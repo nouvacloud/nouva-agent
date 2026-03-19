@@ -1,13 +1,12 @@
 {
-	"name": "nouva-agent",
+	"name": "nouva-agent-workspace",
 	"private": true,
 	"workspaces": [
-		"agent",
-		"packages/*"
+		"agent"
 	],
 	"scripts": {
-		"check-types": "bun run --filter @nouvacloud/agent-protocol check-types && bun run --filter @nouvacloud/service-images check-types && bun run --filter nouva-agent check-types",
-		"test": "bun test packages/agent-protocol/src/index.test.ts packages/service-images/src/images.test.ts",
+		"check-types": "bun run --filter nouva-agent check-types",
+		"test": "bun run --filter nouva-agent test",
 		"build:agent-image": "docker build -f agent/Dockerfile -t nouva-agent:dev .",
 		"format": "bunx @biomejs/biome format --write ."
 	},

@@ -3,7 +3,7 @@ import {
   negotiateDockerApiVersion,
   type ParsedDockerStats,
   parseDockerStatsSnapshot,
-} from "@nouvacloud/agent-protocol";
+} from "./protocol.js";
 
 type HttpMethod = "GET" | "POST" | "DELETE";
 

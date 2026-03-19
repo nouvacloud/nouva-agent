@@ -10,26 +10,6 @@
     "agent": {
       "name": "nouva-agent",
       "version": "0.1.0",
-      "dependencies": {
-        "@nouvacloud/agent-protocol": "workspace:*",
-        "@nouvacloud/service-images": "workspace:*",
-      },
-      "devDependencies": {
-        "@types/node": "^22.15.3",
-        "typescript": "5.9.2",
-      },
-    },
-    "packages/agent-protocol": {
-      "name": "@nouvacloud/agent-protocol",
-      "version": "0.1.0",
-      "devDependencies": {
-        "@types/node": "^22.15.3",
-        "typescript": "5.9.2",
-      },
-    },
-    "packages/service-images": {
-      "name": "@nouvacloud/service-images",
-      "version": "0.1.0",
       "devDependencies": {
         "@types/node": "^22.15.3",
         "typescript": "5.9.2",
@@ -54,10 +34,6 @@
     "@biomejs/cli-win32-arm64": ["@biomejs/cli-win32-arm64@2.4.8", "", { "os": "win32", "cpu": "arm64" }, "sha512-LoFatS0tnHv6KkCVpIy3qZCih+MxUMvdYiPWLHRri7mhi2vyOOs8OrbZBcLTUEWCS+ktO72nZMy4F96oMhkOHQ=="],
 
     "@biomejs/cli-win32-x64": ["@biomejs/cli-win32-x64@2.4.8", "", { "os": "win32", "cpu": "x64" }, "sha512-vAn7iXDoUbqFXqVocuq1sMYAd33p8+mmurqJkWl6CtIhobd/O6moe4rY5AJvzbunn/qZCdiDVcveqtkFh1e7Hg=="],
-
-    "@nouvacloud/agent-protocol": ["@nouvacloud/agent-protocol@workspace:packages/agent-protocol"],
-
-    "@nouvacloud/service-images": ["@nouvacloud/service-images@workspace:packages/service-images"],
 
     "@types/node": ["@types/node@22.19.15", "", { "dependencies": { "undici-types": "~6.21.0" } }, "sha512-F0R/h2+dsy5wJAUe3tAU6oqa2qbWY5TpNfL/RGmo1y38hiyO1w3x2jPtt76wmuaJI4DQnOBu21cNXQ2STIUUWg=="],
 

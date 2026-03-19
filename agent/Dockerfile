@@ -4,12 +4,9 @@ WORKDIR /app
 
 COPY bun.lock package.json tsconfig.base.json ./
 COPY agent/package.json ./agent/
-COPY packages/agent-protocol/package.json ./packages/agent-protocol/
-COPY packages/service-images/package.json ./packages/service-images/
 RUN bun install --frozen-lockfile
 
 COPY agent ./agent
-COPY packages ./packages
 
 WORKDIR /app/agent
 RUN bun run check-types
@@ -43,12 +40,9 @@ WORKDIR /app
 
 COPY bun.lock package.json tsconfig.base.json ./
 COPY agent/package.json ./agent/
-COPY packages/agent-protocol/package.json ./packages/agent-protocol/
-COPY packages/service-images/package.json ./packages/service-images/
 RUN bun install --frozen-lockfile --production
 
 COPY agent ./agent
-COPY packages ./packages
 
 ARG NOUVA_AGENT_VERSION=0.1.0
 ARG VCS_REF=local

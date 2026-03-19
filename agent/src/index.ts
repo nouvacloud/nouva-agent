@@ -22,10 +22,10 @@ import {
   type ServerValidationReport,
   type SyncRoutingPayload,
   type UpdateAgentPayload,
-} from "@nouvacloud/agent-protocol";
-import { getImageConfig, type ServiceCredentials } from "@nouvacloud/service-images";
+} from "./protocol.js";
 import { buildApp, hashProjectNetwork } from "./build.js";
 import { DockerApiClient } from "./docker-api.js";
+import { resolveDatabaseProvisionSpec } from "./service-runtime.js";
 
 const API_URL = process.env.NOUVA_API_URL;
 const SERVER_ID = process.env.NOUVA_SERVER_ID;
@@ -82,19 +82,6 @@ function toRecord(value: unknown): Record<string, string> {
 function toRuntimeMetadata(value: unknown): RuntimeMetadata | null {
   const metadata = toObject(value);
   return Object.keys(metadata).length > 0 ? (metadata as RuntimeMetadata) : null;
-}
-
-function toServiceCredentials(value: unknown): ServiceCredentials {
-  const credentials = toRecord(value);
-  if (!credentials.username || !credentials.password) {
-    throw new Error("Database credentials are incomplete");
-  }
-
-  return {
-    username: credentials.username,
-    password: credentials.password,
-    ...(credentials.database ? { database: credentials.database } : {}),
-  };
 }
 
 function toUpdateAgentPayload(value: unknown): UpdateAgentPayload {
@@ -863,38 +850,31 @@ async function handleDatabaseProvision(docker: DockerApiClient, payload: Databas
   const projectNetwork = buildProjectNetwork(payload.projectId);
   await docker.ensureNetwork(projectNetwork);
 
-  const imageConfig = getImageConfig(payload.variant);
-  const image = `${imageConfig.image}:${payload.version}`;
+  const resolved = resolveDatabaseProvisionSpec(payload);
   const volumeName = `nouva-vol-${payload.serviceId.slice(0, 12)}`;
-  const credentials = toServiceCredentials(payload.credentials);
   await docker.createVolume(volumeName);
 
-  const envVars = imageConfig.getEnvVars(credentials, {
-    serviceId: payload.serviceId,
-    projectId: payload.projectId,
-    volumeId: volumeName,
-  });
   const containerName = `nouva-${payload.variant}-${payload.serviceId.slice(0, 12)}`;
   const containerId = await docker.ensureContainer(
     {
       name: containerName,
-      image,
-      env: Object.entries(envVars).map(([key, value]) => `${key}=${value}`),
-      cmd: imageConfig.getArgs?.(credentials),
+      image: resolved.image,
+      env: Object.entries(resolved.envVars).map(([key, value]) => `${key}=${value}`),
+      cmd: resolved.containerArgs.length > 0 ? resolved.containerArgs : undefined,
       labels: buildLabels({
         kind: "database",
         projectId: payload.projectId,
         serviceId: payload.serviceId,
       }),
       exposedPorts: {
-        [`${imageConfig.defaultPort}/tcp`]: {},
+        [`${resolved.internalPort}/tcp`]: {},
       },
       hostConfig: {
         Mounts: [
           {
             Type: "volume",
             Source: volumeName,
-            Target: imageConfig.dataPath,
+            Target: resolved.dataPath,
           },
         ],
         RestartPolicy: {
@@ -903,7 +883,7 @@ async function handleDatabaseProvision(docker: DockerApiClient, payload: Databas
         ...(payload.publicAccessEnabled && payload.externalPort
           ? {
               PortBindings: {
-                [`${imageConfig.defaultPort}/tcp`]: [
+                [`${resolved.internalPort}/tcp`]: [
                   {
                     HostIp: "0.0.0.0",
                     HostPort: String(payload.externalPort),
@@ -924,25 +904,25 @@ async function handleDatabaseProvision(docker: DockerApiClient, payload: Databas
 
   return {
     internalHost: containerName,
-    internalPort: imageConfig.defaultPort,
+    internalPort: resolved.internalPort,
     externalHost: payload.publicAccessEnabled ? payload.externalHost : null,
     externalPort: payload.publicAccessEnabled ? payload.externalPort : null,
     runtimeMetadata: {
       containerId,
       containerName,
-      image,
+      image: resolved.image,
       publishedPort: payload.publicAccessEnabled ? payload.externalPort : null,
     },
     runtimeInstance: {
       kind: "database",
       status: "running",
       name: containerName,
-      image,
+      image: resolved.image,
       containerId,
       containerName,
       networkName: projectNetwork,
       internalHost: containerName,
-      internalPort: imageConfig.defaultPort,
+      internalPort: resolved.internalPort,
       externalHost: payload.publicAccessEnabled ? payload.externalHost : null,
       externalPort: payload.publicAccessEnabled ? payload.externalPort : null,
     },
