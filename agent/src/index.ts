@@ -13,11 +13,17 @@ import {
   type AgentWorkRecord,
   type AppDeployPayload,
   buildLocalHttpRouteConfig,
+  type CreateVolumeBackupPayload,
   type DatabaseProvisionPayload,
+  type DeleteVolumeBackupPayload,
+  type DeleteVolumePayload,
   type DeployOnlyPayload,
+  type ExpireVolumeBackupRepositoryPayload,
   getAgentRuntimeConfig,
   getDefaultAgentCapabilities,
   parseHostMetricsSnapshot,
+  type RestorePostgresPitrPayload,
+  type RestoreVolumeBackupPayload,
   type RuntimeMetadata,
   type ServerValidationReport,
   type SyncRoutingPayload,
@@ -41,6 +47,8 @@ const LOCAL_REGISTRY_CONTAINER_NAME =
   process.env.NOUVA_AGENT_REGISTRY_CONTAINER || "nouva-registry";
 const TRAEFIK_CONTAINER_NAME = process.env.NOUVA_AGENT_TRAEFIK_CONTAINER || "nouva-traefik";
 const BUILDKIT_ADDRESS = process.env.NOUVA_AGENT_BUILDKIT_ADDR || "tcp://127.0.0.1:1234";
+const BACKUP_HELPER_IMAGE =
+  process.env.NOUVA_BACKUP_HELPER_IMAGE || "ghcr.io/nouvacloud/backup-helper:latest";
 
 if (!API_URL || !SERVER_ID) {
   throw new Error("Missing NOUVA_API_URL or NOUVA_SERVER_ID");
@@ -77,6 +85,26 @@ function toRecord(value: unknown): Record<string, string> {
     }
   }
   return next;
+}
+
+function resolveHydratedHelperSpec(payload: {
+  imageUrl?: string;
+  envVars?: Record<string, string> | undefined;
+  containerArgs?: string[] | undefined;
+  dataPath?: string;
+}) {
+  if (!payload.imageUrl || !payload.dataPath || !payload.envVars) {
+    throw new Error("Backup helper payload is missing hydrated executor fields");
+  }
+
+  return {
+    image: payload.imageUrl,
+    envVars: toRecord(payload.envVars),
+    containerArgs: Array.isArray(payload.containerArgs)
+      ? payload.containerArgs.filter((value): value is string => typeof value === "string")
+      : [],
+    dataPath: payload.dataPath,
+  };
 }
 
 function toRuntimeMetadata(value: unknown): RuntimeMetadata | null {
@@ -579,6 +607,154 @@ function buildLabels(input: {
   };
 }
 
+type PgBackrestInfoBackup = {
+  label: string;
+  type: "full" | "diff" | "incr";
+  stopAt: string | null;
+  annotationBackupId: string | null;
+};
+
+function parsePgBackrestInfo(raw: string): PgBackrestInfoBackup[] {
+  const decoded = JSON.parse(raw) as unknown;
+  if (!Array.isArray(decoded) || decoded.length === 0) {
+    return [];
+  }
+
+  const stanza = decoded[0];
+  const backups =
+    stanza && typeof stanza === "object" && "backup" in stanza && Array.isArray(stanza.backup)
+      ? stanza.backup
+      : [];
+
+  return backups
+    .map((entry: unknown): PgBackrestInfoBackup | null => {
+      if (!entry || typeof entry !== "object") {
+        return null;
+      }
+
+      const label = "label" in entry && typeof entry.label === "string" ? entry.label : null;
+      const type = "type" in entry && typeof entry.type === "string" ? entry.type : null;
+      if (!label || (type !== "full" && type !== "diff" && type !== "incr")) {
+        return null;
+      }
+
+      const stopTimestamp =
+        "timestamp" in entry &&
+        entry.timestamp &&
+        typeof entry.timestamp === "object" &&
+        "stop" in entry.timestamp &&
+        typeof entry.timestamp.stop === "number"
+          ? entry.timestamp.stop
+          : null;
+      const annotationBackupId =
+        "annotation" in entry &&
+        entry.annotation &&
+        typeof entry.annotation === "object" &&
+        "nouva-backup-id" in entry.annotation &&
+        typeof entry.annotation["nouva-backup-id"] === "string"
+          ? entry.annotation["nouva-backup-id"]
+          : null;
+
+      return {
+        label,
+        type,
+        stopAt: stopTimestamp ? new Date(stopTimestamp * 1000).toISOString() : null,
+        annotationBackupId,
+      };
+    })
+    .filter((entry: PgBackrestInfoBackup | null): entry is PgBackrestInfoBackup => entry !== null);
+}
+
+function selectCurrentPgBackrestEntry(
+  entries: PgBackrestInfoBackup[],
+  backupId: string,
+  backupType: "full" | "incr"
+): PgBackrestInfoBackup | null {
+  const byAnnotation = entries.find((entry) => entry.annotationBackupId === backupId);
+  if (byAnnotation) {
+    return byAnnotation;
+  }
+
+  const byType = entries.find((entry) => entry.type === backupType);
+  if (byType) {
+    return byType;
+  }
+
+  return entries[0] ?? null;
+}
+
+function extractPrefixedLogLine(logs: string, prefix: string): string | null {
+  const lines = logs.split(/\r?\n/);
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index];
+    if (line?.startsWith(prefix)) {
+      return line.slice(prefix.length);
+    }
+  }
+
+  return null;
+}
+
+async function runTaskContainer(
+  docker: DockerApiClient,
+  options: {
+    name: string;
+    image: string;
+    env?: string[];
+    cmd: string[];
+    mounts?: Array<{ source: string; target: string }>;
+    timeoutMs?: number;
+  }
+): Promise<{ logs: string }> {
+  await docker.pullImage(options.image);
+  await docker.removeContainer(options.name, true);
+
+  const id = await docker.createContainer({
+    name: options.name,
+    image: options.image,
+    env: options.env,
+    cmd: options.cmd,
+    tty: true,
+    labels: buildLabels({ kind: "task" }),
+    hostConfig: {
+      AutoRemove: false,
+      Mounts: options.mounts?.map((mount) => ({
+        Type: "volume",
+        Source: mount.source,
+        Target: mount.target,
+      })),
+    },
+  });
+
+  try {
+    await docker.startContainer(id);
+    const statusCode = await docker.waitContainer(id, options.timeoutMs);
+    const logs = await docker.containerLogs(id).catch(() => "");
+    if (statusCode !== 0) {
+      throw new Error(logs.trim() || `Task container ${options.name} failed (${statusCode})`);
+    }
+
+    return { logs };
+  } finally {
+    await docker.removeContainer(id, true);
+  }
+}
+
+function buildArchiveRemoteExpression(verifyTls: boolean): string {
+  return [
+    ":s3",
+    "provider=Other",
+    "env_auth=false",
+    "access_key_id=${BACKUP_ACCESS_KEY_ID}",
+    "secret_access_key=${BACKUP_SECRET_ACCESS_KEY}",
+    "endpoint=${BACKUP_ENDPOINT}",
+    "region=${BACKUP_REGION}",
+    "force_path_style=${BACKUP_FORCE_PATH_STYLE}",
+    `insecure_skip_verify=${verifyTls ? "false" : "true"}`,
+    "no_check_bucket=true:${BACKUP_BUCKET}/${BACKUP_OBJECT_KEY}",
+  ].join(",");
+}
+
 async function ensureBaseRuntime(
   docker: DockerApiClient,
   config: AgentRuntimeConfig
@@ -846,15 +1022,32 @@ async function handleDeployOnlyApp(
   });
 }
 
-async function handleDatabaseProvision(docker: DockerApiClient, payload: DatabaseProvisionPayload) {
+function getManagedVolumeName(payload: DatabaseProvisionPayload | DeleteVolumePayload): string {
+  return payload.volumeName;
+}
+
+function getDatabaseContainerName(payload: DatabaseProvisionPayload): string {
+  return `nouva-${payload.variant}-${payload.serviceId.slice(0, 12)}`;
+}
+
+function isAttachedDatabaseVolumePayload(
+  payload: DeleteVolumePayload | (DatabaseProvisionPayload & { runtimeMetadata?: RuntimeMetadata | null })
+): payload is DatabaseProvisionPayload & { runtimeMetadata?: RuntimeMetadata | null } {
+  return typeof (payload as DatabaseProvisionPayload).serviceId === "string";
+}
+
+async function deployDatabaseContainer(
+  docker: DockerApiClient,
+  payload: DatabaseProvisionPayload
+) {
   const projectNetwork = buildProjectNetwork(payload.projectId);
   await docker.ensureNetwork(projectNetwork);
 
   const resolved = resolveDatabaseProvisionSpec(payload);
-  const volumeName = `nouva-vol-${payload.serviceId.slice(0, 12)}`;
+  const volumeName = getManagedVolumeName(payload);
   await docker.createVolume(volumeName);
 
-  const containerName = `nouva-${payload.variant}-${payload.serviceId.slice(0, 12)}`;
+  const containerName = getDatabaseContainerName(payload);
   const containerId = await docker.ensureContainer(
     {
       name: containerName,
@@ -903,6 +1096,19 @@ async function handleDatabaseProvision(docker: DockerApiClient, payload: Databas
   );
 
   return {
+    projectNetwork,
+    resolved,
+    volumeName,
+    containerName,
+    containerId,
+  };
+}
+
+async function handleDatabaseProvision(docker: DockerApiClient, payload: DatabaseProvisionPayload) {
+  const { projectNetwork, resolved, volumeName, containerName, containerId } =
+    await deployDatabaseContainer(docker, payload);
+
+  return {
     internalHost: containerName,
     internalPort: resolved.internalPort,
     externalHost: payload.publicAccessEnabled ? payload.externalHost : null,
@@ -912,6 +1118,8 @@ async function handleDatabaseProvision(docker: DockerApiClient, payload: Databas
       containerName,
       image: resolved.image,
       publishedPort: payload.publicAccessEnabled ? payload.externalPort : null,
+      volumeName,
+      mountPath: resolved.dataPath,
     },
     runtimeInstance: {
       kind: "database",
@@ -927,6 +1135,353 @@ async function handleDatabaseProvision(docker: DockerApiClient, payload: Databas
       externalPort: payload.publicAccessEnabled ? payload.externalPort : null,
     },
   };
+}
+
+async function handleApplyDatabaseVolume(
+  docker: DockerApiClient,
+  payload: DatabaseProvisionPayload & { runtimeMetadata?: RuntimeMetadata | null }
+) {
+  const identifier = payload.runtimeMetadata?.containerId ?? payload.runtimeMetadata?.containerName;
+  if (identifier) {
+    await docker.removeContainer(identifier, true);
+  }
+
+  return await handleDatabaseProvision(docker, payload);
+}
+
+async function handleDeleteVolume(docker: DockerApiClient, payload: DeleteVolumePayload) {
+  await docker.removeVolume(getManagedVolumeName(payload), true);
+  return {
+    volumeName: payload.volumeName,
+  };
+}
+
+async function handleWipeVolume(
+  docker: DockerApiClient,
+  payload: DeleteVolumePayload | (DatabaseProvisionPayload & { runtimeMetadata?: RuntimeMetadata | null })
+) {
+  if (!isAttachedDatabaseVolumePayload(payload)) {
+    await docker.removeVolume(getManagedVolumeName(payload), true);
+    await docker.createVolume(payload.volumeName);
+    return {
+      volumeName: payload.volumeName,
+    };
+  }
+
+  const identifier = payload.runtimeMetadata?.containerId ?? payload.runtimeMetadata?.containerName;
+  if (identifier) {
+    await docker.removeContainer(identifier, true);
+  }
+
+  await docker.removeVolume(getManagedVolumeName(payload), true);
+
+  return await handleDatabaseProvision(docker, payload);
+}
+
+async function handleCreateArchiveBackup(
+  docker: DockerApiClient,
+  payload: CreateVolumeBackupPayload
+) {
+  const remoteExpression = buildArchiveRemoteExpression(payload.destination.verifyTls);
+  const { logs } = await runTaskContainer(docker, {
+    name: `nouva-backup-${payload.backupId.slice(0, 12)}`,
+    image: BACKUP_HELPER_IMAGE,
+    env: [
+      `BACKUP_ACCESS_KEY_ID=${payload.destination.accessKeyId}`,
+      `BACKUP_SECRET_ACCESS_KEY=${payload.destination.secretAccessKey}`,
+      `BACKUP_ENDPOINT=${payload.destination.endpoint}`,
+      `BACKUP_REGION=${payload.destination.region}`,
+      `BACKUP_BUCKET=${payload.destination.bucket}`,
+      `BACKUP_OBJECT_KEY=archives/v1/projects/${payload.projectId}/volumes/${payload.volumeId}/backups/${payload.backupId}.tar.gz`,
+      `BACKUP_FORCE_PATH_STYLE=${payload.destination.pathStyle ? "true" : "false"}`,
+    ],
+    cmd: [
+      "sh",
+      "-c",
+      [
+        "set -eu",
+        `remote="${remoteExpression}"`,
+        'archive="/tmp/nouva-volume-backup.tar.gz"',
+        'tar -C /source -czf "$archive" .',
+        'size_bytes=$(wc -c < "$archive" | tr -d " ")',
+        'rclone copyto "$archive" "$remote"',
+        'printf "NOUVA_SIZE_BYTES:%s\\n" "$size_bytes"',
+      ].join("\n"),
+    ],
+    mounts: [{ source: payload.volumeName, target: "/source" }],
+    timeoutMs: 30 * 60_000,
+  });
+
+  const sizeBytes = Number.parseInt(extractPrefixedLogLine(logs, "NOUVA_SIZE_BYTES:") ?? "", 10);
+  return {
+    sizeBytes: Number.isFinite(sizeBytes) ? sizeBytes : null,
+  };
+}
+
+async function handleDeleteArchiveBackup(
+  docker: DockerApiClient,
+  payload: DeleteVolumeBackupPayload
+) {
+  const remoteExpression = buildArchiveRemoteExpression(payload.destination.verifyTls);
+  await runTaskContainer(docker, {
+    name: `nouva-delete-backup-${payload.backupId.slice(0, 12)}`,
+    image: BACKUP_HELPER_IMAGE,
+    env: [
+      `BACKUP_ACCESS_KEY_ID=${payload.destination.accessKeyId}`,
+      `BACKUP_SECRET_ACCESS_KEY=${payload.destination.secretAccessKey}`,
+      `BACKUP_ENDPOINT=${payload.destination.endpoint}`,
+      `BACKUP_REGION=${payload.destination.region}`,
+      `BACKUP_BUCKET=${payload.destination.bucket}`,
+      `BACKUP_OBJECT_KEY=archives/v1/projects/${payload.projectId}/volumes/${payload.volumeId}/backups/${payload.backupId}.tar.gz`,
+      `BACKUP_FORCE_PATH_STYLE=${payload.destination.pathStyle ? "true" : "false"}`,
+    ],
+    cmd: [
+      "sh",
+      "-c",
+      [
+        "set -eu",
+        `remote="${remoteExpression}"`,
+        'rclone deletefile "$remote" || true',
+      ].join("\n"),
+    ],
+    timeoutMs: 10 * 60_000,
+  });
+
+  return {};
+}
+
+async function handleRestoreArchiveBackup(
+  docker: DockerApiClient,
+  payload: RestoreVolumeBackupPayload
+) {
+  const remoteExpression = buildArchiveRemoteExpression(payload.destination.verifyTls);
+  await docker.createVolume(payload.targetVolumeName);
+  await runTaskContainer(docker, {
+    name: `nouva-restore-backup-${payload.backupId.slice(0, 12)}`,
+    image: BACKUP_HELPER_IMAGE,
+    env: [
+      `BACKUP_ACCESS_KEY_ID=${payload.destination.accessKeyId}`,
+      `BACKUP_SECRET_ACCESS_KEY=${payload.destination.secretAccessKey}`,
+      `BACKUP_ENDPOINT=${payload.destination.endpoint}`,
+      `BACKUP_REGION=${payload.destination.region}`,
+      `BACKUP_BUCKET=${payload.destination.bucket}`,
+      `BACKUP_OBJECT_KEY=archives/v1/projects/${payload.projectId}/volumes/${payload.sourceVolumeId}/backups/${payload.backupId}.tar.gz`,
+      `BACKUP_FORCE_PATH_STYLE=${payload.destination.pathStyle ? "true" : "false"}`,
+    ],
+    cmd: [
+      "sh",
+      "-c",
+      [
+        "set -eu",
+        `remote="${remoteExpression}"`,
+        'archive="/tmp/nouva-volume-backup.tar.gz"',
+        'mkdir -p /target',
+        'rclone copyto "$remote" "$archive"',
+        'tar -C /target -xzf "$archive"',
+      ].join("\n"),
+    ],
+    mounts: [{ source: payload.targetVolumeName, target: "/target" }],
+    timeoutMs: 30 * 60_000,
+  });
+
+  return {
+    volumeName: payload.targetVolumeName,
+  };
+}
+
+async function handleCreatePgBackrestBackup(
+  docker: DockerApiClient,
+  payload: CreateVolumeBackupPayload
+) {
+  const spec = resolveHydratedHelperSpec(payload);
+  const { logs } = await runTaskContainer(docker, {
+    name: `nouva-pgbackrest-backup-${payload.backupId.slice(0, 12)}`,
+    image: spec.image,
+    env: [
+      ...Object.entries(spec.envVars).map(([key, value]) => `${key}=${value}`),
+      `NOUVA_BACKUP_ID=${payload.backupId}`,
+      `NOUVA_PGBACKREST_BACKUP_TYPE=${payload.pgbackrestType ?? "full"}`,
+      `NOUVA_DATA_PATH=${spec.dataPath}`,
+    ],
+    cmd: [
+      "sh",
+      "-c",
+      [
+        "set -eu",
+        'printf "%s\\n" "*:*:*:$POSTGRES_USER:$POSTGRES_PASSWORD" > /tmp/.pgpass',
+        "chmod 0600 /tmp/.pgpass",
+        "export PGPASSFILE=/tmp/.pgpass",
+        'metadata_dir="$NOUVA_DATA_PATH/.nouva/pgbackrest"',
+        'mkdir -p "$metadata_dir"',
+        'if [ -x /nouva/generate_config.sh ]; then /nouva/generate_config.sh; fi',
+        'pgbackrest --stanza="$PGBACKREST_STANZA" --type="$NOUVA_PGBACKREST_BACKUP_TYPE" --annotation="nouva-backup-id=$NOUVA_BACKUP_ID" --log-level-console=info backup',
+        'if info_output=$(pgbackrest --stanza="$PGBACKREST_STANZA" --output=json info 2>/dev/null); then',
+        `  printf 'NOUVA_PGBACKREST_INFO:%s\\n' "$(printf '%s' "$info_output" | tr -d '\\n')"` ,
+        "fi",
+      ].join("\n"),
+    ],
+    mounts: [{ source: payload.volumeName, target: spec.dataPath }],
+    timeoutMs: 30 * 60_000,
+  });
+
+  const rawInfo = extractPrefixedLogLine(logs, "NOUVA_PGBACKREST_INFO:");
+  const entries = rawInfo ? parsePgBackrestInfo(rawInfo) : [];
+  const selected = selectCurrentPgBackrestEntry(
+    entries,
+    payload.backupId,
+    payload.pgbackrestType ?? "full"
+  );
+
+  return {
+    completedAt: selected?.stopAt ?? null,
+    pgbackrestType:
+      selected?.type === "full" || selected?.type === "incr"
+        ? selected.type
+        : (payload.pgbackrestType ?? null),
+    pgbackrestSet: selected?.label ?? null,
+    activePgbackrestSets: entries.map((entry) => entry.label),
+  };
+}
+
+async function handleRestorePgBackrestBackup(
+  docker: DockerApiClient,
+  payload: RestoreVolumeBackupPayload
+) {
+  if (!payload.backupCompletedAt) {
+    throw new Error("Backup restore is missing backupCompletedAt");
+  }
+
+  const spec = resolveHydratedHelperSpec(payload);
+
+  await docker.createVolume(payload.targetVolumeName);
+  await runTaskContainer(docker, {
+    name: `nouva-pgbackrest-restore-${payload.targetVolumeId.slice(0, 12)}`,
+    image: spec.image,
+    env: [
+      ...Object.entries(spec.envVars).map(([key, value]) => `${key}=${value}`),
+      `RESTORE_TARGET=${payload.backupCompletedAt}`,
+      `RESTORE_SET=${payload.pgbackrestSet ?? ""}`,
+      `NOUVA_DATA_PATH=${spec.dataPath}`,
+    ],
+    cmd: [
+      "sh",
+      "-c",
+      [
+        "set -eu",
+        'mkdir -p "$NOUVA_DATA_PATH"',
+        'chown -R 999:999 "$NOUVA_DATA_PATH" || true',
+        'if [ -x /nouva/generate_config.sh ]; then /nouva/generate_config.sh; fi',
+        'if [ -n "${RESTORE_SET:-}" ]; then',
+        '  exec pgbackrest --stanza="$PGBACKREST_STANZA" --set="$RESTORE_SET" --delta --type=time --target="$RESTORE_TARGET" --target-action=promote --log-level-console=info restore',
+        "fi",
+        'exec pgbackrest --stanza="$PGBACKREST_STANZA" --delta --type=time --target="$RESTORE_TARGET" --target-action=promote --log-level-console=info restore',
+      ].join("\n"),
+    ],
+    mounts: [{ source: payload.targetVolumeName, target: spec.dataPath }],
+    timeoutMs: 30 * 60_000,
+  });
+
+  return {
+    volumeName: payload.targetVolumeName,
+  };
+}
+
+async function handleExpireVolumeBackupRepository(
+  docker: DockerApiClient,
+  payload: ExpireVolumeBackupRepositoryPayload
+) {
+  const { logs } = await runTaskContainer(docker, {
+    name: `nouva-pgbackrest-expire-${payload.volumeId.slice(0, 12)}`,
+    image: payload.imageUrl ?? "postgres:17",
+    env: Object.entries(toRecord(payload.envVars)).map(([key, value]) => `${key}=${value}`),
+    cmd: [
+      "sh",
+      "-c",
+      [
+        "set -eu",
+        'if [ -x /nouva/generate_config.sh ]; then /nouva/generate_config.sh; fi',
+        'pgbackrest --stanza="$PGBACKREST_STANZA" --log-level-console=info expire',
+        'if info_output=$(pgbackrest --stanza="$PGBACKREST_STANZA" --output=json info 2>/dev/null); then',
+        `  printf 'NOUVA_PGBACKREST_INFO:%s\\n' "$(printf '%s' "$info_output" | tr -d '\\n')"` ,
+        "fi",
+      ].join("\n"),
+    ],
+    timeoutMs: 30 * 60_000,
+  });
+
+  const rawInfo = extractPrefixedLogLine(logs, "NOUVA_PGBACKREST_INFO:");
+  const entries = rawInfo ? parsePgBackrestInfo(rawInfo) : [];
+  return {
+    activePgbackrestSets: entries.map((entry) => entry.label),
+  };
+}
+
+async function handleCreateVolumeBackup(
+  docker: DockerApiClient,
+  payload: CreateVolumeBackupPayload
+) {
+  if (payload.engine === "pgbackrest") {
+    return await handleCreatePgBackrestBackup(docker, payload);
+  }
+
+  return await handleCreateArchiveBackup(docker, payload);
+}
+
+async function handleDeleteVolumeBackup(
+  docker: DockerApiClient,
+  payload: DeleteVolumeBackupPayload
+) {
+  if (payload.engine === "pgbackrest") {
+    return {};
+  }
+
+  return await handleDeleteArchiveBackup(docker, payload);
+}
+
+async function handleRestoreVolumeBackup(
+  docker: DockerApiClient,
+  payload: RestoreVolumeBackupPayload
+) {
+  if (payload.engine === "pgbackrest") {
+    return await handleRestorePgBackrestBackup(docker, payload);
+  }
+
+  return await handleRestoreArchiveBackup(docker, payload);
+}
+
+async function handleRestorePostgresPitr(
+  docker: DockerApiClient,
+  payload: RestorePostgresPitrPayload
+) {
+  const identifier = payload.runtimeMetadata?.containerId ?? payload.runtimeMetadata?.containerName;
+  if (identifier) {
+    await docker.stopContainer(identifier);
+    await docker.removeContainer(identifier, true);
+  }
+
+  const spec = resolveDatabaseProvisionSpec(payload);
+  await runTaskContainer(docker, {
+    name: `nouva-pgbackrest-pitr-${payload.serviceId.slice(0, 12)}`,
+    image: spec.image,
+    env: [
+      ...Object.entries(spec.envVars).map(([key, value]) => `${key}=${value}`),
+      `RESTORE_TARGET=${payload.restoreTarget}`,
+      `NOUVA_DATA_PATH=${spec.dataPath}`,
+    ],
+    cmd: [
+      "sh",
+      "-c",
+      [
+        "set -eu",
+        'if [ -x /nouva/generate_config.sh ]; then /nouva/generate_config.sh; fi',
+        'pgbackrest --stanza="$PGBACKREST_STANZA" --delta --type=time --target="$RESTORE_TARGET" --target-action=promote --log-level-console=info restore',
+      ].join("\n"),
+    ],
+    mounts: [{ source: payload.volumeName, target: spec.dataPath }],
+    timeoutMs: 30 * 60_000,
+  });
+
+  return await handleDatabaseProvision(docker, payload);
 }
 
 async function handleRestart(docker: DockerApiClient, runtimeMetadata: RuntimeMetadata | null) {
@@ -1064,7 +1619,11 @@ async function handleUpdateAgent(
     true // replace any previous updater
   );
 
-  return { scheduled: true, imageTag, scheduledAt: new Date().toISOString() };
+  return {
+    scheduled: true,
+    imageTag,
+    scheduledAt: new Date().toISOString(),
+  };
 }
 
 async function processWorkItem(
@@ -1109,11 +1668,52 @@ async function processWorkItem(
           payload as unknown as DatabaseProvisionPayload
         );
         break;
+      case "apply_database_volume":
+        result = await handleApplyDatabaseVolume(docker, {
+          ...(payload as unknown as DatabaseProvisionPayload),
+          runtimeMetadata: toRuntimeMetadata(payload.runtimeMetadata),
+        });
+        break;
       case "delete_service":
         result = await handleDeleteService(
           docker,
           String(payload.serviceId),
           toRuntimeMetadata(payload.runtimeMetadata)
+        );
+        break;
+      case "delete_volume":
+        result = await handleDeleteVolume(docker, payload as unknown as DeleteVolumePayload);
+        break;
+      case "wipe_volume":
+        result = await handleWipeVolume(docker, "serviceId" in payload
+          ? {
+              ...(payload as unknown as DatabaseProvisionPayload),
+              runtimeMetadata: toRuntimeMetadata(payload.runtimeMetadata),
+            }
+          : (payload as unknown as DeleteVolumePayload));
+        break;
+      case "create_volume_backup":
+        result = await handleCreateVolumeBackup(docker, payload as unknown as CreateVolumeBackupPayload);
+        break;
+      case "delete_volume_backup":
+        result = await handleDeleteVolumeBackup(docker, payload as unknown as DeleteVolumeBackupPayload);
+        break;
+      case "restore_volume_backup":
+        result = await handleRestoreVolumeBackup(
+          docker,
+          payload as unknown as RestoreVolumeBackupPayload
+        );
+        break;
+      case "restore_postgres_pitr":
+        result = await handleRestorePostgresPitr(
+          docker,
+          payload as unknown as RestorePostgresPitrPayload
+        );
+        break;
+      case "expire_volume_backup_repository":
+        result = await handleExpireVolumeBackupRepository(
+          docker,
+          payload as unknown as ExpireVolumeBackupRepositoryPayload
         );
         break;
       case "sync_routing":

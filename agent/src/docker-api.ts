@@ -12,6 +12,7 @@ export interface DockerContainerSpec {
   image: string;
   env?: string[];
   cmd?: string[];
+  tty?: boolean;
   labels?: Record<string, string>;
   exposedPorts?: Record<string, Record<string, never>>;
   hostConfig?: Record<string, unknown>;
@@ -136,6 +137,15 @@ export class DockerApiClient {
     });
   }
 
+  async removeVolume(name: string, force = false): Promise<void> {
+    try {
+      await this.request(
+        "DELETE",
+        `/volumes/${encodeURIComponent(name)}${force ? "?force=true" : ""}`
+      );
+    } catch {}
+  }
+
   async inspectContainer(nameOrId: string): Promise<{
     Id: string;
     Name: string;
@@ -172,6 +182,7 @@ export class DockerApiClient {
         Image: spec.image,
         Env: spec.env,
         Cmd: spec.cmd,
+        Tty: spec.tty ?? false,
         Labels: spec.labels,
         ExposedPorts: spec.exposedPorts,
         HostConfig: spec.hostConfig,
@@ -183,6 +194,25 @@ export class DockerApiClient {
 
   async startContainer(id: string): Promise<void> {
     await this.request("POST", `/containers/${encodeURIComponent(id)}/start`);
+  }
+
+  async waitContainer(id: string, timeoutMs = 30 * 60_000): Promise<number> {
+    const result = await this.request<{ StatusCode?: number }>(
+      "POST",
+      `/containers/${encodeURIComponent(id)}/wait`,
+      null,
+      timeoutMs
+    );
+    return result.StatusCode ?? 1;
+  }
+
+  async containerLogs(id: string): Promise<string> {
+    return await this.request<string>(
+      "GET",
+      `/containers/${encodeURIComponent(id)}/logs?stdout=true&stderr=true&timestamps=false`,
+      null,
+      30_000
+    );
   }
 
   async connectNetwork(network: string, container: string): Promise<void> {

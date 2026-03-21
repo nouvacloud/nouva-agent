@@ -11,6 +11,7 @@ type ServiceVariant = "postgres" | "redis";
 interface ServiceEnvContext {
   projectId: string;
   volumeId: string;
+  dataPath?: string;
 }
 
 interface LegacyImageConfig {
@@ -111,12 +112,13 @@ function getLegacyImageConfig(variant: ServiceVariant): LegacyImageConfig {
         defaultPort: 5432,
         dataPath: "/var/lib/postgresql",
         getEnvVars: (creds, context) => {
+          const mountPath = context.dataPath ?? "/var/lib/postgresql";
           const identity = getLegacyPgBackrestIdentity(context);
           return {
             POSTGRES_USER: creds.username,
             POSTGRES_PASSWORD: creds.password,
             POSTGRES_DB: creds.database ?? "postgres",
-            POSTGRES_SOCKET_DIR: "/var/lib/postgresql/.sockets",
+            POSTGRES_SOCKET_DIR: `${mountPath}/.sockets`,
             PGBACKREST_STANZA: identity.stanza,
             PGBACKREST_REPO1_PATH: identity.repo1Path,
           };
@@ -167,17 +169,25 @@ export function resolveDatabaseProvisionSpec(
   }
 
   const config = getLegacyImageConfig(payload.variant);
-  const volumeName = `nouva-vol-${payload.serviceId.slice(0, 12)}`;
+  const volumeId =
+    typeof payload.volumeId === "string" && payload.volumeId.length > 0
+      ? payload.volumeId
+      : `nouva-vol-${payload.serviceId.slice(0, 12)}`;
+  const mountPath =
+    typeof payload.mountPath === "string" && payload.mountPath.length > 0
+      ? payload.mountPath
+      : config.dataPath;
   const credentials = toServiceCredentials(payload.credentials);
 
   return {
     image: formatImageReference(config.image, payload.version),
     envVars: config.getEnvVars(credentials, {
       projectId: payload.projectId,
-      volumeId: volumeName,
+      volumeId,
+      dataPath: mountPath,
     }),
     containerArgs: config.getArgs?.(credentials) ?? [],
-    dataPath: config.dataPath,
+    dataPath: mountPath,
     internalPort: payload.internalPort || config.defaultPort,
   };
 }

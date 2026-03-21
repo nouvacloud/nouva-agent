@@ -25,6 +25,9 @@ describe("service runtime", () => {
       serviceId: "svc_1",
       serviceName: "main-db",
       variant: "postgres",
+      volumeId: "vol_1",
+      volumeName: "nouva-vol-vol_1",
+      mountPath: "/var/lib/postgresql",
       imageUrl: "registry.example.com/postgres:17",
       envVars: {
         POSTGRES_USER: "nouva_user",
@@ -55,6 +58,9 @@ describe("service runtime", () => {
       serviceId: "svc_1234567890abc",
       serviceName: "main-db",
       variant: "postgres",
+      volumeId: "vol_1",
+      volumeName: "nouva-vol-vol_1",
+      mountPath: "/var/lib/postgresql",
       version: "17",
       credentials: {
         username: "nouva_user",
@@ -88,6 +94,9 @@ describe("service runtime", () => {
       serviceId: "svc_1",
       serviceName: "cache",
       variant: "redis",
+      volumeId: "vol_1",
+      volumeName: "nouva-vol-vol_1",
+      mountPath: "/data",
       version: "7.4",
       credentials: {
         username: "ignored",
@@ -115,6 +124,9 @@ describe("service runtime", () => {
         serviceId: "svc_1",
         serviceName: "main-db",
         variant: "postgres",
+        volumeId: "vol_1",
+        volumeName: "nouva-vol-vol_1",
+        mountPath: "/var/lib/postgresql",
         version: "17",
         credentials: {
           username: "nouva_user",
@@ -136,6 +148,9 @@ describe("service runtime", () => {
         serviceId: "svc_1",
         serviceName: "main-db",
         variant: "postgres",
+        volumeId: "vol_1",
+        volumeName: "nouva-vol-vol_1",
+        mountPath: "/var/lib/postgresql",
         version: "17",
         credentials: {
           username: "nouva_user",
@@ -155,5 +170,30 @@ describe("service runtime", () => {
       stanza: "vol-vol_1",
       repo1Path: "/postgres/v1/projects/proj_1/volumes/vol_1",
     });
+  });
+
+  test("uses the requested mount path in the legacy fallback", () => {
+    const resolved = resolveDatabaseProvisionSpec({
+      projectId: "proj_1",
+      serviceId: "svc_1",
+      serviceName: "main-db",
+      variant: "postgres",
+      volumeId: "vol_1",
+      volumeName: "nouva-vol-vol_1",
+      mountPath: "/srv/postgres-data",
+      version: "17",
+      credentials: {
+        username: "nouva_user",
+        password: "super-secret",
+      },
+      internalPort: 5432,
+      storageSizeGb: 10,
+      externalHost: null,
+      externalPort: null,
+      publicAccessEnabled: false,
+    });
+
+    expect(resolved.dataPath).toBe("/srv/postgres-data");
+    expect(resolved.envVars.POSTGRES_SOCKET_DIR).toBe("/srv/postgres-data/.sockets");
   });
 });

@@ -17,8 +17,16 @@ export const AGENT_WORK_KINDS = [
   "restart_app",
   "remove_app",
   "provision_database",
+  "apply_database_volume",
   "restart_database",
   "delete_service",
+  "delete_volume",
+  "wipe_volume",
+  "create_volume_backup",
+  "delete_volume_backup",
+  "restore_volume_backup",
+  "restore_postgres_pitr",
+  "expire_volume_backup_repository",
   "sync_routing",
   "update_agent",
 ] as const;
@@ -196,6 +204,9 @@ export interface DatabaseProvisionPayload {
   serviceId: string;
   serviceName: string;
   variant: "postgres" | "redis";
+  volumeId: string;
+  volumeName: string;
+  mountPath: string;
   imageUrl?: string;
   envVars?: Record<string, string>;
   containerArgs?: string[];
@@ -208,6 +219,114 @@ export interface DatabaseProvisionPayload {
   runtimeMetadata?: RuntimeMetadata | null;
   version?: string;
   credentials?: Record<string, string>;
+}
+
+export interface DeleteVolumePayload {
+  [key: string]: unknown;
+  projectId: string;
+  volumeId: string;
+  volumeName: string;
+}
+
+export interface PlatformBackupDestinationMetadata {
+  [key: string]: unknown;
+  id: string;
+  type: "s3";
+  bucket: string;
+  endpoint: string;
+  region: string;
+  pathStyle: boolean;
+  verifyTls: boolean;
+  pgbackrestRepoType: string;
+  pgbackrestCipherType: string | null;
+  pgbackrestRetentionFullType: string | null;
+  pgbackrestRetentionFull: string | null;
+  pgbackrestRetentionDiff: string | null;
+  pgbackrestRetentionArchiveType: string | null;
+  pgbackrestRetentionArchive: string | null;
+  pgbackrestRetentionHistory: string | null;
+  pgbackrestArchiveAsync: boolean | null;
+  pgbackrestSpoolPath: string | null;
+}
+
+export interface PlatformBackupDestination extends PlatformBackupDestinationMetadata {
+  accessKeyId: string;
+  secretAccessKey: string;
+  pgbackrestCipherPass: string | null;
+}
+
+interface QueuedVolumeBackupPayloadBase {
+  [key: string]: unknown;
+  projectId: string;
+  serviceId: string;
+  serviceName: string;
+  variant: "postgres" | "redis";
+  version: string;
+  volumeId: string;
+  volumeName: string;
+  mountPath: string;
+  destination: PlatformBackupDestinationMetadata;
+}
+
+export interface CreateVolumeBackupPayload extends QueuedVolumeBackupPayloadBase {
+  backupId: string;
+  kind: string;
+  scheduleType?: string | null;
+  engine: "pgbackrest" | "snapshot";
+  pgbackrestType?: "full" | "incr" | null;
+  runtimeMetadata?: RuntimeMetadata | null;
+  destination: PlatformBackupDestination;
+  imageUrl?: string;
+  envVars?: Record<string, string>;
+  containerArgs?: string[];
+  dataPath?: string;
+  credentials?: Record<string, string>;
+}
+
+export interface DeleteVolumeBackupPayload extends QueuedVolumeBackupPayloadBase {
+  backupId: string;
+  engine: "pgbackrest" | "snapshot";
+  destination: PlatformBackupDestination;
+}
+
+export interface RestoreVolumeBackupPayload {
+  [key: string]: unknown;
+  projectId: string;
+  serviceId: string;
+  serviceName: string;
+  variant: "postgres" | "redis";
+  version: string;
+  sourceVolumeId: string;
+  sourceVolumeName: string;
+  sourceMountPath: string;
+  targetVolumeId: string;
+  targetVolumeName: string;
+  targetMountPath: string;
+  backupId: string;
+  engine: "pgbackrest" | "snapshot";
+  backupCompletedAt?: string | null;
+  pgbackrestSet?: string | null;
+  destination: PlatformBackupDestination;
+  imageUrl?: string;
+  envVars?: Record<string, string>;
+  containerArgs?: string[];
+  dataPath?: string;
+  credentials?: Record<string, string>;
+}
+
+export interface RestorePostgresPitrPayload extends DatabaseProvisionPayload {
+  restoreTarget: string;
+  destination: PlatformBackupDestination;
+}
+
+export interface ExpireVolumeBackupRepositoryPayload {
+  [key: string]: unknown;
+  projectId: string;
+  volumeId: string;
+  volumeName: string;
+  destination: PlatformBackupDestination;
+  imageUrl?: string;
+  envVars?: Record<string, string>;
 }
 
 export interface RestartServicePayload {

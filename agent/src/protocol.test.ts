@@ -10,6 +10,7 @@ import {
   type AgentRegistrationRequest,
   type AgentRegistrationResponse,
   type AgentWorkMutationRequest,
+  AGENT_WORK_KINDS,
   getAgentRuntimeConfig,
   negotiateDockerApiVersion,
   parseDockerStatsSnapshot,
@@ -119,6 +120,67 @@ describe("agent protocol", () => {
     expect(roundTrips).toHaveLength(8);
     expect(roundTrips[0]).toEqual(registrationRequest);
     expect(roundTrips[7]).toEqual(metricsRequest);
+  });
+
+  test("includes the backup and PITR work kinds in the wire contract", () => {
+    expect(AGENT_WORK_KINDS).toEqual(
+      expect.arrayContaining([
+        "create_volume_backup",
+        "delete_volume_backup",
+        "restore_volume_backup",
+        "restore_postgres_pitr",
+        "expire_volume_backup_repository",
+      ])
+    );
+  });
+
+  test("round-trips a hydrated backup work payload", () => {
+    const payload = {
+      projectId: "proj_1",
+      serviceId: "svc_1",
+      serviceName: "main-db",
+      variant: "postgres",
+      version: "17",
+      volumeId: "vol_1",
+      volumeName: "nouva-vol-vol_1",
+      mountPath: "/var/lib/postgresql",
+      backupId: "bkp_1",
+      kind: "MANUAL",
+      scheduleType: null,
+      engine: "pgbackrest",
+      pgbackrestType: "full",
+      destination: {
+        id: "platform-default",
+        type: "s3",
+        bucket: "nouva-backups",
+        endpoint: "https://s3.example.com",
+        region: "us-east-1",
+        accessKeyId: "key-id",
+        secretAccessKey: "secret-key",
+        pathStyle: true,
+        verifyTls: true,
+        pgbackrestRepoType: "s3",
+        pgbackrestCipherType: null,
+        pgbackrestCipherPass: null,
+        pgbackrestRetentionFullType: null,
+        pgbackrestRetentionFull: null,
+        pgbackrestRetentionDiff: null,
+        pgbackrestRetentionArchiveType: null,
+        pgbackrestRetentionArchive: null,
+        pgbackrestRetentionHistory: null,
+        pgbackrestArchiveAsync: null,
+        pgbackrestSpoolPath: null,
+      },
+      imageUrl: "postgres:17",
+      envVars: {
+        POSTGRES_PASSWORD: "super-secret",
+        PGBACKREST_REPO1_S3_BUCKET: "nouva-backups",
+      },
+      containerArgs: [],
+      dataPath: "/var/lib/postgresql",
+    };
+
+    expect(JSON.parse(JSON.stringify(payload))).toEqual(payload);
   });
 
   test("treats queued and expired work items as leaseable", () => {
