@@ -1,18 +1,24 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*.*.*"
+  release:
+    types:
+      - published
 
 jobs:
   publish:
+    if: ${{ !github.event.release.draft && !github.event.release.prerelease }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write
       packages: write
+    env:
+      IMAGE_NAME: ghcr.io/nouvacloud/nouva-agent
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -44,17 +50,91 @@ jobs:
           file: agent/Dockerfile
           push: true
           build-args: |
-            NOUVA_AGENT_VERSION=${{ github.ref_name }}
+            NOUVA_AGENT_VERSION=${{ github.event.release.tag_name }}
             VCS_REF=${{ github.sha }}
           tags: |
-            ghcr.io/nouvacloud/nouva-agent:${{ github.ref_name }}
-            ghcr.io/nouvacloud/nouva-agent:${{ github.sha }}
-            ghcr.io/nouvacloud/nouva-agent:latest
+            ${{ env.IMAGE_NAME }}:${{ github.event.release.tag_name }}
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.IMAGE_NAME }}:latest
           labels: |
             org.opencontainers.image.source=https://github.com/nouvacloud/nouva-agent
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.version=${{ github.event.release.tag_name }}
             org.opencontainers.image.licenses=Apache-2.0
 
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image
+        run: cosign sign --yes "${IMAGE_NAME}@${{ steps.docker.outputs.digest }}"
+
+      - name: Notify control plane
+        env:
+          NOUVA_CONTROL_PLANE_URL: ${{ secrets.NOUVA_CONTROL_PLANE_URL }}
+          NOUVA_AGENT_RELEASE_WEBHOOK_SECRET: ${{ secrets.NOUVA_AGENT_RELEASE_WEBHOOK_SECRET }}
+          VERSION: ${{ github.event.release.tag_name }}
+          DIGEST: ${{ steps.docker.outputs.digest }}
+          GIT_SHA: ${{ github.sha }}
+          GITHUB_RELEASE_ID: ${{ github.event.release.id }}
+          GITHUB_RELEASE_URL: ${{ github.event.release.html_url }}
+          PUBLISHED_AT: ${{ github.event.release.published_at }}
+        run: |
+          node <<'EOF'
+          const crypto = require("node:crypto");
+
+          (async () => {
+            const baseUrl = process.env.NOUVA_CONTROL_PLANE_URL;
+            const secret = process.env.NOUVA_AGENT_RELEASE_WEBHOOK_SECRET;
+            const imageName = process.env.IMAGE_NAME;
+            const digest = process.env.DIGEST;
+
+            if (!baseUrl) {
+              throw new Error("NOUVA_CONTROL_PLANE_URL is required");
+            }
+
+            if (!secret) {
+              throw new Error("NOUVA_AGENT_RELEASE_WEBHOOK_SECRET is required");
+            }
+
+            if (!digest) {
+              throw new Error("DIGEST is required");
+            }
+
+            const payload = {
+              version: process.env.VERSION,
+              imageRef: `${imageName}@${digest}`,
+              digest,
+              gitSha: process.env.GIT_SHA,
+              githubReleaseId: process.env.GITHUB_RELEASE_ID,
+              githubReleaseUrl: process.env.GITHUB_RELEASE_URL,
+              publishedAt: process.env.PUBLISHED_AT,
+            };
+
+            const body = JSON.stringify(payload);
+            const signature = `sha256=${crypto.createHmac("sha256", secret).update(body).digest("hex")}`;
+            const endpoint = `${baseUrl.replace(/\/$/, "")}/api/internal/agent-releases/published`;
+
+            const response = await fetch(endpoint, {
+              method: "POST",
+              headers: {
+                "content-type": "application/json",
+                "x-nouva-signature-256": signature,
+              },
+              body,
+            });
+
+            if (!response.ok) {
+              throw new Error(
+                `Control plane release ingestion failed (${response.status}): ${await response.text()}`
+              );
+            }
+
+            console.log(await response.text());
+          })().catch((error) => {
+            console.error(error);
+            process.exit(1);
+          });
+          EOF
+
       - name: Show image digest
-        run: echo "Published ghcr.io/nouvacloud/nouva-agent@${{ steps.docker.outputs.digest }}"
+        run: echo "Published ${IMAGE_NAME}@${{ steps.docker.outputs.digest }}"

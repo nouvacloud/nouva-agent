@@ -27,11 +27,11 @@ import {
   type RuntimeMetadata,
   type ServerValidationReport,
   type SyncRoutingPayload,
-  type UpdateAgentPayload,
 } from "./protocol.js";
 import { buildApp, hashProjectNetwork } from "./build.js";
 import { DockerApiClient } from "./docker-api.js";
 import { resolveDatabaseProvisionSpec } from "./service-runtime.js";
+import { resolveUpdateAgentImageRef, toUpdateAgentPayload } from "./update-agent.js";
 
 const API_URL = process.env.NOUVA_API_URL;
 const SERVER_ID = process.env.NOUVA_SERVER_ID;
@@ -110,19 +110,6 @@ function resolveHydratedHelperSpec(payload: {
 function toRuntimeMetadata(value: unknown): RuntimeMetadata | null {
   const metadata = toObject(value);
   return Object.keys(metadata).length > 0 ? (metadata as RuntimeMetadata) : null;
-}
-
-function toUpdateAgentPayload(value: unknown): UpdateAgentPayload {
-  const payload = toObject(value);
-  const imageTag = payload.imageTag;
-
-  if (typeof imageTag !== "string" || imageTag.trim().length === 0) {
-    throw new Error("Agent update payload is missing imageTag");
-  }
-
-  return {
-    imageTag,
-  };
 }
 
 async function readCredentials(): Promise<StoredCredentials | null> {
@@ -1571,12 +1558,12 @@ async function handleSyncRouting(
 
 async function handleUpdateAgent(
   docker: DockerApiClient,
-  payload: UpdateAgentPayload
+  payload: ReturnType<typeof toUpdateAgentPayload>
 ): Promise<Record<string, unknown>> {
-  const { imageTag } = payload;
+  const imageRef = resolveUpdateAgentImageRef(payload);
 
   // Pull the new image before anything else
-  await docker.pullImage(imageTag);
+  await docker.pullImage(imageRef);
 
   // Collect NOUVA_ env keys — only safe identifier names go in the shell string
   const nouvaEnvKeys = Object.keys(process.env).filter((k) => k.startsWith("NOUVA_"));
@@ -1584,7 +1571,7 @@ async function handleUpdateAgent(
   // Values are passed securely via the Docker API Env field — never interpolated into shell
   const updaterEnv: string[] = [
     ...nouvaEnvKeys.map((k) => `${k}=${process.env[k] ?? ""}`),
-    `NOUVA_AGENT_TARGET_IMAGE=${imageTag}`,
+    `NOUVA_AGENT_TARGET_IMAGE=${imageRef}`,
   ];
 
   // Only key names (safe identifiers) appear in the shell string; values come from container env
@@ -1621,7 +1608,9 @@ async function handleUpdateAgent(
 
   return {
     scheduled: true,
-    imageTag,
+    imageRef,
+    ...(payload.releaseId ? { releaseId: payload.releaseId } : {}),
+    ...(payload.version ? { version: payload.version } : {}),
     scheduledAt: new Date().toISOString(),
   };
 }

@@ -168,7 +168,10 @@ export interface AgentWorkLeaseResult {
 }
 
 export interface UpdateAgentPayload {
-  imageTag: string;
+  releaseId?: string;
+  version?: string;
+  imageRef?: string;
+  imageTag?: string;
 }
 
 export interface AppDeployPayload {
