@@ -1,235 +1,121 @@
-# Nouva Agent Codebase
+# Nouva Agent
 
-This repository contains a single runnable Bun package in `agent/`. It builds and publishes the
-`ghcr.io/nouvacloud/nouva-agent` container image.
+[![CI](https://github.com/nouvacloud/nouva-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/nouvacloud/nouva-agent/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Docker Image](https://img.shields.io/badge/ghcr.io-nouvacloud%2Fnouva--agent-blue)](https://ghcr.io/nouvacloud/nouva-agent)
 
-The agent process is implemented in three main runtime files plus two local helper modules:
+A containerized edge agent that runs on your infrastructure to execute deployment and service management tasks on behalf of [Nouva Cloud](https://nouvacloud.com). It communicates with the Nouva control plane to lease work, process it locally via Docker, and report results back.
 
-- `agent/src/index.ts`: process entrypoint, API polling loop, host validation, metrics collection,
-  and work dispatch
-- `agent/src/docker-api.ts`: Docker Engine client over `/var/run/docker.sock`
-- `agent/src/build.ts`: Git clone plus Railpack/BuildKit image build helper
-- `agent/src/protocol.ts`: local wire-contract types and small parsing/rendering helpers used by
-  the agent runtime
-- `agent/src/service-runtime.ts`: local database runtime helpers used only by the agent executor,
-  including the temporary legacy `provision_database` fallback
+## Features
 
-The root `package.json` is only workspace/build wiring for `agent/`. The shared TypeScript config
-is in `tsconfig.base.json`.
+- **Application deployments** — build from Git with [Railpack](https://railpack.io)/BuildKit, deploy, redeploy, rollback, and restart containers
+- **Database provisioning** — create and manage database service containers with configurable images and volumes
+- **Volume backups** — create, restore, and manage volume backups including PostgreSQL point-in-time recovery
+- **Routing** — automatic Traefik route configuration for deployed services
+- **Metrics & monitoring** — host and container metrics collection reported to the control plane
+- **Self-updates** — pull and apply new agent versions with zero manual intervention
+- **Zero production dependencies** — built entirely on Node.js built-in APIs
 
-## Repository Layout
+## Prerequisites
 
-### `agent/src/index.ts`
+- [Bun](https://bun.sh) ≥ 1.3.5
+- [Docker](https://docs.docker.com/get-docker/)
+- Git
 
-`index.ts` is the long-running control loop. It owns:
-
-- environment variable loading
-- persisted credentials under `/var/lib/nouva-agent/credentials.json`
-- registration and heartbeat requests to the Nouva API
-- server validation snapshot collection
-- helper container provisioning for registry, BuildKit, and Traefik
-- work leasing from `/api/agent/work/lease`
-- per-work-item execution and completion/failure reporting
-- host and container metrics collection
-
-The file is intentionally monolithic. There is no app factory or separate service layer yet.
-
-### `agent/src/docker-api.ts`
-
-`DockerApiClient` is a thin wrapper around the Docker HTTP API. It uses `node:http` with
-`socketPath: "/var/run/docker.sock"` and exposes the container/network/volume operations the agent
-needs:
-
-- image pull
-- network and volume creation
-- container inspect/create/start/stop/restart/remove
-- container stats collection
-
-`DockerApiClient.create()` probes `/version` first and normalizes the API version before all later
-requests.
-
-### `agent/src/build.ts`
-
-`buildApp()` is the app-image builder used by `deploy_app` and `redeploy_app` work items.
-
-It:
-
-1. clones the source repository at the requested commit
-2. runs `railpack prepare` to emit `railpack-plan.json` and `railpack-info.json`
-3. parses `railpack-info.json` to infer language/framework/version/internal port metadata
-4. runs `buildctl build` against `ghcr.io/railwayapp/railpack-frontend:latest`
-5. pushes the built image to the agent’s local registry as
-   `localRegistryHost:localRegistryPort/nouva-app:<deploymentId>`
-
-The helper does not compile the app locally inside Node or Bun. It shells out to `git`, `railpack`,
-and `buildctl`.
-
-### `agent/src/protocol.ts`
-
-`protocol.ts` is the local definition of the JSON wire contract the agent uses at runtime. It
-contains:
-
-- registration, heartbeat, lease, metrics, and work-mutation request/response interfaces
-- work payload types such as `AppDeployPayload`, `DeployOnlyPayload`, and `UpdateAgentPayload`
-- agent runtime config types and defaults
-- work-lease helper logic
-- Docker stats parsing
-- host `/proc` metrics parsing
-- Traefik local-route YAML generation
-
-It exists inside this repo so the agent can compile without depending on a separately published
-shared package.
-
-### `agent/src/service-runtime.ts`
-
-`service-runtime.ts` contains the database provisioning runtime helpers.
-
-Its main job is `resolveDatabaseProvisionSpec(payload)`, which converts a `provision_database`
-payload into the container inputs the executor needs:
-
-- `image`
-- `envVars`
-- `containerArgs`
-- `dataPath`
-- `internalPort`
-
-The resolver supports two payload shapes:
-
-- the current executor-driven shape with `imageUrl`, `envVars`, `containerArgs`, and `dataPath`
-- a temporary legacy fallback using `variant`, `version`, and `credentials`
-
-The fallback exists only so the agent can roll forward safely while older control-plane payloads are
-still in flight.
-
-## Runtime Flow
-
-### Startup
-
-`index.ts` reads these environment variables at startup:
-
-- required:
-  - `NOUVA_API_URL`
-  - `NOUVA_SERVER_ID`
-- optional:
-  - `NOUVA_REGISTRATION_TOKEN`
-  - `NOUVA_AGENT_VERSION`
-  - `NOUVA_APP_DOMAIN`
-  - `NOUVA_AGENT_DATA_VOLUME`
-  - `NOUVA_AGENT_BUILDKIT_CONTAINER`
-  - `NOUVA_AGENT_REGISTRY_CONTAINER`
-  - `NOUVA_AGENT_TRAEFIK_CONTAINER`
-  - `NOUVA_AGENT_BUILDKIT_ADDR`
-  - `NOUVA_HOST_OS_ID`
-  - `NOUVA_HOST_OS_VERSION_ID`
-  - `NOUVA_IMAGE_REGISTRY`
-  - `NOUVA_POSTGRES_IMAGE`
-
-The process then creates `/var/lib/nouva-agent`, loads cached credentials, and computes the default
-runtime config from `getAgentRuntimeConfig()`.
-
-### Registration, Heartbeat, and Leasing
-
-The agent registers with `/api/agent/register` when no cached token exists, then starts three loops:
-
-- heartbeat loop posting `/api/agent/heartbeat`
-- metrics loop posting `/api/agent/metrics`
-- work loop posting `/api/agent/work/lease`
-
-Leased work items are processed sequentially in `processWorkItem()`. Successful results are posted
-to `/api/agent/work/:id/complete`; failures are posted to `/api/agent/work/:id/fail`.
-
-### App Work Items
-
-`deploy_app` and `redeploy_app` call `buildApp()` first, then `deployAppImage()`.
-
-`rollback_app` skips the build and reuses an existing `imageUrl`.
-
-`deployAppImage()`:
-
-- ensures the helper runtime containers exist
-- creates the per-project Docker network
-- replaces any previous runtime container referenced in `runtimeMetadata`
-- creates a new app container with Nouva labels
-- connects it to the project network and the local Traefik network
-- writes a Traefik file-provider route under `/var/lib/nouva-agent/traefik/dynamic`
-
-### Database Work Items
-
-`handleDatabaseProvision()` now resolves all database container inputs from the payload before it
-talks to Docker.
-
-For the executor-driven payload shape, the control plane has already decided:
-
-- which image to run
-- which env vars to inject
-- which command args to use
-- which data path to mount
-
-For the legacy payload shape, `service-runtime.ts` derives those values locally as a compatibility
-fallback.
-
-### Update Work Item
-
-`handleUpdateAgent()` pulls the target image and starts a short-lived `docker:cli` container that
-stops/removes the current `nouva-agent` container and starts a replacement with the inherited
-`NOUVA_*` environment.
-
-## Build And Release Pipeline
-
-### Local Image Build
-
-The root build command is:
+## Quick Start
 
 ```bash
-bun run build:agent-image
-```
-
-That expands to:
-
-```bash
-docker build -f agent/Dockerfile -t nouva-agent:dev .
-```
-
-`agent/Dockerfile` uses two stages:
-
-- builder: installs Bun dependencies and runs `bun run check-types` in `agent/`
-- runner: installs `git`, `curl`, `bash`, `ca-certificates`, `railpack`, and `buildctl`, then
-  starts the agent with `bun src/index.ts`
-
-The image runs directly from source. It does not copy a compiled binary into the final image.
-
-### CI And Release
-
-`.github/workflows/ci.yml` runs install, typecheck, tests, and a Docker build.
-
-`.github/workflows/release.yml` runs the same verification steps and then publishes only the Docker
-image tags:
-
-- `ghcr.io/nouvacloud/nouva-agent:${GITHUB_REF_NAME}`
-- `ghcr.io/nouvacloud/nouva-agent:${GITHUB_SHA}`
-- `ghcr.io/nouvacloud/nouva-agent:latest`
-
-The release workflow does not publish npm packages.
-
-## Running And Testing
-
-From the repository root:
-
-```bash
+# Clone and install
+git clone https://github.com/nouvacloud/nouva-agent.git
+cd nouva-agent
 bun install
-bun run check-types
-bun run test
+
+# Build the Docker image
 bun run build:agent-image
+
+# Run the agent
+docker run -d \
+  --name nouva-agent \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -e NOUVA_API_URL=https://api.nouvacloud.com \
+  -e NOUVA_SERVER_ID=your-server-id \
+  -e NOUVA_REGISTRATION_TOKEN=your-token \
+  nouva-agent:dev
 ```
 
-Package-local commands:
+## Configuration
+
+### Required
+
+| Variable | Description |
+|---|---|
+| `NOUVA_API_URL` | Nouva control plane API endpoint |
+| `NOUVA_SERVER_ID` | Unique server identifier |
+
+### Optional
+
+| Variable | Default | Description |
+|---|---|---|
+| `NOUVA_REGISTRATION_TOKEN` | — | Initial registration token |
+| `NOUVA_AGENT_VERSION` | `0.1.0` | Reported agent version |
+| `NOUVA_APP_DOMAIN` | `nouva.cloud` | Base domain for deployed apps |
+| `NOUVA_AGENT_DATA_VOLUME` | `nouva-agent-data` | Agent data volume name |
+| `NOUVA_AGENT_BUILDKIT_CONTAINER` | `nouva-buildkitd` | BuildKit container name |
+| `NOUVA_AGENT_REGISTRY_CONTAINER` | `nouva-registry` | Local registry container name |
+| `NOUVA_AGENT_TRAEFIK_CONTAINER` | `nouva-traefik` | Traefik container name |
+| `NOUVA_AGENT_BUILDKIT_ADDR` | `tcp://127.0.0.1:1234` | BuildKit daemon address |
+| `NOUVA_HOST_OS_ID` | — | Host OS identifier |
+| `NOUVA_HOST_OS_VERSION_ID` | — | Host OS version |
+| `NOUVA_IMAGE_REGISTRY` | — | Custom image registry |
+| `NOUVA_POSTGRES_IMAGE` | — | PostgreSQL image URL |
+| `NOUVA_BACKUP_HELPER_IMAGE` | `ghcr.io/nouvacloud/backup-helper:latest` | Backup helper image |
+
+## Architecture
+
+The agent runs a single long-lived process with three concurrent loops:
+
+1. **Heartbeat** — periodic health check with the control plane
+2. **Metrics** — collects host and container stats, reports upstream
+3. **Work polling** — leases tasks from the API, executes them sequentially, and reports completion or failure
+
+All Docker operations go through the Docker Engine API via `/var/run/docker.sock`. Application builds use Git + Railpack + BuildKit, with images pushed to a local registry.
+
+### Source Layout
+
+```
+agent/src/
+├── index.ts            # Main control loop and work dispatch
+├── docker-api.ts       # Docker Engine API client
+├── build.ts            # Git clone + Railpack/BuildKit build helper
+├── protocol.ts         # Wire contract types and helpers
+├── service-runtime.ts  # Database provisioning helpers
+└── update-agent.ts     # Agent self-update logic
+```
+
+## Development
+
+```bash
+bun install              # Install dependencies
+bun run check-types      # Type-check
+bun run test             # Run tests
+bun run format           # Format with Biome
+bun run build:agent-image # Build Docker image
+```
+
+For local development with watch mode:
 
 ```bash
 bun run --filter nouva-agent dev
-bun run --filter nouva-agent start
 ```
 
-Current automated tests live in:
+## Contributing
 
-- `agent/src/protocol.test.ts`
-- `agent/src/service-runtime.test.ts`
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on opening issues and pull requests.
+
+## Security
+
+To report a vulnerability, see [SECURITY.md](SECURITY.md).
+
+## License
+
+[Apache License 2.0](LICENSE)
