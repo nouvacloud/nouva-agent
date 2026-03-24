@@ -6,6 +6,10 @@
 
 A containerized edge agent that runs on your infrastructure to execute deployment and service management tasks on behalf of [Nouva Cloud](https://nouvacloud.com). It communicates with the Nouva control plane to lease work, process it locally via Docker, and report results back.
 
+Production container images are published only from a published GitHub Release in this repository.
+Merges to `main` and plain tag pushes do not publish `ghcr.io/nouvacloud/nouva-agent`. See
+[docs/releasing.md](docs/releasing.md) for the release flow.
+
 ## Features
 
 - **Application deployments** — build from Git with [Railpack](https://railpack.io)/BuildKit, deploy, redeploy, rollback, and restart containers

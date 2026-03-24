@@ -16,6 +16,29 @@ jobs:
     env:
       IMAGE_NAME: ghcr.io/nouvacloud/nouva-agent
     steps:
+      - name: Validate release configuration
+        env:
+          NOUVA_CONTROL_PLANE_URL: ${{ secrets.NOUVA_CONTROL_PLANE_URL }}
+          NOUVA_AGENT_RELEASE_WEBHOOK_SECRET: ${{ secrets.NOUVA_AGENT_RELEASE_WEBHOOK_SECRET }}
+        run: |
+          missing=""
+
+          if [ -z "${NOUVA_CONTROL_PLANE_URL}" ]; then
+            missing="NOUVA_CONTROL_PLANE_URL"
+          fi
+
+          if [ -z "${NOUVA_AGENT_RELEASE_WEBHOOK_SECRET}" ]; then
+            if [ -n "${missing}" ]; then
+              missing="${missing}, "
+            fi
+            missing="${missing}NOUVA_AGENT_RELEASE_WEBHOOK_SECRET"
+          fi
+
+          if [ -n "${missing}" ]; then
+            echo "Missing required release secret(s): ${missing}" >&2
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.release.tag_name }}
