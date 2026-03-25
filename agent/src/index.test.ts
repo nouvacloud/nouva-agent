@@ -1,90 +1,284 @@
 import { describe, expect, mock, test } from "bun:test";
-import type { AgentRuntimeConfig, AppDeployPayload } from "./protocol.js";
+import type { DeployAppImageInput } from "./app-build-runtime.js";
 import { buildAndDeployAppWithDependencies } from "./app-build-runtime.js";
+import {
+	buildAppContainerSpec,
+	buildDatabaseContainerSpec,
+	handleApplyDatabaseVolume,
+	handleDatabaseProvision,
+	handleRestorePostgresPitr,
+} from "./index.js";
+import type {
+	AgentRuntimeConfig,
+	AppDeployPayload,
+	DatabaseProvisionPayload,
+} from "./protocol.js";
 
 const runtimeConfig: AgentRuntimeConfig = {
-  heartbeatIntervalSeconds: 30,
-  pollIntervalSeconds: 10,
-  leaseTtlSeconds: 120,
-  metricsIntervalSeconds: 30,
-  ingressMode: "local_traefik",
-  buildkitMode: "docker-container",
-  capabilities: {
-    dockerApi: true,
-    buildkit: true,
-    localRegistry: true,
-    localTraefik: true,
-  },
-  localRegistryHost: "127.0.0.1",
-  localRegistryPort: 5000,
-  localTraefikNetwork: "nouva-local",
+	heartbeatIntervalSeconds: 30,
+	pollIntervalSeconds: 10,
+	leaseTtlSeconds: 120,
+	metricsIntervalSeconds: 30,
+	ingressMode: "local_traefik",
+	buildkitMode: "docker-container",
+	capabilities: {
+		dockerApi: true,
+		buildkit: true,
+		localRegistry: true,
+		localTraefik: true,
+	},
+	localRegistryHost: "127.0.0.1",
+	localRegistryPort: 5000,
+	localTraefikNetwork: "nouva-local",
 };
 
-const payload: AppDeployPayload = {
-  repoUrl: "https://example.com/repo.git",
-  commitHash: "abc123",
-  commitMessage: "feat: build",
-  branch: "main",
-  subdomain: "app",
-  serviceName: "app",
-  projectId: "proj_1",
-  serviceId: "svc_1",
-  deploymentId: "dep_1",
-  envVars: {},
-  appBuildType: "dockerfile",
-  appBuildConfig: {
-    buildRoot: "apps/web",
-    dockerfilePath: "Dockerfile",
-    dockerContextPath: ".",
-    dockerBuildStage: "runner",
-  },
-  resourceLimits: null,
-  runtimeMetadata: null,
+const resourceLimits = {
+	cpuMillicores: 1500,
+	memoryBytes: 2 * 1024 * 1024 * 1024,
+} as const;
+
+const appPayload: AppDeployPayload = {
+	repoUrl: "https://example.com/repo.git",
+	commitHash: "abc123",
+	commitMessage: "feat: build",
+	branch: "main",
+	subdomain: "app",
+	serviceName: "app",
+	projectId: "proj_1",
+	serviceId: "svc_1",
+	deploymentId: "dep_1",
+	envVars: {},
+	appBuildType: "dockerfile",
+	appBuildConfig: {
+		buildRoot: "apps/web",
+		dockerfilePath: "Dockerfile",
+		dockerContextPath: ".",
+		dockerBuildStage: "runner",
+	},
+	resourceLimits,
+	runtimeMetadata: null,
 };
+
+const appRuntimePayload: DeployAppImageInput = {
+	projectId: "proj_1",
+	serviceId: "svc_1",
+	deploymentId: "dep_1",
+	serviceName: "app",
+	subdomain: "app",
+	envVars: {
+		PORT: "8080",
+	},
+	imageUrl: "127.0.0.1:5000/nouva-app:dep_1",
+	resourceLimits,
+	runtimeMetadata: null,
+	detectedLanguage: null,
+	detectedFramework: null,
+	languageVersion: null,
+	internalPort: 8080,
+	buildDuration: 100,
+};
+
+const databasePayload: DatabaseProvisionPayload = {
+	projectId: "proj_1",
+	serviceId: "svc_1",
+	serviceName: "main-db",
+	variant: "postgres",
+	volumeId: "vol_1",
+	volumeName: "nouva-vol-vol_1",
+	mountPath: "/var/lib/postgresql",
+	imageUrl: "postgres:17",
+	envVars: {
+		POSTGRES_USER: "nouva_user",
+		POSTGRES_PASSWORD: "super-secret",
+	},
+	containerArgs: [],
+	dataPath: "/var/lib/postgresql",
+	internalPort: 5432,
+	storageSizeGb: 20,
+	externalHost: null,
+	externalPort: null,
+	publicAccessEnabled: false,
+	resourceLimits,
+	runtimeMetadata: null,
+};
+
+function createDockerMock() {
+	return {
+		ensureNetwork: mock(async () => {}),
+		createVolume: mock(async () => {}),
+		ensureContainer: mock(async () => "ctr_1"),
+		removeContainer: mock(async () => {}),
+		stopContainer: mock(async () => {}),
+		pullImage: mock(async () => {}),
+		createContainer: mock(async () => "task_1"),
+		startContainer: mock(async () => {}),
+		waitContainer: mock(async () => 0),
+		containerLogs: mock(async () => ""),
+	};
+}
 
 describe("buildAndDeployAppWithDependencies", () => {
-  test("ensures the base runtime before build work starts", async () => {
-    const calls: string[] = [];
-    const ensureBaseRuntime = mock(async () => {
-      calls.push("ensure");
-    });
-    const buildApp = mock(async () => {
-      calls.push("build");
-      return {
-        imageUrl: "127.0.0.1:5000/nouva-app:dep_1",
-        imageSha: "sha256:test",
-        buildDuration: 100,
-        detectedLanguage: null,
-        detectedFramework: null,
-        languageVersion: null,
-        internalPort: 8080,
-      };
-    });
-    const deployAppImage = mock(async () => {
-      calls.push("deploy");
-      return {
-        runtimeMetadata: null,
-      };
-    });
+	test("forwards resource limits into the deploy step", async () => {
+		const calls: string[] = [];
+		const ensureBaseRuntime = mock(async () => {
+			calls.push("ensure");
+		});
+		const buildApp = mock(async () => {
+			calls.push("build");
+			return {
+				imageUrl: "127.0.0.1:5000/nouva-app:dep_1",
+				imageSha: "sha256:test",
+				buildDuration: 100,
+				detectedLanguage: null,
+				detectedFramework: null,
+				languageVersion: null,
+				internalPort: 8080,
+			};
+		});
+		const deployAppImage = mock(async () => {
+			calls.push("deploy");
+			return {
+				runtimeMetadata: null,
+			};
+		});
 
-    await buildAndDeployAppWithDependencies(
-      {
-        ensureBaseRuntime,
-        buildApp,
-        deployAppImage,
-      },
-      {} as never,
-      runtimeConfig,
-      payload,
-      "tcp://127.0.0.1:1234"
-    );
+		await buildAndDeployAppWithDependencies(
+			{
+				ensureBaseRuntime,
+				buildApp,
+				deployAppImage,
+			},
+			{} as never,
+			runtimeConfig,
+			appPayload,
+			"tcp://127.0.0.1:1234",
+		);
 
-    expect(calls).toEqual(["ensure", "build", "deploy"]);
-    expect(buildApp).toHaveBeenCalledWith(
-      expect.objectContaining({
-        appBuildType: "dockerfile",
-        appBuildConfig: payload.appBuildConfig,
-      })
-    );
-  });
+		expect(calls).toEqual(["ensure", "build", "deploy"]);
+		expect(buildApp).toHaveBeenCalledWith(
+			expect.objectContaining({
+				appBuildType: "dockerfile",
+				appBuildConfig: appPayload.appBuildConfig,
+			}),
+		);
+		expect(deployAppImage.mock.calls[0]?.[2]).toEqual(
+			expect.objectContaining({
+				resourceLimits: appPayload.resourceLimits,
+			}),
+		);
+	});
+});
+
+describe("buildAppContainerSpec", () => {
+	test("includes Docker CPU and memory limits when resource limits are provided", () => {
+		const spec = buildAppContainerSpec(runtimeConfig, appRuntimePayload);
+
+		expect(spec.spec.hostConfig).toEqual(
+			expect.objectContaining({
+				NanoCpus: 1_500_000_000,
+				Memory: 2 * 1024 * 1024 * 1024,
+			}),
+		);
+	});
+
+	test("omits Docker CPU and memory limits when resource limits are null", () => {
+		const spec = buildAppContainerSpec(runtimeConfig, {
+			...appRuntimePayload,
+			resourceLimits: null,
+		});
+
+		expect(spec.spec.hostConfig).not.toHaveProperty("NanoCpus");
+		expect(spec.spec.hostConfig).not.toHaveProperty("Memory");
+	});
+});
+
+describe("buildDatabaseContainerSpec", () => {
+	test("includes Docker resource limits for provisioned database containers", () => {
+		const spec = buildDatabaseContainerSpec(databasePayload);
+
+		expect(spec.spec.hostConfig).toEqual(
+			expect.objectContaining({
+				NanoCpus: 1_500_000_000,
+				Memory: 2 * 1024 * 1024 * 1024,
+			}),
+		);
+	});
+
+	test("omits Docker CPU and memory limits for unlimited database containers", () => {
+		const spec = buildDatabaseContainerSpec({
+			...databasePayload,
+			resourceLimits: null,
+		});
+
+		expect(spec.spec.hostConfig).not.toHaveProperty("NanoCpus");
+		expect(spec.spec.hostConfig).not.toHaveProperty("Memory");
+	});
+});
+
+describe("database runtime recreate paths", () => {
+	test("applies Docker resource limits during database provision", async () => {
+		const docker = createDockerMock();
+
+		await handleDatabaseProvision(docker as never, databasePayload);
+
+		expect(docker.ensureContainer.mock.calls[0]?.[0]).toEqual(
+			expect.objectContaining({
+				hostConfig: expect.objectContaining({
+					NanoCpus: 1_500_000_000,
+					Memory: 2 * 1024 * 1024 * 1024,
+				}),
+			}),
+		);
+	});
+
+	test("applies Docker resource limits when reapplying a database volume", async () => {
+		const docker = createDockerMock();
+
+		await handleApplyDatabaseVolume(docker as never, {
+			...databasePayload,
+			resourceLimits: {
+				memoryBytes: 1024 * 1024 * 1024,
+			},
+			runtimeMetadata: {
+				containerName: "nouva-postgres-prev",
+			},
+		});
+
+		expect(docker.removeContainer).toHaveBeenCalledWith(
+			"nouva-postgres-prev",
+			true,
+		);
+		expect(docker.ensureContainer.mock.calls[0]?.[0]).toEqual(
+			expect.objectContaining({
+				hostConfig: expect.objectContaining({
+					Memory: 1024 * 1024 * 1024,
+				}),
+			}),
+		);
+		expect(
+			docker.ensureContainer.mock.calls[0]?.[0]?.hostConfig,
+		).not.toHaveProperty("NanoCpus");
+	});
+
+	test("applies Docker resource limits when recreating a database after PITR", async () => {
+		const docker = createDockerMock();
+
+		await handleRestorePostgresPitr(docker as never, {
+			...databasePayload,
+			restoreTarget: "2026-03-25T00:00:00Z",
+			runtimeMetadata: {
+				containerName: "nouva-postgres-prev",
+			},
+		});
+
+		expect(docker.stopContainer).toHaveBeenCalledWith("nouva-postgres-prev");
+		expect(docker.ensureContainer.mock.calls[0]?.[0]).toEqual(
+			expect.objectContaining({
+				hostConfig: expect.objectContaining({
+					NanoCpus: 1_500_000_000,
+					Memory: 2 * 1024 * 1024 * 1024,
+				}),
+			}),
+		);
+	});
 });
