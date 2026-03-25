@@ -29,6 +29,7 @@ import {
   type SyncRoutingPayload,
 } from "./protocol.js";
 import { buildApp, hashProjectNetwork } from "./build.js";
+import { buildAndDeployAppWithDependencies } from "./app-build-runtime.js";
 import { DockerApiClient } from "./docker-api.js";
 import { resolveDatabaseProvisionSpec } from "./service-runtime.js";
 import { resolveUpdateAgentImageRef, toUpdateAgentPayload } from "./update-agent.js";
@@ -50,8 +51,10 @@ const BUILDKIT_ADDRESS = process.env.NOUVA_AGENT_BUILDKIT_ADDR || "tcp://127.0.0
 const BACKUP_HELPER_IMAGE =
   process.env.NOUVA_BACKUP_HELPER_IMAGE || "ghcr.io/nouvacloud/backup-helper:latest";
 
-if (!API_URL || !SERVER_ID) {
-  throw new Error("Missing NOUVA_API_URL or NOUVA_SERVER_ID");
+function assertAgentBootstrapEnv(): void {
+  if (!API_URL || !SERVER_ID) {
+    throw new Error("Missing NOUVA_API_URL or NOUVA_SERVER_ID");
+  }
 }
 
 interface StoredCredentials {
@@ -771,24 +774,19 @@ async function ensureBaseRuntime(
     },
   });
 
+  const existingBuildkit = await docker.inspectContainer(BUILDKIT_CONTAINER_NAME);
+  if (existingBuildkit?.HostConfig?.NetworkMode !== "host") {
+    await docker.removeContainer(BUILDKIT_CONTAINER_NAME, true);
+  }
+
   await docker.ensureContainer({
     name: BUILDKIT_CONTAINER_NAME,
     image: "moby/buildkit:v0.17.0",
     cmd: ["--addr", "tcp://0.0.0.0:1234"],
     labels: buildLabels({ kind: "buildkit" }),
-    exposedPorts: {
-      "1234/tcp": {},
-    },
     hostConfig: {
       Privileged: true,
-      PortBindings: {
-        "1234/tcp": [
-          {
-            HostIp: "127.0.0.1",
-            HostPort: "1234",
-          },
-        ],
-      },
+      NetworkMode: "host",
       RestartPolicy: {
         Name: "unless-stopped",
       },
@@ -977,25 +975,19 @@ async function handleBuildAndDeployApp(
   config: AgentRuntimeConfig,
   payload: AppDeployPayload
 ) {
-  const buildResult = await buildApp({
-    repoUrl: payload.repoUrl,
-    commitHash: payload.commitHash,
-    deploymentId: payload.deploymentId,
-    envVars: payload.envVars,
-    localRegistryHost: config.localRegistryHost,
-    localRegistryPort: config.localRegistryPort,
-    buildkitAddress: BUILDKIT_ADDRESS,
-  });
+  const dependencies = {
+    ensureBaseRuntime,
+    buildApp,
+    deployAppImage,
+  };
 
-  return await deployAppImage(docker, config, {
-    ...payload,
-    imageUrl: buildResult.imageUrl,
-    buildDuration: buildResult.buildDuration,
-    detectedLanguage: buildResult.detectedLanguage,
-    detectedFramework: buildResult.detectedFramework,
-    languageVersion: buildResult.languageVersion,
-    internalPort: buildResult.internalPort,
-  });
+  return await buildAndDeployAppWithDependencies(
+    dependencies,
+    docker,
+    config,
+    payload,
+    BUILDKIT_ADDRESS
+  );
 }
 
 async function handleDeployOnlyApp(
@@ -1805,6 +1797,7 @@ async function collectMetrics(docker: DockerApiClient): Promise<AgentMetricsEnve
 }
 
 async function main() {
+  assertAgentBootstrapEnv();
   await mkdir(DATA_DIR, { recursive: true });
   const docker = await DockerApiClient.create();
   let credentials = await readCredentials();
@@ -1905,7 +1898,9 @@ async function main() {
   }, config.pollIntervalSeconds * 1000);
 }
 
-main().catch((error) => {
-  console.error("[nouva-agent] fatal", error);
-  process.exit(1);
-});
+if (import.meta.main) {
+  main().catch((error) => {
+    console.error("[nouva-agent] fatal", error);
+    process.exit(1);
+  });
+}

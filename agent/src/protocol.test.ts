@@ -183,6 +183,33 @@ describe("agent protocol", () => {
     expect(JSON.parse(JSON.stringify(payload))).toEqual(payload);
   });
 
+  test("round-trips app build settings in deploy payloads", () => {
+    const payload = {
+      repoUrl: "https://example.com/repo.git",
+      commitHash: "abc123",
+      commitMessage: "feat: deploy",
+      branch: "main",
+      subdomain: "frontend",
+      serviceName: "frontend",
+      projectId: "proj_1",
+      serviceId: "svc_1",
+      deploymentId: "dep_1",
+      envVars: {
+        NODE_ENV: "production",
+      },
+      appBuildType: "static" as const,
+      appBuildConfig: {
+        buildRoot: "apps/web",
+        publishDirectory: "dist",
+        spaFallback: true,
+      },
+      resourceLimits: null,
+      runtimeMetadata: null,
+    };
+
+    expect(JSON.parse(JSON.stringify(payload))).toEqual(payload);
+  });
+
   test("treats queued and expired work items as leaseable", () => {
     expect(
       canLeaseWorkItem({

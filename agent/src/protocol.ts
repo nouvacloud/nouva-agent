@@ -63,6 +63,36 @@ export type RuntimeMetadata = {
   [key: string]: unknown;
 };
 
+export interface ServiceResourceLimits {
+  cpuMillicores?: number;
+  memoryBytes?: number;
+}
+
+export const APP_BUILD_TYPES = ["railpack", "dockerfile", "static"] as const;
+export type AppBuildType = (typeof APP_BUILD_TYPES)[number];
+
+export interface AppRailpackBuildConfig {
+  buildRoot: string;
+}
+
+export interface AppDockerfileBuildConfig {
+  buildRoot: string;
+  dockerfilePath: string;
+  dockerContextPath: string;
+  dockerBuildStage?: string | null;
+}
+
+export interface AppStaticBuildConfig {
+  buildRoot: string;
+  publishDirectory: string;
+  spaFallback: boolean;
+}
+
+export type AppBuildConfig =
+  | AppRailpackBuildConfig
+  | AppDockerfileBuildConfig
+  | AppStaticBuildConfig;
+
 export type AgentCapabilities = {
   dockerApi?: boolean;
   buildkit?: boolean;
@@ -185,6 +215,9 @@ export interface AppDeployPayload {
   serviceId: string;
   deploymentId: string;
   envVars: Record<string, string>;
+  appBuildType?: AppBuildType | null;
+  appBuildConfig?: AppBuildConfig | null;
+  resourceLimits: ServiceResourceLimits | null;
   buildCommand?: string;
   startCommand?: string;
   runtimeMetadata?: RuntimeMetadata | null;
@@ -199,6 +232,7 @@ export interface DeployOnlyPayload {
   serviceId: string;
   deploymentId: string;
   envVars: Record<string, string>;
+  resourceLimits: ServiceResourceLimits | null;
   runtimeMetadata?: RuntimeMetadata | null;
 }
 

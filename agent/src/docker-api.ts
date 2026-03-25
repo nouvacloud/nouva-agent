@@ -150,6 +150,7 @@ export class DockerApiClient {
     Id: string;
     Name: string;
     State?: { Running?: boolean };
+    HostConfig?: { NetworkMode?: string };
   } | null> {
     try {
       return await this.request("GET", `/containers/${encodeURIComponent(nameOrId)}/json`);
