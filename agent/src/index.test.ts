@@ -8,6 +8,7 @@ import {
   handleDatabaseProvision,
   handleRestorePostgresPitr,
   normalizeRuntimeLogEntries,
+  prepareAppBuildkitRuntime,
 } from "./index.js";
 import type { AgentRuntimeConfig, AppDeployPayload, DatabaseProvisionPayload } from "./protocol.js";
 
@@ -166,6 +167,7 @@ describe("buildAndDeployAppWithDependencies", () => {
       expect.objectContaining({
         appBuildType: "dockerfile",
         appBuildConfig: appPayload.appBuildConfig,
+        resourceLimits: appPayload.resourceLimits,
       })
     );
     expect(deployAppImage.mock.calls[0]?.[2]).toEqual(
@@ -174,6 +176,76 @@ describe("buildAndDeployAppWithDependencies", () => {
         resourceLimits: appPayload.resourceLimits,
       })
     );
+  });
+});
+
+describe("prepareAppBuildkitRuntime", () => {
+  test("creates an isolated resource-limited BuildKit worker for bounded app builds", async () => {
+    const docker = {
+      ensureContainer: mock(async () => "buildkit_1"),
+      removeContainer: mock(async () => {}),
+    };
+    const waitUntilReady = mock(async () => {});
+
+    const runtime = await prepareAppBuildkitRuntime(
+      docker as never,
+      {
+        deploymentId: "dep_1",
+        resourceLimits,
+      },
+      {
+        allocatePort: async () => 4567,
+        waitUntilReady,
+      }
+    );
+
+    expect(runtime.address).toBe("tcp://127.0.0.1:4567");
+    expect(docker.ensureContainer).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: "nouva-buildkitd-dep_1",
+        cmd: ["--addr", "tcp://0.0.0.0:4567"],
+        hostConfig: expect.objectContaining({
+          Privileged: true,
+          NetworkMode: "host",
+          RestartPolicy: {
+            Name: "no",
+          },
+          NanoCpus: 1_500_000_000,
+          Memory: 2 * 1024 * 1024 * 1024,
+        }),
+      }),
+      true
+    );
+    expect(waitUntilReady).toHaveBeenCalledWith("tcp://127.0.0.1:4567");
+
+    await runtime.cleanup();
+
+    expect(docker.removeContainer).toHaveBeenCalledWith("nouva-buildkitd-dep_1", true);
+  });
+
+  test("reuses the shared BuildKit daemon for unlimited app builds", async () => {
+    const docker = {
+      ensureContainer: mock(async () => "buildkit_1"),
+      removeContainer: mock(async () => {}),
+    };
+
+    const runtime = await prepareAppBuildkitRuntime(
+      docker as never,
+      {
+        deploymentId: "dep_1",
+        resourceLimits: null,
+      },
+      {
+        sharedAddress: "tcp://127.0.0.1:1234",
+      }
+    );
+
+    expect(runtime.address).toBe("tcp://127.0.0.1:1234");
+    expect(docker.ensureContainer).not.toHaveBeenCalled();
+
+    await runtime.cleanup();
+
+    expect(docker.removeContainer).not.toHaveBeenCalled();
   });
 });
 

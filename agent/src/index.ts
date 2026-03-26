@@ -36,6 +36,7 @@ import {
   type RestoreVolumeBackupPayload,
   type RuntimeLogMessage,
   type RuntimeMetadata,
+  type ServiceResourceLimits,
   type ServerValidationReport,
   type SyncRoutingPayload,
 } from "./protocol.js";
@@ -52,10 +53,12 @@ const AGENT_VERSION = process.env.NOUVA_AGENT_VERSION || "0.3.0";
 const APP_DOMAIN = process.env.NOUVA_APP_DOMAIN || "nouva.cloud";
 const DATA_VOLUME = process.env.NOUVA_AGENT_DATA_VOLUME || "nouva-agent-data";
 const BUILDKIT_CONTAINER_NAME = process.env.NOUVA_AGENT_BUILDKIT_CONTAINER || "nouva-buildkitd";
+const BUILDKIT_IMAGE = "moby/buildkit:v0.17.0";
 const LOCAL_REGISTRY_CONTAINER_NAME =
   process.env.NOUVA_AGENT_REGISTRY_CONTAINER || "nouva-registry";
 const TRAEFIK_CONTAINER_NAME = process.env.NOUVA_AGENT_TRAEFIK_CONTAINER || "nouva-traefik";
 const BUILDKIT_ADDRESS = process.env.NOUVA_AGENT_BUILDKIT_ADDR || "tcp://127.0.0.1:1234";
+const DEFAULT_BUILDKIT_PORT = 1234;
 const BACKUP_HELPER_IMAGE =
   process.env.NOUVA_BACKUP_HELPER_IMAGE || "ghcr.io/nouvacloud/backup-helper:latest";
 const RUNTIME_LOG_SYNC_INTERVAL_MS = Number.parseInt(
@@ -609,6 +612,150 @@ function buildLabels(input: {
   };
 }
 
+function resolveBuildkitPort(address: string): number {
+  try {
+    const parsed = new URL(address);
+    if (parsed.protocol !== "tcp:") {
+      throw new Error("unsupported protocol");
+    }
+
+    const port = Number.parseInt(parsed.port, 10);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new Error("invalid port");
+    }
+
+    return port;
+  } catch {
+    return DEFAULT_BUILDKIT_PORT;
+  }
+}
+
+function buildScopedBuildkitContainerName(deploymentId: string): string {
+  const sanitized = deploymentId.toLowerCase().replace(/[^a-z0-9_.-]+/g, "-");
+  const suffix = sanitized.slice(0, 24) || "build";
+  return `nouva-buildkitd-${suffix}`;
+}
+
+function createBuildkitAddress(port: number): string {
+  return `tcp://127.0.0.1:${port}`;
+}
+
+async function allocateAvailableLocalPort(): Promise<number> {
+  return await new Promise<number>((resolve, reject) => {
+    const server = net.createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (!address || typeof address !== "object") {
+        server.close();
+        reject(new Error("Failed to allocate a local TCP port for BuildKit"));
+        return;
+      }
+
+      server.close((error?: Error | null) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+
+        resolve(address.port);
+      });
+    });
+  });
+}
+
+async function waitForBuildkitAvailability(address: string, timeoutMs = 15_000): Promise<void> {
+  const port = resolveBuildkitPort(address);
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    if (await checkTcpConnect("127.0.0.1", port, 500)) {
+      return;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+
+  throw new Error(`BuildKit did not become ready at ${address} within ${timeoutMs}ms`);
+}
+
+function buildBuildkitContainerSpec(options: {
+  name: string;
+  port: number;
+  resourceLimits: ServiceResourceLimits | null;
+  restartPolicyName: "no" | "unless-stopped";
+  deploymentId?: string | null;
+}): DockerContainerSpec {
+  return {
+    name: options.name,
+    image: BUILDKIT_IMAGE,
+    cmd: ["--addr", `tcp://0.0.0.0:${options.port}`],
+    labels: buildLabels({
+      kind: "buildkit",
+      deploymentId: options.deploymentId ?? null,
+    }),
+    hostConfig: {
+      Privileged: true,
+      NetworkMode: "host",
+      RestartPolicy: {
+        Name: options.restartPolicyName,
+      },
+      ...toDockerResourceSettings(options.resourceLimits),
+    },
+  };
+}
+
+export interface PreparedAppBuildkitRuntime {
+  address: string;
+  cleanup: () => Promise<void>;
+}
+
+export async function prepareAppBuildkitRuntime(
+  docker: Pick<DockerApiClient, "ensureContainer" | "removeContainer">,
+  payload: Pick<AppDeployPayload, "deploymentId" | "resourceLimits">,
+  options: {
+    sharedAddress?: string;
+    allocatePort?: () => Promise<number>;
+    waitUntilReady?: (address: string) => Promise<void>;
+  } = {}
+): Promise<PreparedAppBuildkitRuntime> {
+  const sharedAddress = options.sharedAddress ?? BUILDKIT_ADDRESS;
+  if (!payload.resourceLimits) {
+    return {
+      address: sharedAddress,
+      cleanup: async () => {},
+    };
+  }
+
+  const port = await (options.allocatePort ?? allocateAvailableLocalPort)();
+  const containerName = buildScopedBuildkitContainerName(payload.deploymentId);
+  const address = createBuildkitAddress(port);
+
+  try {
+    await docker.ensureContainer(
+      buildBuildkitContainerSpec({
+        name: containerName,
+        port,
+        resourceLimits: payload.resourceLimits,
+        restartPolicyName: "no",
+        deploymentId: payload.deploymentId,
+      }),
+      true
+    );
+    await (options.waitUntilReady ?? waitForBuildkitAvailability)(address);
+  } catch (error) {
+    await docker.removeContainer(containerName, true);
+    throw error;
+  }
+
+  return {
+    address,
+    cleanup: async () => {
+      await docker.removeContainer(containerName, true);
+    },
+  };
+}
+
 type ManagedContainerRecord = Awaited<ReturnType<DockerApiClient["listManagedContainers"]>>[number];
 
 export interface RuntimeLogCursor {
@@ -896,19 +1043,14 @@ async function ensureBaseRuntime(
     await docker.removeContainer(BUILDKIT_CONTAINER_NAME, true);
   }
 
-  await docker.ensureContainer({
-    name: BUILDKIT_CONTAINER_NAME,
-    image: "moby/buildkit:v0.17.0",
-    cmd: ["--addr", "tcp://0.0.0.0:1234"],
-    labels: buildLabels({ kind: "buildkit" }),
-    hostConfig: {
-      Privileged: true,
-      NetworkMode: "host",
-      RestartPolicy: {
-        Name: "unless-stopped",
-      },
-    },
-  });
+  await docker.ensureContainer(
+    buildBuildkitContainerSpec({
+      name: BUILDKIT_CONTAINER_NAME,
+      port: resolveBuildkitPort(BUILDKIT_ADDRESS),
+      resourceLimits: null,
+      restartPolicyName: "unless-stopped",
+    })
+  );
 
   await docker.ensureContainer({
     name: TRAEFIK_CONTAINER_NAME,
@@ -1109,19 +1251,24 @@ async function handleBuildAndDeployApp(
   config: AgentRuntimeConfig,
   payload: AppDeployPayload
 ) {
+  const buildkitRuntime = await prepareAppBuildkitRuntime(docker, payload);
   const dependencies = {
     ensureBaseRuntime,
     buildApp,
     deployAppImage,
   };
 
-  return await buildAndDeployAppWithDependencies(
-    dependencies,
-    docker,
-    config,
-    payload,
-    BUILDKIT_ADDRESS
-  );
+  try {
+    return await buildAndDeployAppWithDependencies(
+      dependencies,
+      docker,
+      config,
+      payload,
+      buildkitRuntime.address
+    );
+  } finally {
+    await buildkitRuntime.cleanup();
+  }
 }
 
 async function handleDeployOnlyApp(

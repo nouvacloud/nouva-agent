@@ -34,6 +34,7 @@ export interface BuildAndDeployAppDependencies {
 		commitHash: string;
 		deploymentId: string;
 		envVars: Record<string, string>;
+		resourceLimits: AppDeployPayload["resourceLimits"];
 		localRegistryHost: string;
 		localRegistryPort: number;
 		buildkitAddress: string;
@@ -61,6 +62,7 @@ export async function buildAndDeployAppWithDependencies(
 		commitHash: payload.commitHash,
 		deploymentId: payload.deploymentId,
 		envVars: payload.envVars,
+		resourceLimits: payload.resourceLimits,
 		localRegistryHost: config.localRegistryHost,
 		localRegistryPort: config.localRegistryPort,
 		buildkitAddress,

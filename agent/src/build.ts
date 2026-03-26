@@ -10,6 +10,7 @@ import type {
   AppDockerfileBuildConfig,
   AppRailpackBuildConfig,
   AppStaticBuildConfig,
+  ServiceResourceLimits,
 } from "./protocol.js";
 
 const execFile = promisify(execFileCallback);
@@ -32,6 +33,7 @@ export interface BuildAppOptions {
   commitHash: string;
   deploymentId: string;
   envVars: Record<string, string>;
+  resourceLimits: ServiceResourceLimits | null;
   localRegistryHost: string;
   localRegistryPort: number;
   buildkitAddress: string;
