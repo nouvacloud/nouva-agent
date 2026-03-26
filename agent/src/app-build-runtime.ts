@@ -14,6 +14,7 @@ export interface DeployAppImageInput {
 	subdomain: string;
 	envVars: Record<string, string>;
 	imageUrl: string;
+	volume?: AppDeployPayload["volume"];
 	resourceLimits: AppDeployPayload["resourceLimits"];
 	runtimeMetadata?: RuntimeMetadata | null;
 	detectedLanguage?: string | null;

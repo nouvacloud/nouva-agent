@@ -1016,6 +1016,17 @@ export function buildAppContainerSpec(
         deploymentId: payload.deploymentId,
       }),
       hostConfig: {
+        ...(payload.volume
+          ? {
+              Mounts: [
+                {
+                  Type: "volume",
+                  Source: payload.volume.volumeName,
+                  Target: payload.volume.mountPath,
+                },
+              ],
+            }
+          : {}),
         RestartPolicy: {
           Name: "unless-stopped",
         },
@@ -1047,6 +1058,9 @@ export async function deployAppImage(
   }
 
   const { containerName, appPort, spec } = buildAppContainerSpec(config, payload);
+  if (payload.volume) {
+    await docker.createVolume(payload.volume.volumeName);
+  }
   const containerId = await docker.ensureContainer(spec, true);
   await docker.connectNetwork(projectNetwork, containerId).catch((err: Error) => {
     console.error(

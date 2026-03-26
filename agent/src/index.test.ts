@@ -52,6 +52,11 @@ const appPayload: AppDeployPayload = {
     dockerContextPath: ".",
     dockerBuildStage: "runner",
   },
+  volume: {
+    volumeId: "vol_1",
+    volumeName: "nouva-vol-vol_1",
+    mountPath: "/data",
+  },
   resourceLimits,
   runtimeMetadata: null,
 };
@@ -66,6 +71,11 @@ const appRuntimePayload: DeployAppImageInput = {
     PORT: "8080",
   },
   imageUrl: "127.0.0.1:5000/nouva-app:dep_1",
+  volume: {
+    volumeId: "vol_1",
+    volumeName: "nouva-vol-vol_1",
+    mountPath: "/data",
+  },
   resourceLimits,
   runtimeMetadata: null,
   detectedLanguage: null,
@@ -160,6 +170,7 @@ describe("buildAndDeployAppWithDependencies", () => {
     );
     expect(deployAppImage.mock.calls[0]?.[2]).toEqual(
       expect.objectContaining({
+        volume: appPayload.volume,
         resourceLimits: appPayload.resourceLimits,
       })
     );
@@ -186,6 +197,22 @@ describe("buildAppContainerSpec", () => {
 
     expect(spec.spec.hostConfig).not.toHaveProperty("NanoCpus");
     expect(spec.spec.hostConfig).not.toHaveProperty("Memory");
+  });
+
+  test("mounts managed app volumes when they are provided", () => {
+    const spec = buildAppContainerSpec(runtimeConfig, appRuntimePayload);
+
+    expect(spec.spec.hostConfig).toEqual(
+      expect.objectContaining({
+        Mounts: [
+          {
+            Type: "volume",
+            Source: "nouva-vol-vol_1",
+            Target: "/data",
+          },
+        ],
+      })
+    );
   });
 });
 

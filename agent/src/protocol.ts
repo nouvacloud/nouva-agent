@@ -234,6 +234,7 @@ export interface AppDeployPayload {
   envVars: Record<string, string>;
   appBuildType?: AppBuildType | null;
   appBuildConfig?: AppBuildConfig | null;
+  volume?: AppVolumeIdentity | null;
   resourceLimits: ServiceResourceLimits | null;
   buildCommand?: string;
   startCommand?: string;
@@ -249,8 +250,15 @@ export interface DeployOnlyPayload {
   serviceId: string;
   deploymentId: string;
   envVars: Record<string, string>;
+  volume?: AppVolumeIdentity | null;
   resourceLimits: ServiceResourceLimits | null;
   runtimeMetadata?: RuntimeMetadata | null;
+}
+
+export interface AppVolumeIdentity {
+  volumeId: string;
+  volumeName: string;
+  mountPath: string;
 }
 
 export interface DatabaseProvisionPayload {
