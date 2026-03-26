@@ -59,6 +59,7 @@ interface StrategyBuildResult {
 
 interface BuildctlImageBuildOptions {
   buildkitAddress: string;
+  buildArgs?: Record<string, string>;
   contextDir: string;
   dockerfileDir: string;
   dockerfileName: string;
@@ -258,6 +259,10 @@ export function buildDockerfileBuildctlArgs(options: BuildctlImageBuildOptions):
     "platform=linux/amd64",
   ];
 
+  for (const key of Object.keys(options.buildArgs ?? {}).sort()) {
+    args.push("--opt", `build-arg:${key}=${options.buildArgs![key]}`);
+  }
+
   if (options.targetStage) {
     args.push("--opt", `target=${options.targetStage}`);
   }
@@ -366,6 +371,7 @@ async function buildDockerfileApplication(options: {
   const imageSha = await runBuildctlBuild(
     {
       buildkitAddress: options.buildkitAddress,
+      buildArgs: options.envVars,
       contextDir,
       dockerfileDir: path.dirname(dockerfileAbsolutePath),
       dockerfileName: path.basename(dockerfileAbsolutePath),

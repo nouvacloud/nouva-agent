@@ -40,6 +40,10 @@ describe("build helpers", () => {
     expect(
       buildDockerfileBuildctlArgs({
         buildkitAddress: "tcp://127.0.0.1:1234",
+        buildArgs: {
+          NEXT_PUBLIC_API_URL: "https://api.example.com",
+          VITE_TITLE: "Nouva Cloud",
+        },
         contextDir: "/tmp/repo/apps/web",
         dockerfileDir: "/tmp/repo/apps/web/deploy",
         dockerfileName: "Dockerfile",
@@ -56,6 +60,10 @@ describe("build helpers", () => {
         "dockerfile=/tmp/repo/apps/web/deploy",
         "--opt",
         "filename=Dockerfile",
+        "--opt",
+        "build-arg:NEXT_PUBLIC_API_URL=https://api.example.com",
+        "--opt",
+        "build-arg:VITE_TITLE=Nouva Cloud",
         "--opt",
         "target=runner",
       ])
