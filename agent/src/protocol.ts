@@ -101,6 +101,7 @@ export type AgentCapabilities = {
   hostMetrics?: boolean;
   containerMetrics?: boolean;
   runtimeLogs?: boolean;
+  postgresObservability?: boolean;
   [key: string]: boolean | undefined;
 };
 
@@ -108,6 +109,7 @@ export const DEFAULT_AGENT_HEARTBEAT_INTERVAL_SECONDS = 30;
 export const DEFAULT_AGENT_POLL_INTERVAL_SECONDS = 10;
 export const DEFAULT_AGENT_LEASE_TTL_SECONDS = 120;
 export const DEFAULT_AGENT_METRICS_INTERVAL_SECONDS = 30;
+export const DEFAULT_AGENT_POSTGRES_OBSERVABILITY_INTERVAL_SECONDS = 30;
 
 export type AgentIngressMode = "local_traefik";
 export type AgentBuildkitMode = "docker-container";
@@ -117,6 +119,7 @@ export interface AgentRuntimeConfig {
   pollIntervalSeconds: number;
   leaseTtlSeconds: number;
   metricsIntervalSeconds: number;
+  postgresObservabilityIntervalSeconds: number;
   ingressMode: AgentIngressMode;
   buildkitMode: AgentBuildkitMode;
   capabilities: AgentCapabilities;
@@ -191,6 +194,56 @@ export interface AgentServiceMetricPayload {
 export interface AgentMetricsEnvelope {
   server: AgentServerMetricPayload;
   services: AgentServiceMetricPayload[];
+}
+
+export type PostgresObservabilityExtensionStatus = {
+  pgStatMonitor: boolean;
+  pgCron: boolean;
+};
+
+export type PostgresObservabilityActiveSession = {
+  state: string;
+  count: number;
+};
+
+export type PostgresObservabilitySlowQuery = {
+  queryId: string;
+  query: string;
+  calls: number;
+  rows: number;
+  totalTimeMs: number;
+  meanTimeMs: number;
+  minTimeMs: number;
+  maxTimeMs: number;
+};
+
+export type PostgresObservabilitySampleStatus = "success" | "error";
+
+export interface PostgresObservabilitySnapshot {
+  collectedAt: string;
+  extensionStatus: PostgresObservabilityExtensionStatus;
+  activeSessions: PostgresObservabilityActiveSession[];
+  slowQueries: PostgresObservabilitySlowQuery[];
+}
+
+export interface AgentPostgresObservabilitySample {
+  serviceId: string;
+  collectedAt: string;
+  status: PostgresObservabilitySampleStatus;
+  errorMessage?: string | null;
+  extensionStatus?: PostgresObservabilityExtensionStatus | null;
+  activeSessions?: PostgresObservabilityActiveSession[] | null;
+  slowQueries?: PostgresObservabilitySlowQuery[] | null;
+}
+
+export interface AgentPostgresObservabilityRequest {
+  serverId: string;
+  samples: AgentPostgresObservabilitySample[];
+}
+
+export interface AgentPostgresObservabilityResponse {
+  ok: true;
+  accepted: number;
 }
 
 export interface RuntimeLogMessage {
@@ -428,6 +481,7 @@ export function getDefaultAgentCapabilities(): AgentCapabilities {
     hostMetrics: true,
     containerMetrics: true,
     runtimeLogs: true,
+    postgresObservability: true,
   };
 }
 
@@ -451,6 +505,11 @@ export function getAgentRuntimeConfig(): AgentRuntimeConfig {
     metricsIntervalSeconds: Number.parseInt(
       process.env.NOUVA_AGENT_METRICS_INTERVAL_SECONDS ??
         String(DEFAULT_AGENT_METRICS_INTERVAL_SECONDS),
+      10
+    ),
+    postgresObservabilityIntervalSeconds: Number.parseInt(
+      process.env.NOUVA_AGENT_POSTGRES_OBSERVABILITY_INTERVAL_SECONDS ??
+        String(DEFAULT_AGENT_POSTGRES_OBSERVABILITY_INTERVAL_SECONDS),
       10
     ),
     ingressMode: "local_traefik",

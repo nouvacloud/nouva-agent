@@ -10,6 +10,9 @@
     "check-types": "bunx tsc --noEmit",
     "test": "bun test"
   },
+  "dependencies": {
+    "postgres": "^3.4.7"
+  },
   "devDependencies": {
     "@types/node": "^22.15.3",
     "typescript": "5.9.2"

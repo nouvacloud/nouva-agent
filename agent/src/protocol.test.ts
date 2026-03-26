@@ -7,6 +7,7 @@ import {
 	type AgentLeaseRequest,
 	type AgentLeaseResponse,
 	type AgentMetricsRequest,
+	type AgentPostgresObservabilityRequest,
 	type AgentRegistrationRequest,
 	type AgentRegistrationResponse,
 	type AgentWorkMutationRequest,
@@ -22,6 +23,7 @@ const runtimeEnvKeys = [
 	"NOUVA_AGENT_POLL_INTERVAL_SECONDS",
 	"NOUVA_AGENT_LEASE_TTL_SECONDS",
 	"NOUVA_AGENT_METRICS_INTERVAL_SECONDS",
+	"NOUVA_AGENT_POSTGRES_OBSERVABILITY_INTERVAL_SECONDS",
 	"NOUVA_AGENT_LOCAL_REGISTRY_HOST",
 	"NOUVA_AGENT_LOCAL_REGISTRY_PORT",
 	"NOUVA_AGENT_INGRESS_NETWORK",
@@ -108,6 +110,24 @@ describe("agent protocol", () => {
 			services: [],
 		} satisfies AgentMetricsRequest;
 
+		const postgresObservabilityRequest = {
+			serverId: "srv_123",
+			samples: [
+				{
+					serviceId: "svc_123",
+					collectedAt: new Date().toISOString(),
+					status: "success",
+					errorMessage: null,
+					extensionStatus: {
+						pgStatMonitor: true,
+						pgCron: false,
+					},
+					activeSessions: [{ state: "active", count: 2 }],
+					slowQueries: [],
+				},
+			],
+		} satisfies AgentPostgresObservabilityRequest;
+
 		const roundTrips = [
 			registrationRequest,
 			registrationResponse,
@@ -117,11 +137,13 @@ describe("agent protocol", () => {
 			leaseResponse,
 			mutationRequest,
 			metricsRequest,
+			postgresObservabilityRequest,
 		].map((value) => JSON.parse(JSON.stringify(value)));
 
-		expect(roundTrips).toHaveLength(8);
+		expect(roundTrips).toHaveLength(9);
 		expect(roundTrips[0]).toEqual(registrationRequest);
 		expect(roundTrips[7]).toEqual(metricsRequest);
+		expect(roundTrips[8]).toEqual(postgresObservabilityRequest);
 	});
 
 	test("includes the backup and PITR work kinds in the wire contract", () => {
@@ -326,6 +348,7 @@ describe("agent protocol", () => {
 		process.env.NOUVA_AGENT_POLL_INTERVAL_SECONDS = "12";
 		process.env.NOUVA_AGENT_LEASE_TTL_SECONDS = "240";
 		process.env.NOUVA_AGENT_METRICS_INTERVAL_SECONDS = "90";
+		process.env.NOUVA_AGENT_POSTGRES_OBSERVABILITY_INTERVAL_SECONDS = "75";
 		process.env.NOUVA_AGENT_LOCAL_REGISTRY_HOST = "registry.internal";
 		process.env.NOUVA_AGENT_LOCAL_REGISTRY_PORT = "not-a-number";
 		process.env.NOUVA_AGENT_INGRESS_NETWORK = "nouva-public";
@@ -336,6 +359,7 @@ describe("agent protocol", () => {
 		expect(config.pollIntervalSeconds).toBe(12);
 		expect(config.leaseTtlSeconds).toBe(240);
 		expect(config.metricsIntervalSeconds).toBe(90);
+		expect(config.postgresObservabilityIntervalSeconds).toBe(75);
 		expect(config.localRegistryHost).toBe("registry.internal");
 		expect(config.localRegistryPort).toBe(5000);
 		expect(config.localTraefikNetwork).toBe("nouva-public");
@@ -344,6 +368,7 @@ describe("agent protocol", () => {
 				dockerApi: true,
 				buildkit: true,
 				localRegistry: true,
+				postgresObservability: true,
 			}),
 		);
 	});

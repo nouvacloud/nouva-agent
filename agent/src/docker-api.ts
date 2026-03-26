@@ -7,6 +7,25 @@ import {
 
 type HttpMethod = "GET" | "POST" | "DELETE";
 
+export interface DockerContainerInspection {
+  Id: string;
+  Name: string;
+  State?: { Running?: boolean };
+  HostConfig?: { NetworkMode?: string };
+  Config?: {
+    Env?: string[];
+    Labels?: Record<string, string>;
+  };
+  NetworkSettings?: {
+    Networks?: Record<
+      string,
+      {
+        IPAddress?: string;
+      }
+    >;
+  };
+}
+
 export interface DockerContainerSpec {
   name: string;
   image: string;
@@ -259,12 +278,7 @@ export class DockerApiClient {
     } catch {}
   }
 
-  async inspectContainer(nameOrId: string): Promise<{
-    Id: string;
-    Name: string;
-    State?: { Running?: boolean };
-    HostConfig?: { NetworkMode?: string };
-  } | null> {
+  async inspectContainer(nameOrId: string): Promise<DockerContainerInspection | null> {
     try {
       return await this.request("GET", `/containers/${encodeURIComponent(nameOrId)}/json`);
     } catch {

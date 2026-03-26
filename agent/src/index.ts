@@ -15,6 +15,8 @@ import {
   type AgentLeaseResponse,
   type AgentMetricsEnvelope,
   type AgentMetricsRequest,
+  type AgentPostgresObservabilityRequest,
+  type AgentPostgresObservabilityResponse,
   type AgentRegistrationResponse,
   type AgentRuntimeConfig,
   type AgentRuntimeLogBatch,
@@ -40,6 +42,7 @@ import {
   type ServerValidationReport,
   type SyncRoutingPayload,
 } from "./protocol.js";
+import { collectPostgresObservabilitySamples } from "./postgres-observability.js";
 import { resolveDatabaseProvisionSpec } from "./service-runtime.js";
 import { resolveUpdateAgentImageRef, toUpdateAgentPayload } from "./update-agent.js";
 
@@ -601,6 +604,7 @@ function buildLabels(input: {
   projectId?: string | null;
   serviceId?: string | null;
   deploymentId?: string | null;
+  serviceVariant?: string | null;
 }): Record<string, string> {
   return {
     "nouva.managed": "true",
@@ -609,6 +613,7 @@ function buildLabels(input: {
     ...(input.projectId ? { "nouva.project.id": input.projectId } : {}),
     ...(input.serviceId ? { "nouva.service.id": input.serviceId } : {}),
     ...(input.deploymentId ? { "nouva.deployment.id": input.deploymentId } : {}),
+    ...(input.serviceVariant ? { "nouva.service.variant": input.serviceVariant } : {}),
   };
 }
 
@@ -1341,6 +1346,7 @@ export function buildDatabaseContainerSpec(payload: DatabaseProvisionPayload): {
         kind: "database",
         projectId: payload.projectId,
         serviceId: payload.serviceId,
+        serviceVariant: payload.variant,
       }),
       exposedPorts: {
         [`${resolved.internalPort}/tcp`]: {},
@@ -2174,6 +2180,30 @@ async function syncRuntimeLogs(
   return response.accepted;
 }
 
+async function syncPostgresObservability(
+  docker: DockerApiClient,
+  credentials: StoredCredentials
+): Promise<number> {
+  const samples = await collectPostgresObservabilitySamples(docker);
+  if (samples.length === 0) {
+    return 0;
+  }
+
+  const response = await apiRequest<AgentPostgresObservabilityResponse>(
+    "/api/agent/observability/postgres",
+    {
+      method: "POST",
+      token: credentials.agentToken,
+      body: {
+        serverId: SERVER_ID!,
+        samples,
+      } satisfies AgentPostgresObservabilityRequest,
+    }
+  );
+
+  return response.accepted;
+}
+
 async function main() {
   assertAgentBootstrapEnv();
   await mkdir(DATA_DIR, { recursive: true });
@@ -2190,6 +2220,7 @@ async function main() {
   config = await sendHeartbeat(docker, credentials);
   let workLoopActive = false;
   let runtimeLogLoopActive = false;
+  let postgresObservabilityLoopActive = false;
   let isShuttingDown = false;
   const runtimeLogCursors = new Map<string, RuntimeLogCursor>();
 
@@ -2198,7 +2229,10 @@ async function main() {
     isShuttingDown = true;
     console.log("[nouva-agent] shutting down, draining work and log loops...");
     const deadline = Date.now() + 9_000;
-    while ((workLoopActive || runtimeLogLoopActive) && Date.now() < deadline) {
+    while (
+      (workLoopActive || runtimeLogLoopActive || postgresObservabilityLoopActive) &&
+      Date.now() < deadline
+    ) {
       await new Promise((r) => setTimeout(r, 100));
     }
     process.exit(0);
@@ -2249,6 +2283,23 @@ async function main() {
         console.error("[nouva-agent] metrics failed", error);
       });
   }, config.metricsIntervalSeconds * 1000);
+
+  if (config.postgresObservabilityIntervalSeconds > 0) {
+    setInterval(() => {
+      if (postgresObservabilityLoopActive || isShuttingDown) {
+        return;
+      }
+
+      postgresObservabilityLoopActive = true;
+      syncPostgresObservability(docker, credentials!)
+        .catch((error) => {
+          console.error("[nouva-agent] postgres observability sync failed", error);
+        })
+        .finally(() => {
+          postgresObservabilityLoopActive = false;
+        });
+    }, config.postgresObservabilityIntervalSeconds * 1000);
+  }
 
   if (RUNTIME_LOG_SYNC_INTERVAL_MS > 0) {
     setInterval(() => {

@@ -17,6 +17,7 @@ const runtimeConfig: AgentRuntimeConfig = {
   pollIntervalSeconds: 10,
   leaseTtlSeconds: 120,
   metricsIntervalSeconds: 30,
+  postgresObservabilityIntervalSeconds: 30,
   ingressMode: "local_traefik",
   buildkitMode: "docker-container",
   capabilities: {
@@ -24,6 +25,7 @@ const runtimeConfig: AgentRuntimeConfig = {
     buildkit: true,
     localRegistry: true,
     localTraefik: true,
+    postgresObservability: true,
   },
   localRegistryHost: "127.0.0.1",
   localRegistryPort: 5000,
