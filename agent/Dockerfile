@@ -44,14 +44,12 @@ RUN bun install --frozen-lockfile --production
 
 COPY agent ./agent
 
-ARG NOUVA_AGENT_VERSION=0.3.0
 ARG VCS_REF=local
 LABEL org.opencontainers.image.source="https://github.com/nouvacloud/nouva-agent"
 LABEL org.opencontainers.image.revision="${VCS_REF}"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 
 ENV NODE_ENV=production
-ENV NOUVA_AGENT_VERSION=${NOUVA_AGENT_VERSION}
 
 WORKDIR /app/agent
 CMD ["bun", "src/index.ts"]

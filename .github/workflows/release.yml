@@ -52,6 +52,23 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Validate release tag matches agent package version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          node <<'EOF'
+          const pkg = require("./agent/package.json");
+          const actualTag = process.env.RELEASE_TAG;
+          const expectedTag = `v${pkg.version}`;
+
+          if (actualTag !== expectedTag) {
+            console.error(
+              `Release tag ${actualTag} does not match agent/package.json version ${pkg.version}. Expected ${expectedTag}.`
+            );
+            process.exit(1);
+          }
+          EOF
+
       - name: Typecheck
         run: bun run check-types
 
@@ -73,7 +90,6 @@ jobs:
           file: agent/Dockerfile
           push: true
           build-args: |
-            NOUVA_AGENT_VERSION=${{ github.event.release.tag_name }}
             VCS_REF=${{ github.sha }}
           tags: |
             ${{ env.IMAGE_NAME }}:${{ github.event.release.tag_name }}

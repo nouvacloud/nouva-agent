@@ -61,7 +61,6 @@ docker run -d \
 | Variable | Default | Description |
 |---|---|---|
 | `NOUVA_REGISTRATION_TOKEN` | — | Initial registration token |
-| `NOUVA_AGENT_VERSION` | `0.3.0` | Reported agent version |
 | `NOUVA_APP_DOMAIN` | `nouva.cloud` | Base domain for deployed apps |
 | `NOUVA_AGENT_DATA_VOLUME` | `nouva-agent-data` | Agent data volume name |
 | `NOUVA_AGENT_BUILDKIT_CONTAINER` | `nouva-buildkitd` | BuildKit container name |
@@ -73,6 +72,9 @@ docker run -d \
 | `NOUVA_IMAGE_REGISTRY` | — | Custom image registry |
 | `NOUVA_POSTGRES_IMAGE` | — | PostgreSQL image URL |
 | `NOUVA_BACKUP_HELPER_IMAGE` | `ghcr.io/nouvacloud/backup-helper:latest` | Backup helper image |
+
+The agent reports its version from `agent/package.json`, normalized to the release tag format
+(`v${version}`). Publish releases with a matching GitHub release tag.
 
 ## Architecture
 

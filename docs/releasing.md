@@ -16,9 +16,14 @@ The release workflow fails before build and push if either secret is missing.
 ## Publish `v0.1.0`
 
 1. Ensure `main` is in the state you want to ship and that CI is green.
-2. Create tag `v0.1.0` from `main`.
-3. Publish a GitHub Release for `v0.1.0` targeting that tag.
-4. Wait for the `Release` workflow to complete successfully.
+2. Update `agent/package.json` to the version you intend to release, without a `v` prefix.
+3. Create tag `v0.1.0` from `main`, matching `v${agent/package.json version}` exactly.
+4. Publish a GitHub Release for `v0.1.0` targeting that tag.
+5. Wait for the `Release` workflow to complete successfully.
+
+The release workflow now fails if the published GitHub release tag does not match
+`v${agent/package.json version}`. The running agent reports that normalized value on register and
+heartbeat.
 
 ## Verify the published artifacts
 
