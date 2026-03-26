@@ -446,15 +446,24 @@ export interface ExpireVolumeBackupRepositoryPayload {
 }
 
 export interface RestartServicePayload {
+  [key: string]: unknown;
   projectId: string;
   serviceId: string;
+  serviceName: string;
+  variant: "postgres" | "redis";
+  containerName: string;
   deploymentId?: string | null;
   runtimeMetadata?: RuntimeMetadata | null;
 }
 
 export interface RemoveServicePayload {
+  [key: string]: unknown;
   projectId: string;
   serviceId: string;
+  serviceName: string;
+  serviceType: "app" | "database";
+  variant?: "postgres" | "redis" | null;
+  containerName?: string | null;
   deploymentId?: string | null;
   runtimeMetadata?: RuntimeMetadata | null;
 }

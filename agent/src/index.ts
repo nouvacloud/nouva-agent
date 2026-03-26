@@ -34,6 +34,8 @@ import {
   getAgentRuntimeConfig,
   getDefaultAgentCapabilities,
   parseHostMetricsSnapshot,
+  type RemoveServicePayload,
+  type RestartServicePayload,
   type RestorePostgresPitrPayload,
   type RestoreVolumeBackupPayload,
   type RuntimeLogMessage,
@@ -1766,16 +1768,31 @@ export async function handleRestorePostgresPitr(
   };
 }
 
-async function handleRestart(docker: DockerApiClient, runtimeMetadata: RuntimeMetadata | null) {
-  const identifier = runtimeMetadata?.containerId ?? runtimeMetadata?.containerName;
+async function handleRestart(docker: DockerApiClient, payload: RestartServicePayload) {
+  const identifier = resolveServiceContainerIdentifier(payload);
   if (!identifier) {
-    throw new Error("Missing runtime metadata for restart");
+    throw new Error("Missing container identifier for restart");
   }
 
   await docker.restartContainer(identifier);
   return {
-    runtimeMetadata,
+    runtimeMetadata: {
+      ...(payload.runtimeMetadata ?? {}),
+      containerName: payload.containerName ?? payload.runtimeMetadata?.containerName ?? null,
+    },
   };
+}
+
+export function resolveServiceContainerIdentifier(input: {
+  containerName?: string | null;
+  runtimeMetadata?: RuntimeMetadata | null;
+}): string | null {
+  return (
+    input.containerName ??
+    input.runtimeMetadata?.containerId ??
+    input.runtimeMetadata?.containerName ??
+    null
+  );
 }
 
 async function handleRemove(
@@ -1800,21 +1817,20 @@ async function handleRemove(
 
 async function handleDeleteService(
   docker: DockerApiClient,
-  serviceId: string,
-  runtimeMetadata: RuntimeMetadata | null
+  payload: RemoveServicePayload
 ) {
-  const identifier = runtimeMetadata?.containerId ?? runtimeMetadata?.containerName;
+  const identifier = resolveServiceContainerIdentifier(payload);
   if (identifier) {
     await docker.removeContainer(identifier, true);
   }
 
-  await deleteLocalRouteFile(serviceId);
+  await deleteLocalRouteFile(payload.serviceId);
   return {
     runtimeInstance: {
-      kind: "database",
+      kind: payload.serviceType === "app" ? "app" : "database",
       status: "removed",
-      containerId: runtimeMetadata?.containerId ?? null,
-      containerName: runtimeMetadata?.containerName ?? null,
+      containerId: payload.runtimeMetadata?.containerId ?? null,
+      containerName: identifier,
     },
   };
 }
@@ -1937,7 +1953,10 @@ async function processWorkItem(
         break;
       case "restart_app":
       case "restart_database":
-        result = await handleRestart(docker, toRuntimeMetadata(payload.runtimeMetadata));
+        result = await handleRestart(docker, {
+          ...(payload as unknown as RestartServicePayload),
+          runtimeMetadata: toRuntimeMetadata(payload.runtimeMetadata),
+        });
         break;
       case "remove_app":
         result = await handleRemove(
@@ -1959,11 +1978,10 @@ async function processWorkItem(
         });
         break;
       case "delete_service":
-        result = await handleDeleteService(
-          docker,
-          String(payload.serviceId),
-          toRuntimeMetadata(payload.runtimeMetadata)
-        );
+        result = await handleDeleteService(docker, {
+          ...(payload as unknown as RemoveServicePayload),
+          runtimeMetadata: toRuntimeMetadata(payload.runtimeMetadata),
+        });
         break;
       case "delete_volume":
         result = await handleDeleteVolume(docker, payload as unknown as DeleteVolumePayload);

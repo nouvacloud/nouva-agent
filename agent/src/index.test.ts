@@ -9,6 +9,7 @@ import {
   handleRestorePostgresPitr,
   normalizeRuntimeLogEntries,
   prepareAppBuildkitRuntime,
+  resolveServiceContainerIdentifier,
 } from "./index.js";
 import type { AgentRuntimeConfig, AppDeployPayload, DatabaseProvisionPayload } from "./protocol.js";
 
@@ -432,5 +433,19 @@ describe("database runtime recreate paths", () => {
         offset: 2,
       },
     ]);
+  });
+});
+
+describe("resolveServiceContainerIdentifier", () => {
+  test("prefers explicit container names over runtime metadata", () => {
+    expect(
+      resolveServiceContainerIdentifier({
+        containerName: "nouva-postgres-svc_1",
+        runtimeMetadata: {
+          containerId: "ctr_1",
+          containerName: "legacy-name",
+        },
+      })
+    ).toBe("nouva-postgres-svc_1");
   });
 });
