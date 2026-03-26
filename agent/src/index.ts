@@ -1739,12 +1739,6 @@ export async function handleRestorePostgresPitr(
   docker: DockerApiClient,
   payload: RestorePostgresPitrPayload
 ) {
-  const identifier = payload.runtimeMetadata?.containerId ?? payload.runtimeMetadata?.containerName;
-  if (identifier) {
-    await docker.stopContainer(identifier);
-    await docker.removeContainer(identifier, true);
-  }
-
   const spec = resolveDatabaseProvisionSpec(payload);
   await runTaskContainer(docker, {
     name: `nouva-pgbackrest-pitr-${payload.serviceId.slice(0, 12)}`,
@@ -1767,7 +1761,9 @@ export async function handleRestorePostgresPitr(
     timeoutMs: 30 * 60_000,
   });
 
-  return await handleDatabaseProvision(docker, payload);
+  return {
+    statusMessage: "PITR restore ready to apply",
+  };
 }
 
 async function handleRestart(docker: DockerApiClient, runtimeMetadata: RuntimeMetadata | null) {

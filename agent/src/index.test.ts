@@ -353,10 +353,10 @@ describe("database runtime recreate paths", () => {
     expect(docker.ensureContainer.mock.calls[0]?.[0]?.hostConfig).not.toHaveProperty("NanoCpus");
   });
 
-  test("applies Docker resource limits when recreating a database after PITR", async () => {
+  test("restores PITR into the staged volume without touching the live container", async () => {
     const docker = createDockerMock();
 
-    await handleRestorePostgresPitr(docker as never, {
+    const result = await handleRestorePostgresPitr(docker as never, {
       ...databasePayload,
       destination: {} as never,
       restoreTarget: "2026-03-25T00:00:00Z",
@@ -365,15 +365,15 @@ describe("database runtime recreate paths", () => {
       },
     });
 
-    expect(docker.stopContainer).toHaveBeenCalledWith("nouva-postgres-prev");
-    expect(docker.ensureContainer.mock.calls[0]?.[0]).toEqual(
-      expect.objectContaining({
-        hostConfig: expect.objectContaining({
-          NanoCpus: 1_500_000_000,
-          Memory: 2 * 1024 * 1024 * 1024,
-        }),
-      })
-    );
+    expect(result).toEqual({
+      statusMessage: "PITR restore ready to apply",
+    });
+    expect(docker.stopContainer).not.toHaveBeenCalled();
+    expect(docker.ensureContainer).not.toHaveBeenCalled();
+    expect(docker.createContainer).toHaveBeenCalledTimes(1);
+    expect(
+      docker.removeContainer.mock.calls.some((call) => call[0] === "nouva-postgres-prev")
+    ).toBe(false);
   });
 
   test("deduplicates overlapping runtime log batches and preserves offsets", () => {
