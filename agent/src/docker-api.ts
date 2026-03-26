@@ -19,6 +19,92 @@ export interface DockerContainerSpec {
   networkingConfig?: Record<string, unknown>;
 }
 
+export interface DockerLogEntry {
+  type: "stdout" | "stderr";
+  timestamp: string | null;
+  line: string;
+}
+
+function splitLogLines(raw: string): string[] {
+  return raw
+    .split(/\r?\n/)
+    .map((line) => line.replace(/\r$/, ""))
+    .filter((line) => line.length > 0);
+}
+
+function parseTimestampedLogLine(line: string): { timestamp: string | null; line: string } {
+  const separatorIndex = line.indexOf(" ");
+  if (separatorIndex <= 0) {
+    return {
+      timestamp: null,
+      line,
+    };
+  }
+
+  const timestamp = line.slice(0, separatorIndex);
+  if (!Number.isFinite(Date.parse(timestamp))) {
+    return {
+      timestamp: null,
+      line,
+    };
+  }
+
+  return {
+    timestamp,
+    line: line.slice(separatorIndex + 1),
+  };
+}
+
+export function parseDockerLogBuffer(buffer: Buffer, timestamps = false): DockerLogEntry[] {
+  const frames: Array<{ stream: "stdout" | "stderr"; payload: string }> = [];
+
+  if (buffer.length >= 8) {
+    let offset = 0;
+    let isMultiplexed = true;
+
+    while (offset + 8 <= buffer.length) {
+      const streamType = buffer[offset];
+      const payloadLength = buffer.readUInt32BE(offset + 4);
+      const payloadStart = offset + 8;
+      const payloadEnd = payloadStart + payloadLength;
+      if ((streamType !== 1 && streamType !== 2) || payloadEnd > buffer.length) {
+        isMultiplexed = false;
+        break;
+      }
+
+      frames.push({
+        stream: streamType === 2 ? "stderr" : "stdout",
+        payload: buffer.toString("utf8", payloadStart, payloadEnd),
+      });
+      offset = payloadEnd;
+    }
+
+    if (!isMultiplexed || offset !== buffer.length) {
+      frames.length = 0;
+    }
+  }
+
+  if (frames.length === 0) {
+    frames.push({
+      stream: "stdout",
+      payload: buffer.toString("utf8"),
+    });
+  }
+
+  return frames.flatMap((frame) =>
+    splitLogLines(frame.payload).map((rawLine) => {
+      const parsed = timestamps
+        ? parseTimestampedLogLine(rawLine)
+        : { timestamp: null, line: rawLine };
+      return {
+        type: frame.stream,
+        timestamp: parsed.timestamp,
+        line: parsed.line,
+      } satisfies DockerLogEntry;
+    })
+  );
+}
+
 export class DockerApiClient {
   private constructor(private readonly apiVersion: string) {}
 
@@ -28,12 +114,12 @@ export class DockerApiClient {
     return new DockerApiClient(negotiateDockerApiVersion(payload));
   }
 
-  private static rawRequest(
+  private static rawRequestBuffer(
     method: HttpMethod,
     path: string,
     body?: Record<string, unknown> | null,
     timeoutMs?: number
-  ): Promise<string> {
+  ): Promise<Buffer> {
     return new Promise((resolve, reject) => {
       const req = http.request(
         {
@@ -43,15 +129,19 @@ export class DockerApiClient {
           headers: body ? { "content-type": "application/json" } : undefined,
         },
         (res) => {
-          let raw = "";
-          res.setEncoding("utf8");
+          const chunks: Buffer[] = [];
           res.on("data", (chunk) => {
-            raw += chunk;
+            chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
           });
           res.on("end", () => {
+            const raw = Buffer.concat(chunks);
             const statusCode = res.statusCode ?? 500;
             if (statusCode >= 400) {
-              reject(new Error(`Docker API ${method} ${path} failed (${statusCode}): ${raw}`));
+              reject(
+                new Error(
+                  `Docker API ${method} ${path} failed (${statusCode}): ${raw.toString("utf8")}`
+                )
+              );
               return;
             }
 
@@ -72,6 +162,15 @@ export class DockerApiClient {
       }
       req.end();
     });
+  }
+
+  private static async rawRequest(
+    method: HttpMethod,
+    path: string,
+    body?: Record<string, unknown> | null,
+    timeoutMs?: number
+  ): Promise<string> {
+    return (await DockerApiClient.rawRequestBuffer(method, path, body, timeoutMs)).toString("utf8");
   }
 
   async request<T = string>(
@@ -95,6 +194,20 @@ export class DockerApiClient {
     } catch {
       return raw as T;
     }
+  }
+
+  async requestRaw(
+    method: HttpMethod,
+    path: string,
+    body?: Record<string, unknown> | null,
+    timeoutMs?: number
+  ): Promise<Buffer> {
+    return await DockerApiClient.rawRequestBuffer(
+      method,
+      `/${this.apiVersion}${path}`,
+      body,
+      timeoutMs
+    );
   }
 
   async listManagedContainers(): Promise<
@@ -208,12 +321,46 @@ export class DockerApiClient {
   }
 
   async containerLogs(id: string): Promise<string> {
-    return await this.request<string>(
+    const entries = await this.containerLogEntries(id, {
+      stdout: true,
+      stderr: true,
+      timestamps: false,
+    });
+    return entries.map((entry) => entry.line).join("\n");
+  }
+
+  async containerLogEntries(
+    id: string,
+    options: {
+      stdout?: boolean;
+      stderr?: boolean;
+      timestamps?: boolean;
+      tail?: number;
+      since?: Date | null;
+    } = {}
+  ): Promise<DockerLogEntry[]> {
+    const params = new URLSearchParams({
+      stdout: options.stdout === false ? "false" : "true",
+      stderr: options.stderr === false ? "false" : "true",
+      timestamps: options.timestamps ? "true" : "false",
+    });
+
+    if (typeof options.tail === "number" && Number.isFinite(options.tail)) {
+      params.set("tail", String(Math.max(1, Math.trunc(options.tail))));
+    }
+
+    if (options.since) {
+      params.set("since", String(Math.max(0, Math.floor(options.since.getTime() / 1000))));
+    }
+
+    const raw = await this.requestRaw(
       "GET",
-      `/containers/${encodeURIComponent(id)}/logs?stdout=true&stderr=true&timestamps=false`,
+      `/containers/${encodeURIComponent(id)}/logs?${params.toString()}`,
       null,
       30_000
     );
+
+    return parseDockerLogBuffer(raw, options.timestamps);
   }
 
   async connectNetwork(network: string, container: string): Promise<void> {
