@@ -44,7 +44,7 @@ RUN bun install --frozen-lockfile --production
 
 COPY agent ./agent
 
-ARG NOUVA_AGENT_VERSION=0.2.0
+ARG NOUVA_AGENT_VERSION=0.3.0
 ARG VCS_REF=local
 LABEL org.opencontainers.image.source="https://github.com/nouvacloud/nouva-agent"
 LABEL org.opencontainers.image.revision="${VCS_REF}"
