@@ -11,8 +11,19 @@ export interface DockerContainerInspection {
   Id: string;
   Name: string;
   State?: { Running?: boolean };
-  HostConfig?: { NetworkMode?: string };
+  HostConfig?: {
+    NetworkMode?: string;
+    PortBindings?: Record<
+      string,
+      Array<{
+        HostIp?: string;
+        HostPort?: string;
+      }>
+    >;
+  };
   Config?: {
+    Image?: string;
+    Cmd?: string[];
     Env?: string[];
     Labels?: Record<string, string>;
   };
