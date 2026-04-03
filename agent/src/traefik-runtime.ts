@@ -498,7 +498,7 @@ export function renderTraefikStaticConfig(paths: TraefikRuntimePaths): string {
     "  websecure:",
     '    address: ":443"',
     "  admin:",
-    '    address: "127.0.0.1:8082"',
+    '    address: ":8082"',
     "providers:",
     "  file:",
     `    directory: "${paths.dynamicDir}"`,

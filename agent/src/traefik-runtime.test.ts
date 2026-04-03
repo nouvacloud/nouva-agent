@@ -134,7 +134,7 @@ describe("traefik-runtime", () => {
 
     expect(staticConfig).toContain('address: ":80"');
     expect(staticConfig).toContain('address: ":443"');
-    expect(staticConfig).toContain('address: "127.0.0.1:8082"');
+    expect(staticConfig).toContain('address: ":8082"');
     expect(spec.image).toBe("traefik:v3.5");
     expect(spec.hostConfig).toEqual(
       expect.objectContaining({
