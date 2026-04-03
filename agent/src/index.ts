@@ -237,13 +237,13 @@ async function collectValidationSnapshot(
   const hostOsVersion = process.env.NOUVA_HOST_OS_VERSION_ID || "unknown";
   const hostArch = os.arch();
 
-  const osSupported = hostOsId === "ubuntu" && hostOsVersion === "24.04";
+  const osSupported = hostOsId === "ubuntu";
   checks.push(
     buildCheck(
       "os",
       "Supported OS",
       osSupported ? "pass" : "fail",
-      osSupported ? "Ubuntu 24.04 detected" : "Nouva currently supports Ubuntu 24.04 only",
+      osSupported ? `Ubuntu ${hostOsVersion} detected` : "Nouva currently supports Ubuntu only",
       `${hostOsId} ${hostOsVersion}`
     )
   );
