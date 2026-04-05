@@ -3,6 +3,7 @@ import agentPackageJson from "../package.json" with { type: "json" };
 import type { DeployAppImageInput } from "./app-build-runtime.js";
 import { buildAndDeployAppWithDependencies } from "./app-build-runtime.js";
 import {
+	ApiRequestError,
 	buildUpdateAgentRuntimeEnv,
 	buildAppContainerSpec,
 	buildDatabaseContainerSpec,
@@ -13,6 +14,7 @@ import {
 	prepareAppBuildkitRuntime,
 	resolveReportedAgentVersion,
 	resolveServiceContainerIdentifier,
+	shouldStopRetryingAgentWorkMutation,
 } from "./index.js";
 import type {
 	AgentRuntimeConfig,
@@ -164,6 +166,47 @@ describe("agent version reporting", () => {
 			envInheritFlags:
 				"-e NOUVA_AGENT_DATA_VOLUME -e NOUVA_API_URL -e NOUVA_SERVER_ID -e NOUVA_AGENT_TARGET_IMAGE",
 		});
+	});
+});
+
+describe("agent work mutation errors", () => {
+	test("stops retrying when the control plane reports the work is gone or superseded", () => {
+		expect(
+			shouldStopRetryingAgentWorkMutation(
+				new ApiRequestError({
+					method: "POST",
+					pathName: "/api/agent/work/work_1/complete",
+					status: 404,
+					message: "Work item not found",
+				}),
+			),
+		).toBe(true);
+		expect(
+			shouldStopRetryingAgentWorkMutation(
+				new ApiRequestError({
+					method: "POST",
+					pathName: "/api/agent/work/work_1/fail",
+					status: 409,
+					message: "Work item lease is no longer active",
+				}),
+			),
+		).toBe(true);
+	});
+
+	test("keeps retrying on non-terminal agent work mutation failures", () => {
+		expect(
+			shouldStopRetryingAgentWorkMutation(
+				new ApiRequestError({
+					method: "POST",
+					pathName: "/api/agent/work/work_1/complete",
+					status: 500,
+					message: "boom",
+				}),
+			),
+		).toBe(false);
+		expect(shouldStopRetryingAgentWorkMutation(new Error("network exploded"))).toBe(
+			false,
+		);
 	});
 });
 

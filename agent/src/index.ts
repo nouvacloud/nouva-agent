@@ -550,6 +550,29 @@ async function collectValidationSnapshot(
   };
 }
 
+export class ApiRequestError extends Error {
+  public readonly status: number;
+  public readonly method: string;
+  public readonly pathName: string;
+
+  constructor(input: {
+    method: string;
+    pathName: string;
+    status: number;
+    message: string;
+  }) {
+    super(`${input.method} ${input.pathName} failed (${input.status}): ${input.message}`);
+    this.name = "ApiRequestError";
+    this.status = input.status;
+    this.method = input.method;
+    this.pathName = input.pathName;
+  }
+}
+
+export function shouldStopRetryingAgentWorkMutation(error: unknown): boolean {
+  return error instanceof ApiRequestError && (error.status === 404 || error.status === 409);
+}
+
 async function apiRequest<T>(
   pathName: string,
   options: {
@@ -569,9 +592,12 @@ async function apiRequest<T>(
 
   if (!response.ok) {
     const message = await response.text();
-    throw new Error(
-      `${options.method ?? "GET"} ${pathName} failed (${response.status}): ${message}`
-    );
+    throw new ApiRequestError({
+      method: options.method ?? "GET",
+      pathName,
+      status: response.status,
+      message,
+    });
   }
 
   return (await response.json()) as T;
@@ -2054,6 +2080,13 @@ async function processWorkItem(
         },
       });
     } catch (reportErr) {
+      if (shouldStopRetryingAgentWorkMutation(reportErr)) {
+        console.warn(
+          `[nouva-agent] failure report for work ${workItem.id} was already superseded:`,
+          reportErr
+        );
+        return;
+      }
       console.error(`[nouva-agent] failed to report failure for work ${workItem.id}:`, reportErr);
     }
     return;
@@ -2071,6 +2104,13 @@ async function processWorkItem(
     });
     console.log(`[nouva-agent] work ${workItem.id} (${workItem.kind}) completed`);
   } catch (reportErr) {
+    if (shouldStopRetryingAgentWorkMutation(reportErr)) {
+      console.warn(
+        `[nouva-agent] completion report for work ${workItem.id} was already superseded:`,
+        reportErr
+      );
+      return;
+    }
     // Work succeeded locally. Don't call /fail — let lease expire so the item can be retried.
     console.error(`[nouva-agent] work ${workItem.id} succeeded but /complete failed:`, reportErr);
   }
