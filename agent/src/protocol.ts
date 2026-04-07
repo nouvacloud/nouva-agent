@@ -63,6 +63,83 @@ export type RuntimeMetadata = {
   [key: string]: unknown;
 };
 
+export type AppRolloutStrategy = "candidate_ready_cutover";
+export type AppRolloutPhase = "candidate" | "ready" | "cutover" | "retire" | "rollback";
+export type AppRolloutOutcome = "committed" | "aborted_before_cutover" | "rolled_back";
+
+export interface AppRolloutReadinessConfig {
+  timeoutMs: number;
+  intervalMs: number;
+  tcpConnectTimeoutMs: number;
+}
+
+export interface AppRolloutCutoverConfig {
+  verificationTimeoutMs: number;
+  verificationIntervalMs: number;
+}
+
+export interface AppRolloutConfig {
+  strategy: AppRolloutStrategy;
+  readiness: AppRolloutReadinessConfig;
+  cutover: AppRolloutCutoverConfig;
+  blockSharedVolumes: boolean;
+}
+
+export interface AppRolloutResult {
+  strategy: AppRolloutStrategy;
+  outcome: AppRolloutOutcome;
+  currentPhase: AppRolloutPhase;
+  liveRuntimePreserved: boolean;
+  rollbackCompleted: boolean;
+  activeContainerName?: string | null;
+  candidateContainerName?: string | null;
+}
+
+export const DEFAULT_APP_ROLLOUT_CONFIG: AppRolloutConfig = {
+  strategy: "candidate_ready_cutover",
+  readiness: {
+    timeoutMs: 60_000,
+    intervalMs: 500,
+    tcpConnectTimeoutMs: 2_000,
+  },
+  cutover: {
+    verificationTimeoutMs: 15_000,
+    verificationIntervalMs: 250,
+  },
+  blockSharedVolumes: true,
+};
+
+export function getDefaultAppRolloutConfig(): AppRolloutConfig {
+  return {
+    strategy: DEFAULT_APP_ROLLOUT_CONFIG.strategy,
+    readiness: { ...DEFAULT_APP_ROLLOUT_CONFIG.readiness },
+    cutover: { ...DEFAULT_APP_ROLLOUT_CONFIG.cutover },
+    blockSharedVolumes: DEFAULT_APP_ROLLOUT_CONFIG.blockSharedVolumes,
+  };
+}
+
+export function resolveAppRolloutConfig(config?: AppRolloutConfig | null): AppRolloutConfig {
+  return {
+    strategy: config?.strategy ?? DEFAULT_APP_ROLLOUT_CONFIG.strategy,
+    readiness: {
+      timeoutMs: config?.readiness?.timeoutMs ?? DEFAULT_APP_ROLLOUT_CONFIG.readiness.timeoutMs,
+      intervalMs: config?.readiness?.intervalMs ?? DEFAULT_APP_ROLLOUT_CONFIG.readiness.intervalMs,
+      tcpConnectTimeoutMs:
+        config?.readiness?.tcpConnectTimeoutMs ??
+        DEFAULT_APP_ROLLOUT_CONFIG.readiness.tcpConnectTimeoutMs,
+    },
+    cutover: {
+      verificationTimeoutMs:
+        config?.cutover?.verificationTimeoutMs ??
+        DEFAULT_APP_ROLLOUT_CONFIG.cutover.verificationTimeoutMs,
+      verificationIntervalMs:
+        config?.cutover?.verificationIntervalMs ??
+        DEFAULT_APP_ROLLOUT_CONFIG.cutover.verificationIntervalMs,
+    },
+    blockSharedVolumes: config?.blockSharedVolumes ?? DEFAULT_APP_ROLLOUT_CONFIG.blockSharedVolumes,
+  };
+}
+
 export interface ServiceResourceLimits {
   cpuMillicores?: number;
   memoryBytes?: number;
@@ -291,6 +368,7 @@ export interface AppDeployPayload {
   resourceLimits: ServiceResourceLimits | null;
   buildCommand?: string;
   startCommand?: string;
+  rollout?: AppRolloutConfig | null;
   runtimeMetadata?: RuntimeMetadata | null;
 }
 
@@ -305,6 +383,7 @@ export interface DeployOnlyPayload {
   envVars: Record<string, string>;
   volume?: AppVolumeIdentity | null;
   resourceLimits: ServiceResourceLimits | null;
+  rollout?: AppRolloutConfig | null;
   runtimeMetadata?: RuntimeMetadata | null;
 }
 

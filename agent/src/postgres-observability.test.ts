@@ -46,11 +46,7 @@ const postgresInspection: DockerContainerInspection = {
 describe("postgres observability helpers", () => {
   test("should parse container env and resolve the first network IP", () => {
     expect(
-      readContainerEnv([
-        "POSTGRES_USER=nouva_user",
-        "POSTGRES_PASSWORD=super-secret",
-        "INVALID",
-      ]),
+      readContainerEnv(["POSTGRES_USER=nouva_user", "POSTGRES_PASSWORD=super-secret", "INVALID"])
     ).toEqual({
       POSTGRES_USER: "nouva_user",
       POSTGRES_PASSWORD: "super-secret",
@@ -78,8 +74,8 @@ describe("postgres observability helpers", () => {
               "nouva.service.id": "svc_1",
             },
           },
-        },
-      ),
+        }
+      )
     ).toBe(true);
   });
 
@@ -156,13 +152,10 @@ describe("postgres observability helpers", () => {
       };
     });
 
-    const samples = await collectPostgresObservabilitySamplesWithDependencies(
-      docker as never,
-      {
-        fetchSnapshot,
-        now: () => "2026-03-26T12:00:30.000Z",
-      },
-    );
+    const samples = await collectPostgresObservabilitySamplesWithDependencies(docker as never, {
+      fetchSnapshot,
+      now: () => "2026-03-26T12:00:30.000Z",
+    });
 
     expect(samples).toEqual([
       {

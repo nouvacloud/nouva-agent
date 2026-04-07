@@ -10,7 +10,13 @@ type HttpMethod = "GET" | "POST" | "DELETE";
 export interface DockerContainerInspection {
   Id: string;
   Name: string;
-  State?: { Running?: boolean };
+  State?: {
+    Running?: boolean;
+    Status?: string;
+    Health?: {
+      Status?: string;
+    };
+  };
   HostConfig?: {
     NetworkMode?: string;
     PortBindings?: Record<
@@ -62,7 +68,10 @@ function splitLogLines(raw: string): string[] {
     .filter((line) => line.length > 0);
 }
 
-function parseTimestampedLogLine(line: string): { timestamp: string | null; line: string } {
+function parseTimestampedLogLine(line: string): {
+  timestamp: string | null;
+  line: string;
+} {
   const separatorIndex = line.indexOf(" ");
   if (separatorIndex <= 0) {
     return {

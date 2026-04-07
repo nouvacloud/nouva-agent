@@ -1,5 +1,9 @@
 # Contributing
 
+This repository is mirrored automatically from the Nouva Cloud monorepo.
+Open code changes in the monorepo source of truth rather than sending direct
+PRs here.
+
 ## Before Opening A Pull Request
 
 - open an issue for significant changes so scope and compatibility are clear

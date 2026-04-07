@@ -1,15 +1,12 @@
 import postgres from "postgres";
-import type {
-  DockerApiClient,
-  DockerContainerInspection,
-} from "./docker-api.js";
+import type { DockerApiClient, DockerContainerInspection } from "./docker-api.js";
 import type {
   AgentPostgresObservabilitySample,
   PostgresObservabilitySnapshot,
 } from "./protocol.js";
 
 const POSTGRES_CONTAINER_NAME_PREFIX = "/nouva-postgres-";
-const POSTGRES_SERVER_PORT_FALLBACK = 5433;
+const POSTGRES_SERVER_PORT_FALLBACK = 5432;
 const MAX_SLOW_QUERY_COUNT = 20;
 
 type ManagedContainerRecord = Awaited<ReturnType<DockerApiClient["listManagedContainers"]>>[number];
@@ -36,7 +33,7 @@ export interface ManagedPostgresTarget {
 
 function pickPgStatMonitorColumn(
   columns: Set<string>,
-  candidates: readonly string[],
+  candidates: readonly string[]
 ): string | null {
   for (const candidate of candidates) {
     if (columns.has(candidate)) {
@@ -64,9 +61,7 @@ function toNonNegativeInteger(value: number | string | null | undefined): number
   return Math.max(0, Math.trunc(toFiniteNumber(value)));
 }
 
-export function readContainerEnv(
-  envEntries: string[] | undefined,
-): Record<string, string> {
+export function readContainerEnv(envEntries: string[] | undefined): Record<string, string> {
   const env: Record<string, string> = {};
 
   for (const entry of envEntries ?? []) {
@@ -82,7 +77,7 @@ export function readContainerEnv(
 }
 
 export function resolveContainerIpAddress(
-  inspection: DockerContainerInspection | null,
+  inspection: DockerContainerInspection | null
 ): string | null {
   const networks = inspection?.NetworkSettings?.Networks;
   if (!networks) {
@@ -104,7 +99,7 @@ function getManagedContainerName(container: ManagedContainerRecord): string | nu
 
 export function isManagedPostgresContainer(
   container: ManagedContainerRecord,
-  inspection: DockerContainerInspection | null,
+  inspection: DockerContainerInspection | null
 ): boolean {
   const labels = {
     ...(container.Labels ?? {}),
@@ -120,12 +115,14 @@ export function isManagedPostgresContainer(
   }
 
   const containerName = inspection?.Name ?? getManagedContainerName(container);
-  return typeof containerName === "string" && containerName.startsWith(POSTGRES_CONTAINER_NAME_PREFIX);
+  return (
+    typeof containerName === "string" && containerName.startsWith(POSTGRES_CONTAINER_NAME_PREFIX)
+  );
 }
 
 export function buildManagedPostgresTarget(
   container: ManagedContainerRecord,
-  inspection: DockerContainerInspection | null,
+  inspection: DockerContainerInspection | null
 ): ManagedPostgresTarget | null {
   if (!inspection || !isManagedPostgresContainer(container, inspection)) {
     return null;
@@ -159,7 +156,7 @@ export function buildManagedPostgresTarget(
 }
 
 export async function fetchPostgresObservabilitySnapshot(
-  target: ManagedPostgresTarget,
+  target: ManagedPostgresTarget
 ): Promise<PostgresObservabilitySnapshot> {
   const sql = postgres({
     host: target.host,
@@ -195,7 +192,7 @@ export async function fetchPostgresObservabilitySnapshot(
 
     if (columnRows.length === 0) {
       throw new Error(
-        "pg_stat_monitor is not available for this service yet. Restart the service to apply extension bootstrap.",
+        "pg_stat_monitor is not available for this service yet. Restart the service to apply extension bootstrap."
       );
     }
 
@@ -211,14 +208,12 @@ export async function fetchPostgresObservabilitySnapshot(
       !columns.has("rows") ||
       !columns.has("query")
     ) {
-      throw new Error(
-        "pg_stat_monitor does not expose the expected columns for query insights.",
-      );
+      throw new Error("pg_stat_monitor does not expose the expected columns for query insights.");
     }
 
     if (!totalTimeColumn || !meanTimeColumn || !minTimeColumn || !maxTimeColumn) {
       throw new Error(
-        "pg_stat_monitor timing columns are unavailable for this PostgreSQL version.",
+        "pg_stat_monitor timing columns are unavailable for this PostgreSQL version."
       );
     }
 
@@ -279,7 +274,7 @@ export async function fetchPostgresObservabilitySnapshot(
 function createErrorSample(
   serviceId: string,
   errorMessage: string,
-  collectedAt: string,
+  collectedAt: string
 ): AgentPostgresObservabilitySample {
   return {
     serviceId,
@@ -295,11 +290,9 @@ function createErrorSample(
 export async function collectPostgresObservabilitySamplesWithDependencies(
   docker: DockerApiClient,
   dependencies: {
-    fetchSnapshot: (
-      target: ManagedPostgresTarget,
-    ) => Promise<PostgresObservabilitySnapshot>;
+    fetchSnapshot: (target: ManagedPostgresTarget) => Promise<PostgresObservabilitySnapshot>;
     now: () => string;
-  },
+  }
 ): Promise<AgentPostgresObservabilitySample[]> {
   const containers = await docker.listManagedContainers();
   const samples: AgentPostgresObservabilitySample[] = [];
@@ -325,8 +318,8 @@ export async function collectPostgresObservabilitySamplesWithDependencies(
         createErrorSample(
           serviceId,
           "Managed PostgreSQL container is missing connection details.",
-          dependencies.now(),
-        ),
+          dependencies.now()
+        )
       );
       continue;
     }
@@ -347,8 +340,8 @@ export async function collectPostgresObservabilitySamplesWithDependencies(
         createErrorSample(
           target.serviceId,
           error instanceof Error ? error.message : "Failed to collect PostgreSQL observability.",
-          dependencies.now(),
-        ),
+          dependencies.now()
+        )
       );
     }
   }
@@ -357,7 +350,7 @@ export async function collectPostgresObservabilitySamplesWithDependencies(
 }
 
 export async function collectPostgresObservabilitySamples(
-  docker: DockerApiClient,
+  docker: DockerApiClient
 ): Promise<AgentPostgresObservabilitySample[]> {
   return await collectPostgresObservabilitySamplesWithDependencies(docker, {
     fetchSnapshot: fetchPostgresObservabilitySnapshot,

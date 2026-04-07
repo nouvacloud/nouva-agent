@@ -1,6 +1,6 @@
 import { execFile as execFileCallback } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -102,10 +102,7 @@ export function normalizeAppBuildSettings(
         appBuildType: resolvedBuildType,
         appBuildConfig: {
           buildRoot,
-          dockerfilePath: normalizeRepoRelativePath(
-            config.dockerfilePath,
-            DEFAULT_DOCKERFILE_PATH
-          ),
+          dockerfilePath: normalizeRepoRelativePath(config.dockerfilePath, DEFAULT_DOCKERFILE_PATH),
           dockerContextPath: normalizeRepoRelativePath(
             config.dockerContextPath,
             DEFAULT_DOCKER_CONTEXT_PATH
@@ -128,7 +125,6 @@ export function normalizeAppBuildSettings(
         },
       };
     }
-    case "railpack":
     default: {
       const config = (appBuildConfig ?? {}) as Partial<AppRailpackBuildConfig>;
       return {
@@ -366,7 +362,10 @@ async function buildDockerfileApplication(options: {
   buildkitAddress: string;
   imageUrl: string;
 }): Promise<StrategyBuildResult> {
-  const dockerfileAbsolutePath = resolvePathWithinBuildRoot(options.buildRootDir, options.dockerfilePath);
+  const dockerfileAbsolutePath = resolvePathWithinBuildRoot(
+    options.buildRootDir,
+    options.dockerfilePath
+  );
   const contextDir = resolvePathWithinBuildRoot(options.buildRootDir, options.dockerContextPath);
   const dockerfileSource = await readFile(dockerfileAbsolutePath, "utf8");
 
@@ -505,10 +504,7 @@ export async function buildApp(options: BuildAppOptions): Promise<BuildAppResult
 
     const buildSettings = normalizeAppBuildSettings(options.appBuildType, options.appBuildConfig);
     const imageUrl = buildRegistryImageUrl(options);
-    const buildRootDir = resolveBuildRootDirectory(
-      repoDir,
-      buildSettings.appBuildConfig.buildRoot
-    );
+    const buildRootDir = resolveBuildRootDirectory(repoDir, buildSettings.appBuildConfig.buildRoot);
 
     let result: StrategyBuildResult;
 
@@ -542,7 +538,6 @@ export async function buildApp(options: BuildAppOptions): Promise<BuildAppResult
         });
         break;
       }
-      case "railpack":
       default:
         result = await buildRailpackApplication({
           buildRootDir,

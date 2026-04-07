@@ -8,7 +8,12 @@ import {
   type DeployAppImageInput,
 } from "./app-build-runtime.js";
 import { buildApp, hashProjectNetwork } from "./build.js";
-import { DockerApiClient, type DockerContainerSpec, type DockerLogEntry } from "./docker-api.js";
+import {
+  DockerApiClient,
+  type DockerContainerInspection,
+  type DockerContainerSpec,
+  type DockerLogEntry,
+} from "./docker-api.js";
 import { toDockerResourceSettings } from "./docker-resource-limits.js";
 import { collectPostgresObservabilitySamples } from "./postgres-observability.js";
 import {
@@ -26,6 +31,8 @@ import {
   type AgentRuntimeLogsResponse,
   type AgentWorkRecord,
   type AppDeployPayload,
+  type AppRolloutConfig,
+  type AppRolloutResult,
   type CreateVolumeBackupPayload,
   type DatabaseProvisionPayload,
   type DeleteVolumeBackupPayload,
@@ -41,6 +48,7 @@ import {
   type RestoreVolumeBackupPayload,
   type RuntimeLogMessage,
   type RuntimeMetadata,
+  resolveAppRolloutConfig,
   type ServerValidationReport,
   type ServiceResourceLimits,
   type SyncRoutingPayload,
@@ -226,6 +234,179 @@ async function checkTcpConnect(host: string, port: number, timeoutMs = 3000) {
     });
     socket.connect(port, host);
   });
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function resolveAppRuntimePort(
+  runtimeMetadata: RuntimeMetadata | null | undefined,
+  fallback: number
+) {
+  const port = runtimeMetadata?.internalPort;
+  return typeof port === "number" && Number.isInteger(port) && port >= 1 && port <= 65535
+    ? port
+    : fallback;
+}
+
+function resolveContainerIpAddress(inspection: DockerContainerInspection | null): string | null {
+  const networks = inspection?.NetworkSettings?.Networks;
+  if (!networks) {
+    return null;
+  }
+
+  for (const network of Object.values(networks)) {
+    if (typeof network?.IPAddress === "string" && network.IPAddress.length > 0) {
+      return network.IPAddress;
+    }
+  }
+
+  return null;
+}
+
+function buildAppRolloutResult(input: {
+  outcome: AppRolloutResult["outcome"];
+  currentPhase: AppRolloutResult["currentPhase"];
+  liveRuntimePreserved: boolean;
+  rollbackCompleted: boolean;
+  activeContainerName?: string | null;
+  candidateContainerName?: string | null;
+}): AppRolloutResult {
+  return {
+    strategy: "candidate_ready_cutover",
+    outcome: input.outcome,
+    currentPhase: input.currentPhase,
+    liveRuntimePreserved: input.liveRuntimePreserved,
+    rollbackCompleted: input.rollbackCompleted,
+    activeContainerName: input.activeContainerName ?? null,
+    candidateContainerName: input.candidateContainerName ?? null,
+  };
+}
+
+class AppRolloutError extends Error {
+  readonly result: Record<string, unknown>;
+
+  constructor(message: string, rollout: AppRolloutResult) {
+    super(message);
+    this.name = "AppRolloutError";
+    this.result = {
+      rollout,
+    };
+  }
+}
+
+interface DeployAppImageDependencies {
+  ensureBaseRuntime: typeof ensureBaseRuntime;
+  checkTcpConnect: typeof checkTcpConnect;
+  fetchImpl: typeof fetch;
+  writeLocalTraefikRoute: typeof writeLocalTraefikRoute;
+  deleteLocalTraefikRoute: typeof deleteLocalTraefikRoute;
+}
+
+const defaultDeployAppImageDependencies: DeployAppImageDependencies = {
+  ensureBaseRuntime,
+  checkTcpConnect,
+  fetchImpl: fetch,
+  writeLocalTraefikRoute,
+  deleteLocalTraefikRoute,
+};
+
+async function waitForAppCandidateReadiness(
+  dependencies: Pick<DeployAppImageDependencies, "checkTcpConnect">,
+  docker: Pick<DockerApiClient, "inspectContainer">,
+  containerName: string,
+  appPort: number,
+  rollout: AppRolloutConfig
+): Promise<void> {
+  const deadline = Date.now() + rollout.readiness.timeoutMs;
+  let lastError = "candidate container did not become ready";
+
+  while (Date.now() <= deadline) {
+    const inspection = await docker.inspectContainer(containerName);
+    if (!inspection) {
+      throw new Error(`Candidate container ${containerName} is missing`);
+    }
+
+    const state = inspection.State;
+    const status = state?.Status?.toLowerCase();
+    if (status === "exited" || status === "dead" || status === "removing") {
+      throw new Error(`Candidate container ${containerName} is not running (${status})`);
+    }
+
+    const healthStatus = state?.Health?.Status?.toLowerCase();
+    if (healthStatus === "healthy") {
+      return;
+    }
+
+    if (healthStatus === "unhealthy") {
+      throw new Error(`Candidate container ${containerName} became unhealthy`);
+    }
+
+    const ipAddress = resolveContainerIpAddress(inspection);
+    if (ipAddress) {
+      const reachable = await dependencies.checkTcpConnect(
+        ipAddress,
+        appPort,
+        rollout.readiness.tcpConnectTimeoutMs
+      );
+      if (reachable) {
+        return;
+      }
+      lastError = `Candidate container ${containerName} is not accepting TCP traffic on ${appPort}`;
+    } else {
+      lastError = `Candidate container ${containerName} has no routable IP address yet`;
+    }
+
+    await sleep(rollout.readiness.intervalMs);
+  }
+
+  throw new Error(lastError);
+}
+
+async function waitForLocalTraefikCutover(
+  fetchImpl: typeof fetch,
+  serviceId: string,
+  expectedServiceUrl: string,
+  rollout: AppRolloutConfig
+): Promise<void> {
+  const serviceName = `svc-${serviceId}@file`;
+  const deadline = Date.now() + rollout.cutover.verificationTimeoutMs;
+  let lastError = `Traefik did not point ${serviceName} at ${expectedServiceUrl}`;
+
+  while (Date.now() <= deadline) {
+    const response = await fetchImpl("http://127.0.0.1:8082/api/http/services");
+    if (!response.ok) {
+      lastError = `Traefik service inspection failed with status ${response.status}`;
+      await sleep(rollout.cutover.verificationIntervalMs);
+      continue;
+    }
+
+    const services = (await response.json()) as Array<{
+      name?: string;
+      loadBalancer?: {
+        servers?: Array<{
+          url?: string;
+        }>;
+      };
+    }>;
+
+    const service = services.find((entry) => entry.name === serviceName);
+    const actualUrl = service?.loadBalancer?.servers?.[0]?.url;
+    if (actualUrl === expectedServiceUrl) {
+      return;
+    }
+
+    if (typeof actualUrl === "string" && actualUrl.length > 0) {
+      lastError = `Traefik still points ${serviceName} at ${actualUrl}`;
+    }
+
+    await sleep(rollout.cutover.verificationIntervalMs);
+  }
+
+  throw new Error(lastError);
 }
 
 async function collectValidationSnapshot(
@@ -1215,26 +1396,43 @@ export function buildAppContainerSpec(
   };
 }
 
-export async function deployAppImage(
+export async function deployAppImageWithDependencies(
+  dependencies: DeployAppImageDependencies,
   docker: DockerApiClient,
   config: AgentRuntimeConfig,
   payload: DeployAppImageInput
 ) {
-  await ensureBaseRuntime(docker, config);
+  await dependencies.ensureBaseRuntime(docker, config);
 
   const projectNetwork = buildProjectNetwork(payload.projectId);
   await docker.ensureNetwork(projectNetwork);
 
   const previousContainer =
     payload.runtimeMetadata?.containerName ?? payload.runtimeMetadata?.containerId ?? null;
-  if (previousContainer) {
-    await docker.removeContainer(previousContainer, true);
+  const { containerName, appPort, spec } = buildAppContainerSpec(config, payload);
+  const previousServiceUrl = previousContainer
+    ? `http://${previousContainer}:${resolveAppRuntimePort(payload.runtimeMetadata, appPort)}`
+    : null;
+  const rollout = resolveAppRolloutConfig(payload.rollout);
+
+  if (payload.volume && rollout.blockSharedVolumes) {
+    throw new AppRolloutError(
+      "Safe app rollouts are blocked for services with attached volumes until single-writer support exists",
+      buildAppRolloutResult({
+        outcome: "aborted_before_cutover",
+        currentPhase: "candidate",
+        liveRuntimePreserved: Boolean(previousContainer),
+        rollbackCompleted: false,
+        activeContainerName: previousContainer,
+        candidateContainerName: containerName,
+      })
+    );
   }
 
-  const { containerName, appPort, spec } = buildAppContainerSpec(config, payload);
   if (payload.volume) {
     await docker.createVolume(payload.volume.volumeName);
   }
+
   const containerId = await docker.ensureContainer(spec, true);
   await docker.connectNetwork(projectNetwork, containerId).catch((err: Error) => {
     console.error(
@@ -1242,13 +1440,76 @@ export async function deployAppImage(
     );
   });
 
+  try {
+    await waitForAppCandidateReadiness(dependencies, docker, containerName, appPort, rollout);
+  } catch (error) {
+    await docker.removeContainer(containerName, true);
+    throw new AppRolloutError(
+      error instanceof Error ? error.message : "Candidate container failed readiness checks",
+      buildAppRolloutResult({
+        outcome: "aborted_before_cutover",
+        currentPhase: "ready",
+        liveRuntimePreserved: Boolean(previousContainer),
+        rollbackCompleted: false,
+        activeContainerName: previousContainer,
+        candidateContainerName: containerName,
+      })
+    );
+  }
+
   const hostnames = [`${payload.subdomain}.${APP_DOMAIN}`];
-  await writeLocalTraefikRoute(
-    TRAEFIK_PATHS,
-    payload.serviceId,
-    hostnames,
-    `http://${containerName}:${appPort}`
-  );
+  const candidateServiceUrl = `http://${containerName}:${appPort}`;
+  try {
+    await dependencies.writeLocalTraefikRoute(
+      TRAEFIK_PATHS,
+      payload.serviceId,
+      hostnames,
+      candidateServiceUrl
+    );
+    await waitForLocalTraefikCutover(
+      dependencies.fetchImpl,
+      payload.serviceId,
+      candidateServiceUrl,
+      rollout
+    );
+  } catch (error) {
+    if (previousServiceUrl) {
+      await dependencies.writeLocalTraefikRoute(
+        TRAEFIK_PATHS,
+        payload.serviceId,
+        hostnames,
+        previousServiceUrl
+      );
+      try {
+        await waitForLocalTraefikCutover(
+          dependencies.fetchImpl,
+          payload.serviceId,
+          previousServiceUrl,
+          rollout
+        );
+      } catch {}
+    } else {
+      await dependencies.deleteLocalTraefikRoute(TRAEFIK_PATHS, payload.serviceId);
+    }
+
+    await docker.removeContainer(containerName, true);
+
+    throw new AppRolloutError(
+      error instanceof Error ? error.message : "Traefik cutover failed",
+      buildAppRolloutResult({
+        outcome: "rolled_back",
+        currentPhase: "rollback",
+        liveRuntimePreserved: Boolean(previousContainer),
+        rollbackCompleted: true,
+        activeContainerName: previousContainer,
+        candidateContainerName: containerName,
+      })
+    );
+  }
+
+  if (previousContainer) {
+    await docker.removeContainer(previousContainer, true);
+  }
 
   return {
     imageUrl: payload.imageUrl,
@@ -1267,6 +1528,14 @@ export async function deployAppImage(
       ingressPort: 80,
       internalPort: appPort,
     },
+    rollout: buildAppRolloutResult({
+      outcome: "committed",
+      currentPhase: "retire",
+      liveRuntimePreserved: false,
+      rollbackCompleted: false,
+      activeContainerName: containerName,
+      candidateContainerName: containerName,
+    }),
     runtimeInstance: {
       kind: "app",
       status: "running",
@@ -1281,6 +1550,19 @@ export async function deployAppImage(
       externalPort: 80,
     },
   };
+}
+
+export async function deployAppImage(
+  docker: DockerApiClient,
+  config: AgentRuntimeConfig,
+  payload: DeployAppImageInput
+) {
+  return await deployAppImageWithDependencies(
+    defaultDeployAppImageDependencies,
+    docker,
+    config,
+    payload
+  );
 }
 
 async function handleBuildAndDeployApp(
@@ -1961,6 +2243,7 @@ async function processWorkItem(
   const payload = toObject(workItem.payload);
 
   let result: Record<string, unknown> | undefined;
+  let failureResult: Record<string, unknown> | undefined;
   let workError: Error | null = null;
 
   try {
@@ -2065,6 +2348,9 @@ async function processWorkItem(
         throw new Error(`Unsupported work kind: ${workItem.kind}`);
     }
   } catch (err) {
+    if (err instanceof AppRolloutError) {
+      failureResult = err.result;
+    }
     workError = err instanceof Error ? err : new Error("Unknown agent work failure");
   }
 
@@ -2076,6 +2362,7 @@ async function processWorkItem(
         body: {
           serverId: SERVER_ID!,
           leaseId: workItem.leaseId,
+          result: failureResult ?? null,
           errorMessage: workError.message,
         },
       });

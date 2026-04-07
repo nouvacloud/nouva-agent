@@ -4,6 +4,10 @@
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Docker Image](https://img.shields.io/badge/ghcr.io-nouvacloud%2Fnouva--agent-blue)](https://ghcr.io/nouvacloud/nouva-agent)
 
+> This repository is an automatically mirrored public release surface.
+> The writable source of truth for `nouva-agent` lives in the Nouva Cloud monorepo.
+> GitHub Releases and published images still ship from this repository.
+
 A containerized edge agent that runs on your infrastructure to execute deployment and service management tasks on behalf of [Nouva Cloud](https://nouvacloud.com). It communicates with the Nouva control plane to lease work, process it locally via Docker, and report results back.
 
 Production container images are published only from a published GitHub Release in this repository.

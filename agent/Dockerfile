@@ -2,7 +2,7 @@ FROM oven/bun:1.3.5-debian AS builder
 
 WORKDIR /app
 
-COPY bun.lock package.json tsconfig.base.json ./
+COPY bun.lock package.json ./
 COPY agent/package.json ./agent/
 RUN bun install --frozen-lockfile
 
@@ -38,7 +38,7 @@ RUN railpack --version && buildctl --version
 
 WORKDIR /app
 
-COPY bun.lock package.json tsconfig.base.json ./
+COPY bun.lock package.json ./
 COPY agent/package.json ./agent/
 RUN bun install --frozen-lockfile --production
 
