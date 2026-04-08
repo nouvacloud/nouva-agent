@@ -122,6 +122,20 @@ describe("traefik-runtime", () => {
     expect(config).toContain("Host(`frontend.up.nouva.cloud`) || Host(`app.example.com`)");
   });
 
+  test("should keep provided hostnames on plain HTTP for hosted edge routing", () => {
+    const config = buildTraefikRouteConfig({
+      fileKey: "svc_1",
+      providedHostnames: ["frontend.up.nouva.cloud"],
+      serviceUrl: "http://nouva-app:3000",
+    });
+
+    expect(config).toContain("Host(`frontend.up.nouva.cloud`)");
+    expect(config).toContain("- web");
+    expect(config).not.toContain("- websecure");
+    expect(config).not.toContain("certResolver: letsencrypt");
+    expect(config).not.toContain("redirectScheme:");
+  });
+
   test("should pin Traefik v3.5 and bind 80, 443, and localhost 8082", async () => {
     tempDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-traefik-"));
     const paths = getTraefikRuntimePaths(tempDir);

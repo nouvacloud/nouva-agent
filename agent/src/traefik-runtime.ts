@@ -45,7 +45,9 @@ export interface TraefikRuntimePaths {
 
 export interface TraefikRouteConfig {
   fileKey: string;
-  hostnames: string[];
+  hostnames?: string[];
+  providedHostnames?: string[];
+  customHostnames?: string[];
   serviceUrl: string;
 }
 
@@ -450,40 +452,60 @@ export function resolveRoutingHostnames(input: {
 }
 
 export function buildTraefikRouteConfig(route: TraefikRouteConfig): string {
-  const httpRouterName = `http-${route.fileKey}`;
-  const httpsRouterName = `https-${route.fileKey}`;
+  const providedHostnames = route.providedHostnames ?? [];
+  const customHostnames =
+    route.customHostnames ?? (providedHostnames.length === 0 ? (route.hostnames ?? []) : []);
+  const providedHttpRouterName = `http-${route.fileKey}`;
+  const customHttpRouterName = `http-custom-${route.fileKey}`;
+  const customHttpsRouterName = `https-${route.fileKey}`;
   const redirectMiddlewareName = `redirect-${route.fileKey}`;
   const serviceName = `svc-${route.fileKey}`;
+  const lines = ["http:", "  routers:"];
 
-  return serializeYaml([
-    "http:",
-    "  routers:",
-    `    ${httpRouterName}:`,
-    `      rule: "${quoteHostnames(route.hostnames)}"`,
-    "      entryPoints:",
-    "        - web",
-    "      middlewares:",
-    `        - ${redirectMiddlewareName}`,
-    `      service: ${serviceName}`,
-    `    ${httpsRouterName}:`,
-    `      rule: "${quoteHostnames(route.hostnames)}"`,
-    "      entryPoints:",
-    "        - websecure",
-    `      service: ${serviceName}`,
-    "      tls:",
-    "        certResolver: letsencrypt",
-    "  middlewares:",
-    `    ${redirectMiddlewareName}:`,
-    "      redirectScheme:",
-    "        scheme: https",
-    "        permanent: true",
+  if (providedHostnames.length > 0) {
+    lines.push(
+      `    ${providedHttpRouterName}:`,
+      `      rule: "${quoteHostnames(providedHostnames)}"`,
+      "      entryPoints:",
+      "        - web",
+      `      service: ${serviceName}`
+    );
+  }
+
+  if (customHostnames.length > 0) {
+    lines.push(
+      `    ${customHttpRouterName}:`,
+      `      rule: "${quoteHostnames(customHostnames)}"`,
+      "      entryPoints:",
+      "        - web",
+      "      middlewares:",
+      `        - ${redirectMiddlewareName}`,
+      `      service: ${serviceName}`,
+      `    ${customHttpsRouterName}:`,
+      `      rule: "${quoteHostnames(customHostnames)}"`,
+      "      entryPoints:",
+      "        - websecure",
+      `      service: ${serviceName}`,
+      "      tls:",
+      "        certResolver: letsencrypt",
+      "  middlewares:",
+      `    ${redirectMiddlewareName}:`,
+      "      redirectScheme:",
+      "        scheme: https",
+      "        permanent: true"
+    );
+  }
+
+  lines.push(
     "  services:",
     `    ${serviceName}:`,
     "      loadBalancer:",
     "        passHostHeader: true",
     "        servers:",
-    `          - url: ${route.serviceUrl}`,
-  ]);
+    `          - url: ${route.serviceUrl}`
+  );
+
+  return serializeYaml(lines);
 }
 
 export function renderTraefikStaticConfig(paths: TraefikRuntimePaths): string {
@@ -576,10 +598,20 @@ export function buildTraefikContainerSpec(
 export async function writeTraefikRouteFile(
   paths: TraefikRuntimePaths,
   serviceId: string,
-  hostnames: string[],
+  hostnames: {
+    providedHostname?: string | null;
+    customHostnames?: string[] | null;
+  },
   serviceUrl: string
 ): Promise<void> {
-  if (hostnames.length === 0) {
+  const providedHostnames = resolveRoutingHostnames({
+    providedHostname: hostnames.providedHostname,
+  });
+  const customHostnames = resolveRoutingHostnames({
+    customHostnames: hostnames.customHostnames,
+  });
+
+  if (providedHostnames.length === 0 && customHostnames.length === 0) {
     await deleteTraefikRouteFile(paths, serviceId);
     return;
   }
@@ -588,7 +620,8 @@ export async function writeTraefikRouteFile(
     path.join(paths.dynamicDir, `${serviceId}.yml`),
     buildTraefikRouteConfig({
       fileKey: serviceId,
-      hostnames,
+      providedHostnames,
+      customHostnames,
       serviceUrl,
     })
   );
@@ -597,7 +630,10 @@ export async function writeTraefikRouteFile(
 export async function writeLocalTraefikRoute(
   paths: TraefikRuntimePaths,
   serviceId: string,
-  hostnames: string[],
+  hostnames: {
+    providedHostname?: string | null;
+    customHostnames?: string[] | null;
+  },
   serviceUrl: string
 ): Promise<void> {
   await writeTraefikRouteFile(paths, serviceId, hostnames, serviceUrl);

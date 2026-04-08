@@ -457,7 +457,10 @@ describe("deployAppImageWithDependencies", () => {
     expect(writeLocalTraefikRoute).toHaveBeenCalledWith(
       expect.anything(),
       "svc_1",
-      ["app.nouva.cloud"],
+      {
+        providedHostname: "app.nouva.cloud",
+        customHostnames: [],
+      },
       "http://nouva-app-svc_1-dep_1:8080"
     );
     expect(docker.removeContainer.mock.calls).toEqual([["nouva-app-svc_1-live", true]]);
@@ -604,8 +607,24 @@ describe("deployAppImageWithDependencies", () => {
     });
 
     expect(writeLocalTraefikRoute.mock.calls).toEqual([
-      [expect.anything(), "svc_1", ["app.nouva.cloud"], "http://nouva-app-svc_1-dep_1:8080"],
-      [expect.anything(), "svc_1", ["app.nouva.cloud"], "http://nouva-app-svc_1-live:8080"],
+      [
+        expect.anything(),
+        "svc_1",
+        {
+          providedHostname: "app.nouva.cloud",
+          customHostnames: [],
+        },
+        "http://nouva-app-svc_1-dep_1:8080",
+      ],
+      [
+        expect.anything(),
+        "svc_1",
+        {
+          providedHostname: "app.nouva.cloud",
+          customHostnames: [],
+        },
+        "http://nouva-app-svc_1-live:8080",
+      ],
     ]);
     expect(docker.removeContainer.mock.calls).toEqual([["nouva-app-svc_1-dep_1", true]]);
   });

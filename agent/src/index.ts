@@ -1457,13 +1457,15 @@ export async function deployAppImageWithDependencies(
     );
   }
 
-  const hostnames = [`${payload.subdomain}.${APP_DOMAIN}`];
   const candidateServiceUrl = `http://${containerName}:${appPort}`;
   try {
     await dependencies.writeLocalTraefikRoute(
       TRAEFIK_PATHS,
       payload.serviceId,
-      hostnames,
+      {
+        providedHostname: `${payload.subdomain}.${APP_DOMAIN}`,
+        customHostnames: [],
+      },
       candidateServiceUrl
     );
     await waitForLocalTraefikCutover(
@@ -1477,7 +1479,10 @@ export async function deployAppImageWithDependencies(
       await dependencies.writeLocalTraefikRoute(
         TRAEFIK_PATHS,
         payload.serviceId,
-        hostnames,
+        {
+          providedHostname: `${payload.subdomain}.${APP_DOMAIN}`,
+          customHostnames: [],
+        },
         previousServiceUrl
       );
       try {
@@ -2158,22 +2163,21 @@ async function handleSyncRouting(
 
   await ensureTraefikRuntime(docker, getTraefikRuntimeInput(config));
 
-  const hostnames = [
-    ...(payload.providedHostname ? [payload.providedHostname] : []),
-    ...payload.customHostnames,
-  ];
   const internalPort =
     typeof runtimeMetadata.internalPort === "number"
       ? runtimeMetadata.internalPort
       : (payload.ingressPort ?? 3000);
 
-  if (hostnames.length === 0) {
+  if (!payload.providedHostname && payload.customHostnames.length === 0) {
     await deleteLocalTraefikRoute(TRAEFIK_PATHS, payload.serviceId);
   } else {
     await writeLocalTraefikRoute(
       TRAEFIK_PATHS,
       payload.serviceId,
-      hostnames,
+      {
+        providedHostname: payload.providedHostname,
+        customHostnames: payload.customHostnames,
+      },
       `http://${containerName}:${internalPort}`
     );
   }
