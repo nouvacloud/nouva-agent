@@ -50,12 +50,25 @@ export type ServerValidationReport = {
   checks: ServerValidationCheck[];
 };
 
+export type AgentImageStoreMode = "docker-local" | "local-registry";
+
+export interface RuntimeRetainedImage {
+  reference: string;
+  imageId: string | null;
+  deploymentId?: string | null;
+  commitHash?: string | null;
+}
+
 export type RuntimeMetadata = {
   configVersion?: number;
   ingressHost?: string | null;
   ingressPort?: number | null;
   publishedPort?: number | null;
+  internalPort?: number | null;
   image?: string | null;
+  imageStoreMode?: AgentImageStoreMode | null;
+  currentImage?: RuntimeRetainedImage | null;
+  previousImage?: RuntimeRetainedImage | null;
   containerId?: string | null;
   containerName?: string | null;
   networkName?: string | null;
@@ -199,6 +212,7 @@ export interface AgentRuntimeConfig {
   postgresObservabilityIntervalSeconds: number;
   ingressMode: AgentIngressMode;
   buildkitMode: AgentBuildkitMode;
+  imageStoreMode: AgentImageStoreMode;
   capabilities: AgentCapabilities;
   localRegistryHost: string;
   localRegistryPort: number;
@@ -572,6 +586,10 @@ export function getDefaultAgentCapabilities(): AgentCapabilities {
 
 export function getAgentRuntimeConfig(): AgentRuntimeConfig {
   const registryPort = Number.parseInt(process.env.NOUVA_AGENT_LOCAL_REGISTRY_PORT ?? "5000", 10);
+  const imageStoreMode =
+    process.env.NOUVA_AGENT_IMAGE_STORE_MODE === "local-registry"
+      ? "local-registry"
+      : "docker-local";
 
   return {
     heartbeatIntervalSeconds: Number.parseInt(
@@ -599,6 +617,7 @@ export function getAgentRuntimeConfig(): AgentRuntimeConfig {
     ),
     ingressMode: "local_traefik",
     buildkitMode: "docker-container",
+    imageStoreMode,
     capabilities: getDefaultAgentCapabilities(),
     localRegistryHost: process.env.NOUVA_AGENT_LOCAL_REGISTRY_HOST ?? "127.0.0.1",
     localRegistryPort: Number.isFinite(registryPort) ? registryPort : 5000,

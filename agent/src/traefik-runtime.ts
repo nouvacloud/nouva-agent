@@ -154,6 +154,7 @@ function buildTraefikRuntimeConfig(networkName: string): AgentRuntimeConfig {
     postgresObservabilityIntervalSeconds: 30,
     ingressMode: "local_traefik",
     buildkitMode: "docker-container",
+    imageStoreMode: "docker-local",
     capabilities: {
       dockerApi: true,
       buildkit: true,

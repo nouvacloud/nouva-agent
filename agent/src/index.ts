@@ -1,7 +1,9 @@
+import { execFile as execFileCallback } from "node:child_process";
 import { mkdir, readFile, readlink, rename, statfs, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import agentPackageJson from "../package.json" with { type: "json" };
 import {
   buildAndDeployAppWithDependencies,
@@ -19,6 +21,7 @@ import { collectPostgresObservabilitySamples } from "./postgres-observability.js
 import {
   type AgentCapabilities,
   type AgentHeartbeatResponse,
+  type AgentImageStoreMode,
   type AgentLeaseResponse,
   type AgentMetricsEnvelope,
   type AgentMetricsRequest,
@@ -48,6 +51,7 @@ import {
   type RestoreVolumeBackupPayload,
   type RuntimeLogMessage,
   type RuntimeMetadata,
+  type RuntimeRetainedImage,
   resolveAppRolloutConfig,
   type ServerValidationReport,
   type ServiceResourceLimits,
@@ -66,6 +70,8 @@ import {
 } from "./traefik-runtime.js";
 import { resolveUpdateAgentImageRef, toUpdateAgentPayload } from "./update-agent.js";
 
+const execFile = promisify(execFileCallback);
+
 const API_URL = process.env.NOUVA_API_URL;
 const SERVER_ID = process.env.NOUVA_SERVER_ID;
 const REGISTRATION_TOKEN = process.env.NOUVA_REGISTRATION_TOKEN;
@@ -75,6 +81,9 @@ const APP_DOMAIN = process.env.NOUVA_APP_DOMAIN || "nouva.cloud";
 const DATA_VOLUME = process.env.NOUVA_AGENT_DATA_VOLUME || "nouva-agent-data";
 const BUILDKIT_CONTAINER_NAME = process.env.NOUVA_AGENT_BUILDKIT_CONTAINER || "nouva-buildkitd";
 const BUILDKIT_IMAGE = "moby/buildkit:v0.17.0";
+const GIT_BIN = process.env.GIT_PATH || "git";
+const RAILPACK_BIN = process.env.RAILPACK_PATH || "railpack";
+const BUILDCTL_BIN = process.env.BUILDCTL_PATH || "buildctl";
 const LOCAL_REGISTRY_CONTAINER_NAME =
   process.env.NOUVA_AGENT_REGISTRY_CONTAINER || "nouva-registry";
 const TRAEFIK_CONTAINER_NAME = process.env.NOUVA_AGENT_TRAEFIK_CONTAINER || "nouva-traefik";
@@ -194,6 +203,129 @@ function toRuntimeMetadata(value: unknown): RuntimeMetadata | null {
   return Object.keys(metadata).length > 0 ? (metadata as RuntimeMetadata) : null;
 }
 
+function normalizeRetainedRuntimeImage(value: unknown): RuntimeRetainedImage | null {
+  const image = toObject(value);
+  const reference = typeof image.reference === "string" ? image.reference.trim() : "";
+  if (!reference) {
+    return null;
+  }
+
+  return {
+    reference,
+    imageId: typeof image.imageId === "string" ? image.imageId : null,
+    deploymentId: typeof image.deploymentId === "string" ? image.deploymentId : null,
+    commitHash: typeof image.commitHash === "string" ? image.commitHash : null,
+  };
+}
+
+function resolveCurrentRuntimeImage(
+  runtimeMetadata: RuntimeMetadata | null | undefined
+): RuntimeRetainedImage | null {
+  const currentImage = normalizeRetainedRuntimeImage(runtimeMetadata?.currentImage);
+  if (currentImage) {
+    return currentImage;
+  }
+
+  const reference = typeof runtimeMetadata?.image === "string" ? runtimeMetadata.image.trim() : "";
+  return reference
+    ? {
+        reference,
+        imageId: null,
+        deploymentId: null,
+        commitHash: null,
+      }
+    : null;
+}
+
+function resolvePreviousRuntimeImage(
+  runtimeMetadata: RuntimeMetadata | null | undefined
+): RuntimeRetainedImage | null {
+  return normalizeRetainedRuntimeImage(runtimeMetadata?.previousImage);
+}
+
+function sameRetainedRuntimeImage(
+  left: RuntimeRetainedImage | null | undefined,
+  right: RuntimeRetainedImage | null | undefined
+): boolean {
+  if (!left || !right) {
+    return false;
+  }
+
+  if (left.imageId && right.imageId) {
+    return left.imageId === right.imageId;
+  }
+
+  return left.reference === right.reference;
+}
+
+function isDockerLocalImageStore(mode: AgentImageStoreMode): boolean {
+  return mode === "docker-local";
+}
+
+function buildRetainedRuntimeImage(input: {
+  reference: string;
+  imageId: string | null;
+  deploymentId: string;
+  commitHash: string;
+}): RuntimeRetainedImage {
+  return {
+    reference: input.reference,
+    imageId: input.imageId,
+    deploymentId: input.deploymentId,
+    commitHash: input.commitHash,
+  };
+}
+
+async function removeRetainedRuntimeImage(
+  docker: Pick<DockerApiClient, "removeImage">,
+  image: RuntimeRetainedImage | null
+): Promise<void> {
+  if (!image) {
+    return;
+  }
+
+  if (image.reference) {
+    await docker.removeImage(image.reference, true);
+    return;
+  }
+
+  if (image.imageId) {
+    await docker.removeImage(image.imageId, true);
+  }
+}
+
+async function removeRetainedRuntimeImages(
+  docker: Pick<DockerApiClient, "removeImage">,
+  runtimeMetadata: RuntimeMetadata | null | undefined
+): Promise<void> {
+  const images = [
+    resolveCurrentRuntimeImage(runtimeMetadata),
+    resolvePreviousRuntimeImage(runtimeMetadata),
+  ];
+
+  const removed = new Set<string>();
+  for (const image of images) {
+    const key = image?.imageId ?? image?.reference ?? null;
+    if (!key || removed.has(key)) {
+      continue;
+    }
+    removed.add(key);
+    await removeRetainedRuntimeImage(docker, image);
+  }
+}
+
+function shouldRetainImageReference(
+  runtimeMetadata: RuntimeMetadata | null | undefined,
+  imageReference: string
+): boolean {
+  const retainedImages = [
+    resolveCurrentRuntimeImage(runtimeMetadata),
+    resolvePreviousRuntimeImage(runtimeMetadata),
+  ];
+
+  return retainedImages.some((image) => image?.reference === imageReference);
+}
+
 async function readCredentials(): Promise<StoredCredentials | null> {
   try {
     return JSON.parse(await readFile(CREDENTIALS_PATH, "utf8")) as StoredCredentials;
@@ -240,6 +372,16 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+async function checkCommandAvailability(command: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFile("sh", ["-lc", `command -v ${JSON.stringify(command)}`]);
+    const resolved = stdout.trim();
+    return resolved.length > 0 ? resolved : command;
+  } catch {
+    return null;
+  }
 }
 
 function resolveAppRuntimePort(
@@ -464,6 +606,40 @@ async function collectValidationSnapshot(
     );
   }
 
+  const [gitPath, railpackPath, buildctlPath] = await Promise.all([
+    checkCommandAvailability(GIT_BIN),
+    checkCommandAvailability(RAILPACK_BIN),
+    checkCommandAvailability(BUILDCTL_BIN),
+  ]);
+
+  checks.push(
+    buildCheck(
+      "git",
+      "Git CLI",
+      gitPath ? "pass" : "fail",
+      gitPath ? "Git is available for repository clones" : "Git is missing from the agent runtime",
+      gitPath
+    ),
+    buildCheck(
+      "railpack",
+      "Railpack CLI",
+      railpackPath ? "pass" : "fail",
+      railpackPath
+        ? "Railpack is available for build detection and build planning"
+        : "Railpack is missing from the agent runtime",
+      railpackPath
+    ),
+    buildCheck(
+      "buildctl",
+      "Buildctl CLI",
+      buildctlPath ? "pass" : "fail",
+      buildctlPath
+        ? "Buildctl is available for image builds"
+        : "Buildctl is missing from the agent runtime",
+      buildctlPath
+    )
+  );
+
   if (dockerVersion) {
     let traefikBootstrapError: Error | null = null;
     try {
@@ -481,8 +657,76 @@ async function collectValidationSnapshot(
         traefikBootstrapError
       ))
     );
+
+    try {
+      await ensureSharedBuildkitRuntime(docker);
+      checks.push(
+        buildCheck(
+          "buildkit",
+          "BuildKit daemon",
+          "pass",
+          "BuildKit daemon is reachable and ready for builds",
+          BUILDKIT_ADDRESS
+        )
+      );
+    } catch (error) {
+      checks.push(
+        buildCheck(
+          "buildkit",
+          "BuildKit daemon",
+          "fail",
+          error instanceof Error ? error.message : "BuildKit daemon is unavailable",
+          BUILDKIT_ADDRESS
+        )
+      );
+    }
+
+    if (config.imageStoreMode === "local-registry") {
+      try {
+        await ensureLocalRegistryRuntime(docker, config);
+        checks.push(
+          buildCheck(
+            "registry",
+            "Local image registry",
+            "pass",
+            "Local image registry is reachable and ready for pushes",
+            `127.0.0.1:${config.localRegistryPort}`
+          )
+        );
+      } catch (error) {
+        checks.push(
+          buildCheck(
+            "registry",
+            "Local image registry",
+            "fail",
+            error instanceof Error ? error.message : "Local image registry is unavailable",
+            `127.0.0.1:${config.localRegistryPort}`
+          )
+        );
+      }
+    }
   } else {
     checks.push(...buildUnavailableTraefikChecks("Docker Engine is unavailable"));
+    checks.push(
+      buildCheck(
+        "buildkit",
+        "BuildKit daemon",
+        "fail",
+        "Docker Engine is unavailable, so BuildKit cannot be reconciled",
+        BUILDKIT_ADDRESS
+      )
+    );
+    if (config.imageStoreMode === "local-registry") {
+      checks.push(
+        buildCheck(
+          "registry",
+          "Local image registry",
+          "fail",
+          "Docker Engine is unavailable, so the local image registry cannot be reconciled",
+          `127.0.0.1:${config.localRegistryPort}`
+        )
+      );
+    }
   }
 
   let diskBytesAvailable: number | null = null;
@@ -549,25 +793,6 @@ async function collectValidationSnapshot(
       String(totalMemoryBytes)
     )
   );
-
-  const buildkitMatch = BUILDKIT_ADDRESS.match(/^tcp:\/\/([^:]+):(\d+)/);
-  if (buildkitMatch) {
-    const [, bkHost, bkPort] = buildkitMatch;
-    if (bkHost && bkPort) {
-      const buildkitReachable = await checkTcpConnect(bkHost, Number(bkPort));
-      checks.push(
-        buildCheck(
-          "buildkit",
-          "BuildKit daemon",
-          buildkitReachable ? "pass" : "warn",
-          buildkitReachable
-            ? "BuildKit daemon is reachable"
-            : "BuildKit daemon is not yet reachable — image builds will fail until it starts",
-          BUILDKIT_ADDRESS
-        )
-      );
-    }
-  }
 
   // IP forwarding — required for all Docker container networking and NAT
   try {
@@ -952,6 +1177,28 @@ async function waitForBuildkitAvailability(address: string, timeoutMs = 15_000):
   throw new Error(`BuildKit did not become ready at ${address} within ${timeoutMs}ms`);
 }
 
+async function waitForLocalRegistryAvailability(
+  config: Pick<AgentRuntimeConfig, "localRegistryPort">,
+  timeoutMs = 15_000
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${config.localRegistryPort}/v2/`);
+      if (response.ok) {
+        return;
+      }
+    } catch {}
+
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+
+  throw new Error(
+    `Local registry did not become ready on 127.0.0.1:${config.localRegistryPort} within ${timeoutMs}ms`
+  );
+}
+
 function buildBuildkitContainerSpec(options: {
   name: string;
   port: number;
@@ -976,6 +1223,53 @@ function buildBuildkitContainerSpec(options: {
       ...toDockerResourceSettings(options.resourceLimits),
     },
   };
+}
+
+async function ensureSharedBuildkitRuntime(
+  docker: Pick<DockerApiClient, "ensureContainer" | "inspectContainer" | "removeContainer">
+): Promise<void> {
+  const existingBuildkit = await docker.inspectContainer(BUILDKIT_CONTAINER_NAME);
+  if (existingBuildkit?.HostConfig?.NetworkMode !== "host") {
+    await docker.removeContainer(BUILDKIT_CONTAINER_NAME, true);
+  }
+
+  await docker.ensureContainer({
+    ...buildBuildkitContainerSpec({
+      name: BUILDKIT_CONTAINER_NAME,
+      port: resolveBuildkitPort(BUILDKIT_ADDRESS),
+      resourceLimits: null,
+      restartPolicyName: "unless-stopped",
+    }),
+  });
+  await waitForBuildkitAvailability(BUILDKIT_ADDRESS);
+}
+
+async function ensureLocalRegistryRuntime(
+  docker: Pick<DockerApiClient, "ensureContainer">,
+  config: Pick<AgentRuntimeConfig, "localRegistryPort">
+): Promise<void> {
+  await docker.ensureContainer({
+    name: LOCAL_REGISTRY_CONTAINER_NAME,
+    image: "registry:2",
+    labels: buildLabels({ kind: "registry" }),
+    exposedPorts: {
+      "5000/tcp": {},
+    },
+    hostConfig: {
+      PortBindings: {
+        "5000/tcp": [
+          {
+            HostIp: "127.0.0.1",
+            HostPort: String(config.localRegistryPort),
+          },
+        ],
+      },
+      RestartPolicy: {
+        Name: "unless-stopped",
+      },
+    },
+  });
+  await waitForLocalRegistryAvailability(config);
 }
 
 export interface PreparedAppBuildkitRuntime {
@@ -1287,42 +1581,10 @@ async function ensureBaseRuntime(
   config: AgentRuntimeConfig
 ): Promise<void> {
   await ensureTraefikRuntime(docker, getTraefikRuntimeInput(config));
-
-  await docker.ensureContainer({
-    name: LOCAL_REGISTRY_CONTAINER_NAME,
-    image: "registry:2",
-    labels: buildLabels({ kind: "registry" }),
-    exposedPorts: {
-      "5000/tcp": {},
-    },
-    hostConfig: {
-      PortBindings: {
-        "5000/tcp": [
-          {
-            HostIp: "127.0.0.1",
-            HostPort: String(config.localRegistryPort),
-          },
-        ],
-      },
-      RestartPolicy: {
-        Name: "unless-stopped",
-      },
-    },
-  });
-
-  const existingBuildkit = await docker.inspectContainer(BUILDKIT_CONTAINER_NAME);
-  if (existingBuildkit?.HostConfig?.NetworkMode !== "host") {
-    await docker.removeContainer(BUILDKIT_CONTAINER_NAME, true);
+  await ensureSharedBuildkitRuntime(docker);
+  if (config.imageStoreMode === "local-registry") {
+    await ensureLocalRegistryRuntime(docker, config);
   }
-
-  await docker.ensureContainer({
-    ...buildBuildkitContainerSpec({
-      name: BUILDKIT_CONTAINER_NAME,
-      port: resolveBuildkitPort(BUILDKIT_ADDRESS),
-      resourceLimits: null,
-      restartPolicyName: "unless-stopped",
-    }),
-  });
 }
 
 function resolveAppPort(
@@ -1407,6 +1669,8 @@ export async function deployAppImageWithDependencies(
   const projectNetwork = buildProjectNetwork(payload.projectId);
   await docker.ensureNetwork(projectNetwork);
 
+  const currentRuntimeImage = resolveCurrentRuntimeImage(payload.runtimeMetadata);
+  const retainedPreviousImage = resolvePreviousRuntimeImage(payload.runtimeMetadata);
   const previousContainer =
     payload.runtimeMetadata?.containerName ?? payload.runtimeMetadata?.containerId ?? null;
   const { containerName, appPort, spec } = buildAppContainerSpec(config, payload);
@@ -1414,6 +1678,12 @@ export async function deployAppImageWithDependencies(
     ? `http://${previousContainer}:${resolveAppRuntimePort(payload.runtimeMetadata, appPort)}`
     : null;
   const rollout = resolveAppRolloutConfig(payload.rollout);
+  const dockerLocalImages = isDockerLocalImageStore(config.imageStoreMode);
+  let resolvedImageId = payload.imageId ?? null;
+
+  if (dockerLocalImages && !resolvedImageId) {
+    resolvedImageId = (await docker.inspectImage(payload.imageUrl))?.Id ?? null;
+  }
 
   if (payload.volume && rollout.blockSharedVolumes) {
     throw new AppRolloutError(
@@ -1433,7 +1703,9 @@ export async function deployAppImageWithDependencies(
     await docker.createVolume(payload.volume.volumeName);
   }
 
-  const containerId = await docker.ensureContainer(spec, true);
+  const containerId = await docker.ensureContainer(spec, true, {
+    pull: !dockerLocalImages,
+  });
   await docker.connectNetwork(projectNetwork, containerId).catch((err: Error) => {
     console.error(
       `[nouva-agent] connectNetwork failed for service ${payload.serviceId}: ${err.message}`
@@ -1444,6 +1716,12 @@ export async function deployAppImageWithDependencies(
     await waitForAppCandidateReadiness(dependencies, docker, containerName, appPort, rollout);
   } catch (error) {
     await docker.removeContainer(containerName, true);
+    if (
+      dockerLocalImages &&
+      !shouldRetainImageReference(payload.runtimeMetadata, payload.imageUrl)
+    ) {
+      await docker.removeImage(payload.imageUrl, true);
+    }
     throw new AppRolloutError(
       error instanceof Error ? error.message : "Candidate container failed readiness checks",
       buildAppRolloutResult({
@@ -1498,6 +1776,12 @@ export async function deployAppImageWithDependencies(
     }
 
     await docker.removeContainer(containerName, true);
+    if (
+      dockerLocalImages &&
+      !shouldRetainImageReference(payload.runtimeMetadata, payload.imageUrl)
+    ) {
+      await docker.removeImage(payload.imageUrl, true);
+    }
 
     throw new AppRolloutError(
       error instanceof Error ? error.message : "Traefik cutover failed",
@@ -1516,6 +1800,23 @@ export async function deployAppImageWithDependencies(
     await docker.removeContainer(previousContainer, true);
   }
 
+  const nextCurrentImage = buildRetainedRuntimeImage({
+    reference: payload.imageUrl,
+    imageId: resolvedImageId,
+    deploymentId: payload.deploymentId,
+    commitHash: payload.commitHash,
+  });
+  const nextPreviousImage = currentRuntimeImage ? { ...currentRuntimeImage } : null;
+
+  if (
+    dockerLocalImages &&
+    retainedPreviousImage &&
+    !sameRetainedRuntimeImage(retainedPreviousImage, nextPreviousImage) &&
+    !sameRetainedRuntimeImage(retainedPreviousImage, nextCurrentImage)
+  ) {
+    await removeRetainedRuntimeImage(docker, retainedPreviousImage);
+  }
+
   return {
     imageUrl: payload.imageUrl,
     buildDuration: payload.buildDuration ?? null,
@@ -1529,9 +1830,13 @@ export async function deployAppImageWithDependencies(
       containerId,
       containerName,
       image: payload.imageUrl,
+      imageStoreMode: config.imageStoreMode,
+      currentImage: nextCurrentImage,
+      previousImage: nextPreviousImage,
       ingressHost: `${payload.subdomain}.${APP_DOMAIN}`,
       ingressPort: 80,
       internalPort: appPort,
+      networkName: projectNetwork,
     },
     rollout: buildAppRolloutResult({
       outcome: "committed",
@@ -2122,6 +2427,9 @@ async function handleRemove(
   if (identifier) {
     await docker.removeContainer(identifier, true);
   }
+  if (runtimeMetadata?.imageStoreMode === "docker-local") {
+    await removeRetainedRuntimeImages(docker, runtimeMetadata);
+  }
   await deleteLocalTraefikRoute(TRAEFIK_PATHS, serviceId);
   return {
     runtimeInstance: {
@@ -2137,6 +2445,10 @@ async function handleDeleteService(docker: DockerApiClient, payload: RemoveServi
   const identifier = resolveServiceContainerIdentifier(payload);
   if (identifier) {
     await docker.removeContainer(identifier, true);
+  }
+
+  if (payload.serviceType === "app" && payload.runtimeMetadata?.imageStoreMode === "docker-local") {
+    await removeRetainedRuntimeImages(docker, payload.runtimeMetadata);
   }
 
   await deleteLocalTraefikRoute(TRAEFIK_PATHS, payload.serviceId);
@@ -2254,6 +2566,7 @@ async function processWorkItem(
     switch (workItem.kind) {
       case "deploy_app":
       case "redeploy_app":
+        // App deploy payloads are hydrated at lease time with the live service runtime metadata.
         result = await handleBuildAndDeployApp(
           docker,
           config,

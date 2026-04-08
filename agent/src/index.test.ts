@@ -32,6 +32,7 @@ const runtimeConfig: AgentRuntimeConfig = {
   postgresObservabilityIntervalSeconds: 30,
   ingressMode: "local_traefik",
   buildkitMode: "docker-container",
+  imageStoreMode: "docker-local",
   capabilities: {
     dockerApi: true,
     buildkit: true,
@@ -80,6 +81,7 @@ const appRuntimePayload: DeployAppImageInput = {
   projectId: "proj_1",
   serviceId: "svc_1",
   deploymentId: "dep_1",
+  commitHash: "abc123",
   serviceName: "app",
   subdomain: "app",
   envVars: {
@@ -131,9 +133,12 @@ function createDockerMock() {
     ensureContainer: mock(async () => "ctr_1"),
     connectNetwork: mock(async () => {}),
     inspectContainer: mock(async () => null),
+    inspectImage: mock(async () => ({ Id: "img_candidate" })),
     removeContainer: mock(async () => {}),
+    removeImage: mock(async () => {}),
     stopContainer: mock(async () => {}),
     pullImage: mock(async () => {}),
+    loadImage: mock(async () => {}),
     createContainer: mock(async () => "task_1"),
     startContainer: mock(async () => {}),
     waitContainer: mock(async () => 0),
@@ -240,6 +245,7 @@ describe("buildAndDeployAppWithDependencies", () => {
       calls.push("build");
       return {
         imageUrl: "127.0.0.1:5000/nouva-app:dep_1",
+        imageId: "img_candidate",
         imageSha: "sha256:test",
         buildDuration: 100,
         detectedLanguage: null,
@@ -272,6 +278,7 @@ describe("buildAndDeployAppWithDependencies", () => {
       expect.objectContaining({
         appBuildType: "dockerfile",
         appBuildConfig: appPayload.appBuildConfig,
+        imageStoreMode: "docker-local",
         resourceLimits: appPayload.resourceLimits,
       })
     );
@@ -447,12 +454,27 @@ describe("deployAppImageWithDependencies", () => {
         volume: null,
         rollout: createRolloutConfig(),
         runtimeMetadata: {
+          image: "nouva-app:dep_prev",
+          imageStoreMode: "docker-local",
           containerName: "nouva-app-svc_1-live",
+          currentImage: {
+            reference: "nouva-app:dep_prev",
+            imageId: "img_prev",
+            deploymentId: "dep_prev",
+            commitHash: "prev123",
+          },
+          previousImage: {
+            reference: "nouva-app:dep_older",
+            imageId: "img_older",
+            deploymentId: "dep_older",
+            commitHash: "older123",
+          },
           internalPort: 8080,
         },
       }
     );
 
+    expect(docker.ensureContainer).toHaveBeenCalledWith(expect.anything(), true, { pull: false });
     expect(checkTcpConnect).toHaveBeenCalledWith("172.19.0.10", 8080, 1);
     expect(writeLocalTraefikRoute).toHaveBeenCalledWith(
       expect.anything(),
@@ -464,6 +486,24 @@ describe("deployAppImageWithDependencies", () => {
       "http://nouva-app-svc_1-dep_1:8080"
     );
     expect(docker.removeContainer.mock.calls).toEqual([["nouva-app-svc_1-live", true]]);
+    expect(docker.removeImage).toHaveBeenCalledWith("nouva-app:dep_older", true);
+    expect(result.runtimeMetadata).toEqual(
+      expect.objectContaining({
+        imageStoreMode: "docker-local",
+        currentImage: expect.objectContaining({
+          reference: "127.0.0.1:5000/nouva-app:dep_1",
+          imageId: "img_candidate",
+          deploymentId: "dep_1",
+          commitHash: "abc123",
+        }),
+        previousImage: expect.objectContaining({
+          reference: "nouva-app:dep_prev",
+          imageId: "img_prev",
+          deploymentId: "dep_prev",
+          commitHash: "prev123",
+        }),
+      })
+    );
     expect(result.rollout).toEqual(
       expect.objectContaining({
         outcome: "committed",
@@ -525,6 +565,7 @@ describe("deployAppImageWithDependencies", () => {
 
     expect(writeLocalTraefikRoute).not.toHaveBeenCalled();
     expect(docker.removeContainer.mock.calls).toEqual([["nouva-app-svc_1-dep_1", true]]);
+    expect(docker.removeImage).toHaveBeenCalledWith("127.0.0.1:5000/nouva-app:dep_1", true);
   });
 
   test("restores the previous route and keeps the live runtime when cutover verification fails", async () => {

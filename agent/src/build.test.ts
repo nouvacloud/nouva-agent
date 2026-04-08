@@ -48,7 +48,8 @@ describe("build helpers", () => {
         contextDir: "/tmp/repo/apps/web",
         dockerfileDir: "/tmp/repo/apps/web/deploy",
         dockerfileName: "Dockerfile",
-        imageUrl: "127.0.0.1:5000/nouva-app:dep-1",
+        output:
+          "type=image,name=127.0.0.1:5000/nouva-app:dep-1,push=true,registry.insecure=true,registry.http=true",
         targetStage: "runner",
       })
     ).toEqual(
@@ -83,12 +84,22 @@ describe("build helpers", () => {
     expect(buildStaticNginxConfig(true)).toContain("try_files $uri $uri/ /index.html;");
   });
 
+  test("generates static runtime artifacts from a local build context", () => {
+    expect(
+      buildStaticRuntimeDockerfile({
+        publishDirectoryInContext: "static-export/app/dist",
+        spaFallback: false,
+      })
+    ).toContain("COPY static-export/app/dist/ /usr/share/nginx/html/");
+  });
+
   test("passes env var keys as buildctl secrets for railpack builds", () => {
     const args = buildRailpackBuildctlArgs({
       buildkitAddress: "tcp://127.0.0.1:1234",
       buildRootDir: "/tmp/repo/backend",
       planFileName: "railpack-plan.json",
-      imageUrl: "127.0.0.1:5000/nouva-app:dep-1",
+      output:
+        "type=image,name=127.0.0.1:5000/nouva-app:dep-1,push=true,registry.insecure=true,registry.http=true",
       envVarKeys: ["DATABASE_URL", "ACCESS_KEY_ID"],
     });
 
@@ -102,7 +113,8 @@ describe("build helpers", () => {
       buildkitAddress: "tcp://127.0.0.1:1234",
       buildRootDir: "/tmp/repo",
       planFileName: "railpack-plan.json",
-      imageUrl: "127.0.0.1:5000/nouva-app:dep-1",
+      output:
+        "type=image,name=127.0.0.1:5000/nouva-app:dep-1,push=true,registry.insecure=true,registry.http=true",
     });
 
     expect(args).not.toContain("--secret");

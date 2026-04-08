@@ -6,10 +6,12 @@ export interface DeployAppImageInput {
   projectId: string;
   serviceId: string;
   deploymentId: string;
+  commitHash: string;
   serviceName: string;
   subdomain: string;
   envVars: Record<string, string>;
   imageUrl: string;
+  imageId?: string | null;
   volume?: AppDeployPayload["volume"];
   resourceLimits: AppDeployPayload["resourceLimits"];
   rollout?: AppDeployPayload["rollout"];
@@ -24,11 +26,13 @@ export interface DeployAppImageInput {
 export interface BuildAndDeployAppDependencies {
   ensureBaseRuntime: (docker: DockerApiClient, config: AgentRuntimeConfig) => Promise<void>;
   buildApp: (options: {
+    docker: Pick<DockerApiClient, "inspectImage" | "loadImage">;
     repoUrl: string;
     commitHash: string;
     deploymentId: string;
     envVars: Record<string, string>;
     resourceLimits: AppDeployPayload["resourceLimits"];
+    imageStoreMode: AgentRuntimeConfig["imageStoreMode"];
     localRegistryHost: string;
     localRegistryPort: number;
     buildkitAddress: string;
@@ -52,11 +56,13 @@ export async function buildAndDeployAppWithDependencies(
   await dependencies.ensureBaseRuntime(docker, config);
 
   const buildResult = await dependencies.buildApp({
+    docker,
     repoUrl: payload.repoUrl,
     commitHash: payload.commitHash,
     deploymentId: payload.deploymentId,
     envVars: payload.envVars,
     resourceLimits: payload.resourceLimits,
+    imageStoreMode: config.imageStoreMode,
     localRegistryHost: config.localRegistryHost,
     localRegistryPort: config.localRegistryPort,
     buildkitAddress,
@@ -67,6 +73,7 @@ export async function buildAndDeployAppWithDependencies(
   return await dependencies.deployAppImage(docker, config, {
     ...payload,
     imageUrl: buildResult.imageUrl,
+    imageId: buildResult.imageId,
     buildDuration: buildResult.buildDuration,
     detectedLanguage: buildResult.detectedLanguage,
     detectedFramework: buildResult.detectedFramework,

@@ -6,6 +6,11 @@ import {
 } from "./protocol.js";
 
 type HttpMethod = "GET" | "POST" | "DELETE";
+type DockerRequestBody = Record<string, unknown> | Buffer | string | null;
+
+interface DockerRequestOptions {
+  contentType?: string;
+}
 
 export interface DockerContainerInspection {
   Id: string;
@@ -41,6 +46,12 @@ export interface DockerContainerInspection {
       }
     >;
   };
+}
+
+export interface DockerImageInspection {
+  Id: string;
+  RepoTags?: string[];
+  RepoDigests?: string[];
 }
 
 export interface DockerContainerSpec {
@@ -156,16 +167,38 @@ export class DockerApiClient {
   private static rawRequestBuffer(
     method: HttpMethod,
     path: string,
-    body?: Record<string, unknown> | null,
-    timeoutMs?: number
+    body?: DockerRequestBody,
+    timeoutMs?: number,
+    options: DockerRequestOptions = {}
   ): Promise<Buffer> {
     return new Promise((resolve, reject) => {
+      let payload: Buffer | string | null = null;
+      let headers: Record<string, string> | undefined;
+
+      if (body !== null && body !== undefined) {
+        if (Buffer.isBuffer(body) || typeof body === "string") {
+          payload = body;
+          const payloadLength = Buffer.isBuffer(payload)
+            ? payload.length
+            : Buffer.byteLength(payload, "utf8");
+          headers = {
+            "content-type": options.contentType ?? "application/octet-stream",
+            "content-length": String(payloadLength),
+          };
+        } else {
+          payload = JSON.stringify(body);
+          headers = {
+            "content-type": options.contentType ?? "application/json",
+          };
+        }
+      }
+
       const req = http.request(
         {
           socketPath: "/var/run/docker.sock",
           path,
           method,
-          headers: body ? { "content-type": "application/json" } : undefined,
+          headers,
         },
         (res) => {
           const chunks: Buffer[] = [];
@@ -196,8 +229,8 @@ export class DockerApiClient {
       }
 
       req.on("error", reject);
-      if (body) {
-        req.write(JSON.stringify(body));
+      if (payload !== null) {
+        req.write(payload);
       }
       req.end();
     });
@@ -206,23 +239,28 @@ export class DockerApiClient {
   private static async rawRequest(
     method: HttpMethod,
     path: string,
-    body?: Record<string, unknown> | null,
-    timeoutMs?: number
+    body?: DockerRequestBody,
+    timeoutMs?: number,
+    options: DockerRequestOptions = {}
   ): Promise<string> {
-    return (await DockerApiClient.rawRequestBuffer(method, path, body, timeoutMs)).toString("utf8");
+    return (
+      await DockerApiClient.rawRequestBuffer(method, path, body, timeoutMs, options)
+    ).toString("utf8");
   }
 
   async request<T = string>(
     method: HttpMethod,
     path: string,
-    body?: Record<string, unknown> | null,
-    timeoutMs?: number
+    body?: DockerRequestBody,
+    timeoutMs?: number,
+    options: DockerRequestOptions = {}
   ): Promise<T> {
     const raw = await DockerApiClient.rawRequest(
       method,
       `/${this.apiVersion}${path}`,
       body,
-      timeoutMs
+      timeoutMs,
+      options
     );
     if (!raw) {
       return "" as T;
@@ -238,14 +276,16 @@ export class DockerApiClient {
   async requestRaw(
     method: HttpMethod,
     path: string,
-    body?: Record<string, unknown> | null,
-    timeoutMs?: number
+    body?: DockerRequestBody,
+    timeoutMs?: number,
+    options: DockerRequestOptions = {}
   ): Promise<Buffer> {
     return await DockerApiClient.rawRequestBuffer(
       method,
       `/${this.apiVersion}${path}`,
       body,
-      timeoutMs
+      timeoutMs,
+      options
     );
   }
 
@@ -306,9 +346,26 @@ export class DockerApiClient {
     }
   }
 
+  async inspectImage(nameOrId: string): Promise<DockerImageInspection | null> {
+    try {
+      return await this.request("GET", `/images/${encodeURIComponent(nameOrId)}/json`);
+    } catch {
+      return null;
+    }
+  }
+
   async removeContainer(nameOrId: string, force = false): Promise<void> {
     try {
       await this.request("DELETE", `/containers/${encodeURIComponent(nameOrId)}?force=${force}`);
+    } catch {}
+  }
+
+  async removeImage(nameOrId: string, force = false): Promise<void> {
+    try {
+      await this.request(
+        "DELETE",
+        `/images/${encodeURIComponent(nameOrId)}?force=${force ? "1" : "0"}`
+      );
     } catch {}
   }
 
@@ -403,7 +460,19 @@ export class DockerApiClient {
     });
   }
 
-  async ensureContainer(spec: DockerContainerSpec, replace = false): Promise<string> {
+  async loadImage(archive: Buffer): Promise<void> {
+    await this.requestRaw("POST", "/images/load?quiet=1", archive, 5 * 60_000, {
+      contentType: "application/x-tar",
+    });
+  }
+
+  async ensureContainer(
+    spec: DockerContainerSpec,
+    replace = false,
+    options: {
+      pull?: boolean;
+    } = {}
+  ): Promise<string> {
     const existing = await this.inspectContainer(spec.name);
     if (existing && replace) {
       await this.removeContainer(spec.name, true);
@@ -417,7 +486,14 @@ export class DockerApiClient {
       return latest.Id;
     }
 
-    await this.pullImage(spec.image);
+    if (options.pull === false) {
+      const image = await this.inspectImage(spec.image);
+      if (!image) {
+        throw new Error(`Docker image ${spec.image} is not present locally`);
+      }
+    } else {
+      await this.pullImage(spec.image);
+    }
     const id = await this.createContainer(spec);
     await this.startContainer(id);
     return id;

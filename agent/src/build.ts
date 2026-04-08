@@ -4,7 +4,9 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import type { DockerApiClient } from "./docker-api.js";
 import type {
+  AgentImageStoreMode,
   AppBuildConfig,
   AppBuildType,
   AppDockerfileBuildConfig,
@@ -29,11 +31,13 @@ interface ResolvedAppBuildSettings {
 }
 
 export interface BuildAppOptions {
+  docker: Pick<DockerApiClient, "inspectImage" | "loadImage">;
   repoUrl: string;
   commitHash: string;
   deploymentId: string;
   envVars: Record<string, string>;
   resourceLimits: ServiceResourceLimits | null;
+  imageStoreMode: AgentImageStoreMode;
   localRegistryHost: string;
   localRegistryPort: number;
   buildkitAddress: string;
@@ -43,6 +47,7 @@ export interface BuildAppOptions {
 
 export interface BuildAppResult {
   imageUrl: string;
+  imageId: string | null;
   imageSha: string | null;
   buildDuration: number;
   detectedLanguage: string | null;
@@ -52,6 +57,7 @@ export interface BuildAppResult {
 }
 
 interface StrategyBuildResult {
+  imageId: string | null;
   imageSha: string | null;
   detectedLanguage: string | null;
   detectedFramework: string | null;
@@ -65,8 +71,14 @@ interface BuildctlImageBuildOptions {
   contextDir: string;
   dockerfileDir: string;
   dockerfileName: string;
-  imageUrl: string;
+  output: string;
   targetStage?: string | null;
+}
+
+interface BuildImageOutput {
+  archivePath: string | null;
+  buildctlOutput: string;
+  imageUrl: string;
 }
 
 function buildEnvVars(envVars: Record<string, string>): Record<string, string> {
@@ -211,11 +223,55 @@ function buildRegistryImageUrl(options: {
   return `${options.localRegistryHost}:${options.localRegistryPort}/${imageTag}`;
 }
 
+function buildLocalImageUrl(options: { deploymentId: string; suffix?: string }): string {
+  return options.suffix
+    ? `nouva-app:${options.deploymentId}-${options.suffix}`
+    : `nouva-app:${options.deploymentId}`;
+}
+
+function buildImageUrl(options: {
+  deploymentId: string;
+  imageStoreMode: AgentImageStoreMode;
+  localRegistryHost: string;
+  localRegistryPort: number;
+  suffix?: string;
+}): string {
+  return options.imageStoreMode === "local-registry"
+    ? buildRegistryImageUrl(options)
+    : buildLocalImageUrl(options);
+}
+
+function createBuildImageOutput(options: {
+  tempRoot: string;
+  imageUrl: string;
+  imageStoreMode: AgentImageStoreMode;
+}): BuildImageOutput {
+  if (options.imageStoreMode === "local-registry") {
+    return {
+      archivePath: null,
+      buildctlOutput: `type=image,name=${options.imageUrl},push=true,registry.insecure=true,registry.http=true`,
+      imageUrl: options.imageUrl,
+    };
+  }
+
+  const sanitizedImageName = options.imageUrl.replace(/[^a-zA-Z0-9_.-]+/g, "-");
+  const archivePath = path.join(options.tempRoot, `${sanitizedImageName}.tar`);
+  return {
+    archivePath,
+    buildctlOutput: `type=docker,name=${options.imageUrl},dest=${archivePath}`,
+    imageUrl: options.imageUrl,
+  };
+}
+
+function buildLocalDirectoryOutput(destDir: string): string {
+  return `type=local,dest=${destDir}`;
+}
+
 export function buildRailpackBuildctlArgs(options: {
   buildkitAddress: string;
   buildRootDir: string;
   planFileName: string;
-  imageUrl: string;
+  output: string;
   envVarKeys?: string[];
 }): string[] {
   const args = [
@@ -233,7 +289,7 @@ export function buildRailpackBuildctlArgs(options: {
     "--local",
     `dockerfile=${options.buildRootDir}`,
     "--output",
-    `type=image,name=${options.imageUrl},push=true,registry.insecure=true,registry.http=true`,
+    options.output,
     "--opt",
     "platform=linux/amd64",
   ];
@@ -257,7 +313,7 @@ export function buildDockerfileBuildctlArgs(options: BuildctlImageBuildOptions):
     "--local",
     `dockerfile=${options.dockerfileDir}`,
     "--output",
-    `type=image,name=${options.imageUrl},push=true,registry.insecure=true,registry.http=true`,
+    options.output,
     "--opt",
     `filename=${options.dockerfileName}`,
     "--opt",
@@ -288,49 +344,101 @@ async function runBuildctlBuild(
   return extractImageSha(`${stdout}\n${stderr}`);
 }
 
-async function buildRailpackApplication(options: {
-  buildRootDir: string;
-  envVars: Record<string, string>;
-  buildkitAddress: string;
-  imageUrl: string;
-}): Promise<StrategyBuildResult> {
-  const childEnv = buildEnvVars(options.envVars);
+async function loadBuiltImageIfNeeded(
+  docker: Pick<DockerApiClient, "inspectImage" | "loadImage">,
+  output: BuildImageOutput
+): Promise<string | null> {
+  if (!output.archivePath) {
+    return null;
+  }
+
+  const archive = await readFile(output.archivePath);
+  await docker.loadImage(archive);
+  const inspection = await docker.inspectImage(output.imageUrl);
+  return inspection?.Id ?? null;
+}
+
+async function prepareRailpackPlan(
+  buildRootDir: string,
+  envVars: Record<string, string>
+): Promise<{
+  childEnv: NodeJS.ProcessEnv;
+  info: Record<string, unknown>;
+  planFileName: string;
+}> {
+  const childEnv = buildEnvVars(envVars);
   const infoFileName = "railpack-info.json";
   const planFileName = "railpack-plan.json";
-  const infoFile = path.join(options.buildRootDir, infoFileName);
+  const infoFile = path.join(buildRootDir, infoFileName);
 
   const prepareArgs = ["prepare", "--plan-out", planFileName, "--info-out", infoFileName];
-  for (const key of Object.keys(options.envVars)) {
+  for (const key of Object.keys(envVars)) {
     prepareArgs.push("--env", `${key}=\${${key}}`);
   }
-  prepareArgs.push(options.buildRootDir);
+  prepareArgs.push(buildRootDir);
 
   await execFile(RAILPACK_BIN, prepareArgs, {
-    cwd: options.buildRootDir,
+    cwd: buildRootDir,
     env: childEnv,
   });
 
   const infoRaw = await readFile(infoFile, "utf8");
-  const info = JSON.parse(infoRaw) as Record<string, unknown>;
+  return {
+    childEnv,
+    info: JSON.parse(infoRaw) as Record<string, unknown>,
+    planFileName,
+  };
+}
+
+async function runRailpackBuildctl(options: {
+  buildRootDir: string;
+  buildkitAddress: string;
+  childEnv: NodeJS.ProcessEnv;
+  envVarKeys: string[];
+  output: string;
+  planFileName: string;
+}): Promise<string | null> {
   const { stdout, stderr } = await execFile(
     BUILDCTL_BIN,
     buildRailpackBuildctlArgs({
       buildkitAddress: options.buildkitAddress,
       buildRootDir: options.buildRootDir,
-      planFileName,
-      imageUrl: options.imageUrl,
-      envVarKeys: Object.keys(options.envVars),
+      planFileName: options.planFileName,
+      output: options.output,
+      envVarKeys: options.envVarKeys,
     }),
     {
       cwd: options.buildRootDir,
-      env: childEnv,
+      env: options.childEnv,
       maxBuffer: 1024 * 1024 * 32,
     }
   );
 
+  return extractImageSha(`${stdout}\n${stderr}`);
+}
+
+async function buildRailpackApplication(options: {
+  docker: Pick<DockerApiClient, "inspectImage" | "loadImage">;
+  buildRootDir: string;
+  envVars: Record<string, string>;
+  buildkitAddress: string;
+  output: BuildImageOutput;
+}): Promise<StrategyBuildResult> {
+  const prepared = await prepareRailpackPlan(options.buildRootDir, options.envVars);
+  const imageSha = await runRailpackBuildctl({
+    buildRootDir: options.buildRootDir,
+    buildkitAddress: options.buildkitAddress,
+    childEnv: prepared.childEnv,
+    envVarKeys: Object.keys(options.envVars),
+    output: options.output.buildctlOutput,
+    planFileName: prepared.planFileName,
+  });
+  const imageId = await loadBuiltImageIfNeeded(options.docker, options.output);
+
   return {
-    imageSha: extractImageSha(`${stdout}\n${stderr}`),
-    ...inferBuildMetadata(info),
+    imageId,
+    imageSha,
+    ...inferBuildMetadata(prepared.info),
   };
 }
 
@@ -362,13 +470,14 @@ export function detectDockerfileExposedPort(dockerfileSource: string): number | 
 }
 
 async function buildDockerfileApplication(options: {
+  docker: Pick<DockerApiClient, "inspectImage" | "loadImage">;
   buildRootDir: string;
   dockerfilePath: string;
   dockerContextPath: string;
   dockerBuildStage?: string | null;
   envVars: Record<string, string>;
   buildkitAddress: string;
-  imageUrl: string;
+  output: BuildImageOutput;
 }): Promise<StrategyBuildResult> {
   const dockerfileAbsolutePath = resolvePathWithinBuildRoot(
     options.buildRootDir,
@@ -384,13 +493,15 @@ async function buildDockerfileApplication(options: {
       contextDir,
       dockerfileDir: path.dirname(dockerfileAbsolutePath),
       dockerfileName: path.basename(dockerfileAbsolutePath),
-      imageUrl: options.imageUrl,
+      output: options.output.buildctlOutput,
       targetStage: options.dockerBuildStage ?? null,
     },
     buildEnvVars(options.envVars)
   );
+  const imageId = await loadBuiltImageIfNeeded(options.docker, options.output);
 
   return {
+    imageId,
     imageSha,
     detectedLanguage: null,
     detectedFramework: null,
@@ -426,15 +537,23 @@ export function buildStaticNginxConfig(spaFallback: boolean): string {
 }
 
 export function buildStaticRuntimeDockerfile(options: {
-  intermediateImageUrl: string;
-  publishDirectoryInImage: string;
+  intermediateImageUrl?: string;
+  publishDirectoryInContext?: string;
+  publishDirectoryInImage?: string;
   spaFallback: boolean;
 }): string {
-  const lines = [
-    "FROM nginx:1.27-alpine",
-    `COPY --from=${options.intermediateImageUrl} ${options.publishDirectoryInImage}/ /usr/share/nginx/html/`,
-    "EXPOSE 80",
-  ];
+  const copyInstruction =
+    options.intermediateImageUrl && options.publishDirectoryInImage
+      ? `COPY --from=${options.intermediateImageUrl} ${options.publishDirectoryInImage}/ /usr/share/nginx/html/`
+      : options.publishDirectoryInContext
+        ? `COPY ${options.publishDirectoryInContext}/ /usr/share/nginx/html/`
+        : null;
+
+  if (!copyInstruction) {
+    throw new Error("Static runtime Dockerfile requires an image source or build-context source");
+  }
+
+  const lines = ["FROM nginx:1.27-alpine", copyInstruction, "EXPOSE 80"];
 
   if (options.spaFallback) {
     lines.splice(2, 0, "COPY nginx.conf /etc/nginx/conf.d/default.conf");
@@ -444,6 +563,7 @@ export function buildStaticRuntimeDockerfile(options: {
 }
 
 async function buildStaticApplication(options: {
+  docker: Pick<DockerApiClient, "inspectImage" | "loadImage">;
   tempRoot: string;
   buildRootDir: string;
   publishDirectory: string;
@@ -451,53 +571,106 @@ async function buildStaticApplication(options: {
   envVars: Record<string, string>;
   buildkitAddress: string;
   deploymentId: string;
+  imageStoreMode: AgentImageStoreMode;
   localRegistryHost: string;
   localRegistryPort: number;
-  imageUrl: string;
+  output: BuildImageOutput;
 }): Promise<StrategyBuildResult> {
-  const intermediateImageUrl = buildRegistryImageUrl({
-    deploymentId: options.deploymentId,
-    localRegistryHost: options.localRegistryHost,
-    localRegistryPort: options.localRegistryPort,
-    suffix: "static-build",
-  });
-
-  const railpackResult = await buildRailpackApplication({
-    buildRootDir: options.buildRootDir,
-    envVars: options.envVars,
-    buildkitAddress: options.buildkitAddress,
-    imageUrl: intermediateImageUrl,
-  });
-
   const runtimeDir = path.join(options.tempRoot, "static-runtime");
   await mkdir(runtimeDir, { recursive: true });
+  const publishDirectoryInImage = resolveContainerPublishDirectory(options.publishDirectory);
+
+  let detectedLanguage: string | null = null;
+  let detectedFramework: string | null = null;
+  let languageVersion: string | null = null;
+
+  if (options.imageStoreMode === "docker-local") {
+    const staticExportDir = path.join(runtimeDir, "static-export");
+    await mkdir(staticExportDir, { recursive: true });
+
+    const prepared = await prepareRailpackPlan(options.buildRootDir, options.envVars);
+    await runRailpackBuildctl({
+      buildRootDir: options.buildRootDir,
+      buildkitAddress: options.buildkitAddress,
+      childEnv: prepared.childEnv,
+      envVarKeys: Object.keys(options.envVars),
+      output: buildLocalDirectoryOutput(staticExportDir),
+      planFileName: prepared.planFileName,
+    });
+
+    const metadata = inferBuildMetadata(prepared.info);
+    detectedLanguage = metadata.detectedLanguage;
+    detectedFramework = metadata.detectedFramework;
+    languageVersion = metadata.languageVersion;
+
+    await writeFile(
+      path.join(runtimeDir, "Dockerfile"),
+      buildStaticRuntimeDockerfile({
+        publishDirectoryInContext: path.posix.join(
+          "static-export",
+          publishDirectoryInImage.replace(/^\/+/, "")
+        ),
+        spaFallback: options.spaFallback,
+      }),
+      "utf8"
+    );
+  } else {
+    const intermediateImageUrl = buildImageUrl({
+      deploymentId: options.deploymentId,
+      imageStoreMode: options.imageStoreMode,
+      localRegistryHost: options.localRegistryHost,
+      localRegistryPort: options.localRegistryPort,
+      suffix: "static-build",
+    });
+
+    const railpackResult = await buildRailpackApplication({
+      docker: options.docker,
+      buildRootDir: options.buildRootDir,
+      envVars: options.envVars,
+      buildkitAddress: options.buildkitAddress,
+      output: createBuildImageOutput({
+        tempRoot: options.tempRoot,
+        imageUrl: intermediateImageUrl,
+        imageStoreMode: options.imageStoreMode,
+      }),
+    });
+
+    detectedLanguage = railpackResult.detectedLanguage;
+    detectedFramework = railpackResult.detectedFramework;
+    languageVersion = railpackResult.languageVersion;
+
+    await writeFile(
+      path.join(runtimeDir, "Dockerfile"),
+      buildStaticRuntimeDockerfile({
+        intermediateImageUrl,
+        publishDirectoryInImage,
+        spaFallback: options.spaFallback,
+      }),
+      "utf8"
+    );
+  }
+
   await writeFile(
-    path.join(runtimeDir, "Dockerfile"),
-    buildStaticRuntimeDockerfile({
-      intermediateImageUrl,
-      publishDirectoryInImage: resolveContainerPublishDirectory(options.publishDirectory),
-      spaFallback: options.spaFallback,
-    }),
+    path.join(runtimeDir, "nginx.conf"),
+    buildStaticNginxConfig(options.spaFallback),
     "utf8"
   );
-
-  if (options.spaFallback) {
-    await writeFile(path.join(runtimeDir, "nginx.conf"), buildStaticNginxConfig(true), "utf8");
-  }
 
   const imageSha = await runBuildctlBuild({
     buildkitAddress: options.buildkitAddress,
     contextDir: runtimeDir,
     dockerfileDir: runtimeDir,
     dockerfileName: "Dockerfile",
-    imageUrl: options.imageUrl,
+    output: options.output.buildctlOutput,
   });
+  const imageId = await loadBuiltImageIfNeeded(options.docker, options.output);
 
   return {
+    imageId,
     imageSha,
-    detectedLanguage: railpackResult.detectedLanguage,
-    detectedFramework: railpackResult.detectedFramework,
-    languageVersion: railpackResult.languageVersion,
+    detectedLanguage,
+    detectedFramework,
+    languageVersion,
     internalPort: 80,
   };
 }
@@ -511,7 +684,17 @@ export async function buildApp(options: BuildAppOptions): Promise<BuildAppResult
     await cloneRepository(options.repoUrl, options.commitHash, repoDir);
 
     const buildSettings = normalizeAppBuildSettings(options.appBuildType, options.appBuildConfig);
-    const imageUrl = buildRegistryImageUrl(options);
+    const imageUrl = buildImageUrl({
+      deploymentId: options.deploymentId,
+      imageStoreMode: options.imageStoreMode,
+      localRegistryHost: options.localRegistryHost,
+      localRegistryPort: options.localRegistryPort,
+    });
+    const output = createBuildImageOutput({
+      tempRoot,
+      imageUrl,
+      imageStoreMode: options.imageStoreMode,
+    });
     const buildRootDir = resolveBuildRootDirectory(repoDir, buildSettings.appBuildConfig.buildRoot);
 
     let result: StrategyBuildResult;
@@ -520,19 +703,21 @@ export async function buildApp(options: BuildAppOptions): Promise<BuildAppResult
       case "dockerfile": {
         const config = buildSettings.appBuildConfig as AppDockerfileBuildConfig;
         result = await buildDockerfileApplication({
+          docker: options.docker,
           buildRootDir,
           dockerfilePath: config.dockerfilePath,
           dockerContextPath: config.dockerContextPath,
           dockerBuildStage: config.dockerBuildStage ?? null,
           envVars: options.envVars,
           buildkitAddress: options.buildkitAddress,
-          imageUrl,
+          output,
         });
         break;
       }
       case "static": {
         const config = buildSettings.appBuildConfig as AppStaticBuildConfig;
         result = await buildStaticApplication({
+          docker: options.docker,
           tempRoot,
           buildRootDir,
           publishDirectory: config.publishDirectory,
@@ -540,18 +725,20 @@ export async function buildApp(options: BuildAppOptions): Promise<BuildAppResult
           envVars: options.envVars,
           buildkitAddress: options.buildkitAddress,
           deploymentId: options.deploymentId,
+          imageStoreMode: options.imageStoreMode,
           localRegistryHost: options.localRegistryHost,
           localRegistryPort: options.localRegistryPort,
-          imageUrl,
+          output,
         });
         break;
       }
       default:
         result = await buildRailpackApplication({
+          docker: options.docker,
           buildRootDir,
           envVars: options.envVars,
           buildkitAddress: options.buildkitAddress,
-          imageUrl,
+          output,
         });
         break;
     }
