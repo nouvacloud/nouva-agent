@@ -29,6 +29,7 @@ export const TRAEFIK_ADMIN_PORT = 8082;
 export const TRAEFIK_CANDIDATE_ADMIN_PORT = 8083;
 export const TRAEFIK_CONFIG_HASH_LABEL = "nouva.traefik.static-config-sha";
 export const TRAEFIK_ROLE_LABEL = "nouva.traefik.role";
+export const TRAEFIK_API_ENTRYPOINT = "traefik";
 
 const AGENT_DATA_DIR_IN_CONTAINER = "/var/lib/nouva-agent";
 const ACME_FILE_MODE = 0o600;
@@ -491,13 +492,13 @@ export function renderTraefikStaticConfig(paths: TraefikRuntimePaths): string {
     "  insecure: true",
     "  dashboard: true",
     "ping:",
-    "  entryPoint: admin",
+    `  entryPoint: ${TRAEFIK_API_ENTRYPOINT}`,
     "entryPoints:",
     "  web:",
     '    address: ":80"',
     "  websecure:",
     '    address: ":443"',
-    "  admin:",
+    `  ${TRAEFIK_API_ENTRYPOINT}:`,
     '    address: ":8082"',
     "providers:",
     "  file:",

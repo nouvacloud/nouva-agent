@@ -17,6 +17,7 @@ import {
   resetTraefikRuntimeState,
   resolveRoutingHostnames,
   TRAEFIK_ADMIN_PORT,
+  TRAEFIK_API_ENTRYPOINT,
   TRAEFIK_CANDIDATE_ADMIN_PORT,
   TRAEFIK_CANDIDATE_CONTAINER_NAME,
   TRAEFIK_CONFIG_HASH_LABEL,
@@ -135,6 +136,8 @@ describe("traefik-runtime", () => {
     expect(staticConfig).toContain('address: ":80"');
     expect(staticConfig).toContain('address: ":443"');
     expect(staticConfig).toContain('address: ":8082"');
+    expect(staticConfig).toContain(`entryPoint: ${TRAEFIK_API_ENTRYPOINT}`);
+    expect(staticConfig).toContain(`  ${TRAEFIK_API_ENTRYPOINT}:`);
     expect(spec.image).toBe("traefik:v3.5");
     expect(spec.hostConfig).toEqual(
       expect.objectContaining({
