@@ -216,8 +216,9 @@ export function buildRailpackBuildctlArgs(options: {
   buildRootDir: string;
   planFileName: string;
   imageUrl: string;
+  envVarKeys?: string[];
 }): string[] {
-  return [
+  const args = [
     "--addr",
     options.buildkitAddress,
     "build",
@@ -236,6 +237,12 @@ export function buildRailpackBuildctlArgs(options: {
     "--opt",
     "platform=linux/amd64",
   ];
+
+  for (const key of options.envVarKeys ?? []) {
+    args.push("--secret", `id=${key},env=${key}`);
+  }
+
+  return args;
 }
 
 export function buildDockerfileBuildctlArgs(options: BuildctlImageBuildOptions): string[] {
@@ -312,6 +319,7 @@ async function buildRailpackApplication(options: {
       buildRootDir: options.buildRootDir,
       planFileName,
       imageUrl: options.imageUrl,
+      envVarKeys: Object.keys(options.envVars),
     }),
     {
       cwd: options.buildRootDir,

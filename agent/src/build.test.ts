@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   buildDockerfileBuildctlArgs,
+  buildRailpackBuildctlArgs,
   buildStaticNginxConfig,
   buildStaticRuntimeDockerfile,
   detectDockerfileExposedPort,
@@ -80,6 +81,31 @@ describe("build helpers", () => {
     ).toContain("COPY --from=127.0.0.1:5000/nouva-app:dep-1-static-build /app/dist/");
 
     expect(buildStaticNginxConfig(true)).toContain("try_files $uri $uri/ /index.html;");
+  });
+
+  test("passes env var keys as buildctl secrets for railpack builds", () => {
+    const args = buildRailpackBuildctlArgs({
+      buildkitAddress: "tcp://127.0.0.1:1234",
+      buildRootDir: "/tmp/repo/backend",
+      planFileName: "railpack-plan.json",
+      imageUrl: "127.0.0.1:5000/nouva-app:dep-1",
+      envVarKeys: ["DATABASE_URL", "ACCESS_KEY_ID"],
+    });
+
+    expect(args).toContain("--secret");
+    expect(args).toContain("id=DATABASE_URL,env=DATABASE_URL");
+    expect(args).toContain("id=ACCESS_KEY_ID,env=ACCESS_KEY_ID");
+  });
+
+  test("omits secrets when no env var keys provided", () => {
+    const args = buildRailpackBuildctlArgs({
+      buildkitAddress: "tcp://127.0.0.1:1234",
+      buildRootDir: "/tmp/repo",
+      planFileName: "railpack-plan.json",
+      imageUrl: "127.0.0.1:5000/nouva-app:dep-1",
+    });
+
+    expect(args).not.toContain("--secret");
   });
 
   test("detects exposed ports from Dockerfiles", () => {
