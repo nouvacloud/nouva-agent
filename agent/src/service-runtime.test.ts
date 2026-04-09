@@ -106,4 +106,38 @@ describe("service runtime", () => {
 
     expect(resolved.envVars).toEqual({ POSTGRES_USER: "nouva_user" });
   });
+
+  test("resolves mongodb executor fields for generic database runtime handling", () => {
+    const resolved = resolveDatabaseProvisionSpec({
+      projectId: "proj_1",
+      serviceId: "svc_1",
+      serviceName: "main-mongo",
+      variant: "mongodb",
+      volumeId: "vol_1",
+      volumeName: "nouva-vol-vol_1",
+      mountPath: "/data/db",
+      imageUrl: "mongo:8.0",
+      envVars: {
+        MONGO_INITDB_ROOT_USERNAME: "root",
+      },
+      containerArgs: ["--bind_ip_all"],
+      dataPath: "/data/db",
+      internalPort: 27017,
+      storageSizeGb: 10,
+      externalHost: null,
+      externalPort: null,
+      publicAccessEnabled: false,
+      resourceLimits: null,
+    });
+
+    expect(resolved).toEqual({
+      image: "mongo:8.0",
+      envVars: {
+        MONGO_INITDB_ROOT_USERNAME: "root",
+      },
+      containerArgs: ["--bind_ip_all"],
+      dataPath: "/data/db",
+      internalPort: 27017,
+    });
+  });
 });

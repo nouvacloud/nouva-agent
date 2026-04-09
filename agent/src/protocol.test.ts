@@ -261,6 +261,35 @@ describe("agent protocol", () => {
     expect(JSON.parse(JSON.stringify(payload))).toEqual(payload);
   });
 
+  test("round-trips mongodb database provision payloads", () => {
+    const payload = {
+      projectId: "proj_1",
+      serviceId: "svc_1",
+      serviceName: "main-mongo",
+      variant: "mongodb" as const,
+      volumeId: "vol_1",
+      volumeName: "nouva-vol-vol_1",
+      mountPath: "/data/db",
+      imageUrl: "mongo:8.0",
+      envVars: {
+        MONGO_INITDB_ROOT_PASSWORD: "super-secret",
+      },
+      containerArgs: ["--bind_ip_all"],
+      dataPath: "/data/db",
+      internalPort: 27017,
+      storageSizeGb: 20,
+      externalHost: null,
+      externalPort: null,
+      publicAccessEnabled: false,
+      resourceLimits: {
+        cpuMillicores: 1500,
+      },
+      runtimeMetadata: null,
+    };
+
+    expect(JSON.parse(JSON.stringify(payload))).toEqual(payload);
+  });
+
   test("treats queued and expired work items as leaseable", () => {
     expect(
       canLeaseWorkItem({

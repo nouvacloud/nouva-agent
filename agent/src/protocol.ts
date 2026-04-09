@@ -407,11 +407,14 @@ export interface AppVolumeIdentity {
   mountPath: string;
 }
 
+export type DatabaseServiceVariant = "postgres" | "mongodb" | "redis";
+export type BackupDatabaseServiceVariant = "postgres" | "redis";
+
 export interface DatabaseProvisionPayload {
   projectId: string;
   serviceId: string;
   serviceName: string;
-  variant: "postgres" | "redis";
+  variant: DatabaseServiceVariant;
   volumeId: string;
   volumeName: string;
   mountPath: string;
@@ -469,7 +472,7 @@ interface QueuedVolumeBackupPayloadBase {
   projectId: string;
   serviceId: string;
   serviceName: string;
-  variant: "postgres" | "redis";
+  variant: BackupDatabaseServiceVariant;
   version: string;
   volumeId: string;
   volumeName: string;
@@ -503,7 +506,7 @@ export interface RestoreVolumeBackupPayload {
   projectId: string;
   serviceId: string;
   serviceName: string;
-  variant: "postgres" | "redis";
+  variant: BackupDatabaseServiceVariant;
   version: string;
   sourceVolumeId: string;
   sourceVolumeName: string;
@@ -523,7 +526,8 @@ export interface RestoreVolumeBackupPayload {
   credentials?: Record<string, string>;
 }
 
-export interface RestorePostgresPitrPayload extends DatabaseProvisionPayload {
+export interface RestorePostgresPitrPayload extends Omit<DatabaseProvisionPayload, "variant"> {
+  variant: "postgres";
   restoreTarget: string;
   destination: PlatformBackupDestination;
 }
@@ -543,7 +547,7 @@ export interface RestartServicePayload {
   projectId: string;
   serviceId: string;
   serviceName: string;
-  variant: "postgres" | "redis";
+  variant: DatabaseServiceVariant;
   containerName: string;
   deploymentId?: string | null;
   runtimeMetadata?: RuntimeMetadata | null;
@@ -555,7 +559,7 @@ export interface RemoveServicePayload {
   serviceId: string;
   serviceName: string;
   serviceType: "app" | "database";
-  variant?: "postgres" | "redis" | null;
+  variant?: DatabaseServiceVariant | null;
   containerName?: string | null;
   deploymentId?: string | null;
   runtimeMetadata?: RuntimeMetadata | null;
