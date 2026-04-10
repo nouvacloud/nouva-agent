@@ -217,6 +217,11 @@ export interface AgentRuntimeConfig {
   localRegistryHost: string;
   localRegistryPort: number;
   localTraefikNetwork: string;
+  privateRegistry?: {
+    host: string;
+    username: string;
+    password: string;
+  };
 }
 
 export interface AgentRegistrationSnapshot {

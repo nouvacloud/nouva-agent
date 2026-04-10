@@ -10,6 +10,13 @@ type DockerRequestBody = Record<string, unknown> | Buffer | string | null;
 
 interface DockerRequestOptions {
   contentType?: string;
+  headers?: Record<string, string>;
+}
+
+export interface RegistryAuth {
+  host: string;
+  username: string;
+  password: string;
 }
 
 export interface DockerContainerInspection {
@@ -184,13 +191,17 @@ export class DockerApiClient {
           headers = {
             "content-type": options.contentType ?? "application/octet-stream",
             "content-length": String(payloadLength),
+            ...(options.headers ?? {}),
           };
         } else {
           payload = JSON.stringify(body);
           headers = {
             "content-type": options.contentType ?? "application/json",
+            ...(options.headers ?? {}),
           };
         }
+      } else if (options.headers) {
+        headers = { ...options.headers };
       }
 
       const req = http.request(
@@ -301,12 +312,26 @@ export class DockerApiClient {
     return await this.request("GET", `/containers/json?all=true&filters=${filters}`);
   }
 
-  async pullImage(image: string): Promise<void> {
+  async pullImage(image: string, auth?: RegistryAuth): Promise<void> {
+    const headers = auth
+      ? {
+          "X-Registry-Auth": Buffer.from(
+            JSON.stringify({
+              username: auth.username,
+              password: auth.password,
+              serveraddress: auth.host,
+            }),
+            "utf8"
+          ).toString("base64"),
+        }
+      : undefined;
+
     await this.request(
       "POST",
       `/images/create?fromImage=${encodeURIComponent(image)}`,
       null,
-      5 * 60_000
+      5 * 60_000,
+      { headers }
     );
   }
 
@@ -470,6 +495,7 @@ export class DockerApiClient {
     spec: DockerContainerSpec,
     replace = false,
     options: {
+      auth?: RegistryAuth;
       pull?: boolean;
     } = {}
   ): Promise<string> {
@@ -492,7 +518,7 @@ export class DockerApiClient {
         throw new Error(`Docker image ${spec.image} is not present locally`);
       }
     } else {
-      await this.pullImage(spec.image);
+      await this.pullImage(spec.image, options.auth);
     }
     const id = await this.createContainer(spec);
     await this.startContainer(id);

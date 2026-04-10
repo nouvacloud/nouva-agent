@@ -15,6 +15,7 @@ import {
   type DockerContainerInspection,
   type DockerContainerSpec,
   type DockerLogEntry,
+  type RegistryAuth,
 } from "./docker-api.js";
 import { toDockerResourceSettings } from "./docker-resource-limits.js";
 import { collectPostgresObservabilitySamples } from "./postgres-observability.js";
@@ -1518,6 +1519,7 @@ function extractPrefixedLogLine(logs: string, prefix: string): string | null {
 
 async function runTaskContainer(
   docker: DockerApiClient,
+  config: Pick<AgentRuntimeConfig, "privateRegistry">,
   options: {
     name: string;
     image: string;
@@ -1527,7 +1529,7 @@ async function runTaskContainer(
     timeoutMs?: number;
   }
 ): Promise<{ logs: string }> {
-  await docker.pullImage(options.image);
+  await docker.pullImage(options.image, resolveRegistryAuthForImage(config, options.image));
   await docker.removeContainer(options.name, true);
 
   const id = await docker.createContainer({
@@ -1920,6 +1922,40 @@ function getDatabaseContainerName(payload: DatabaseProvisionPayload): string {
   return `nouva-${payload.variant}-${payload.serviceId.slice(0, 12)}`;
 }
 
+function getImageRegistryHost(imageReference: string): string | null {
+  const trimmed = imageReference.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const slashIndex = trimmed.indexOf("/");
+  if (slashIndex === -1) {
+    return null;
+  }
+
+  const firstSegment = trimmed.slice(0, slashIndex);
+  if (!firstSegment) {
+    return null;
+  }
+
+  return firstSegment.includes(".") || firstSegment.includes(":") || firstSegment === "localhost"
+    ? firstSegment
+    : null;
+}
+
+function resolveRegistryAuthForImage(
+  config: Pick<AgentRuntimeConfig, "privateRegistry">,
+  imageReference: string
+): RegistryAuth | undefined {
+  if (!config.privateRegistry) {
+    return undefined;
+  }
+
+  return getImageRegistryHost(imageReference) === config.privateRegistry.host
+    ? config.privateRegistry
+    : undefined;
+}
+
 export function buildDatabaseContainerSpec(payload: DatabaseProvisionPayload): {
   projectNetwork: string;
   resolved: ReturnType<typeof resolveDatabaseProvisionSpec>;
@@ -1996,12 +2032,18 @@ function isAttachedDatabaseVolumePayload(
   return typeof (payload as DatabaseProvisionPayload).serviceId === "string";
 }
 
-async function deployDatabaseContainer(docker: DockerApiClient, payload: DatabaseProvisionPayload) {
+async function deployDatabaseContainer(
+  docker: DockerApiClient,
+  config: Pick<AgentRuntimeConfig, "privateRegistry">,
+  payload: DatabaseProvisionPayload
+) {
   const { projectNetwork, resolved, volumeName, containerName, spec } =
     buildDatabaseContainerSpec(payload);
   await docker.ensureNetwork(projectNetwork);
   await docker.createVolume(volumeName);
-  const containerId = await docker.ensureContainer(spec, true);
+  const containerId = await docker.ensureContainer(spec, true, {
+    auth: resolveRegistryAuthForImage(config, resolved.image),
+  });
 
   return {
     projectNetwork,
@@ -2014,10 +2056,11 @@ async function deployDatabaseContainer(docker: DockerApiClient, payload: Databas
 
 export async function handleDatabaseProvision(
   docker: DockerApiClient,
+  config: Pick<AgentRuntimeConfig, "privateRegistry">,
   payload: DatabaseProvisionPayload
 ) {
   const { projectNetwork, resolved, volumeName, containerName, containerId } =
-    await deployDatabaseContainer(docker, payload);
+    await deployDatabaseContainer(docker, config, payload);
 
   return {
     internalHost: containerName,
@@ -2050,6 +2093,7 @@ export async function handleDatabaseProvision(
 
 export async function handleApplyDatabaseVolume(
   docker: DockerApiClient,
+  config: Pick<AgentRuntimeConfig, "privateRegistry">,
   payload: DatabaseProvisionPayload & {
     runtimeMetadata?: RuntimeMetadata | null;
   }
@@ -2059,7 +2103,7 @@ export async function handleApplyDatabaseVolume(
     await docker.removeContainer(identifier, true);
   }
 
-  return await handleDatabaseProvision(docker, payload);
+  return await handleDatabaseProvision(docker, config, payload);
 }
 
 async function handleDeleteVolume(docker: DockerApiClient, payload: DeleteVolumePayload) {
@@ -2071,6 +2115,7 @@ async function handleDeleteVolume(docker: DockerApiClient, payload: DeleteVolume
 
 async function handleWipeVolume(
   docker: DockerApiClient,
+  config: Pick<AgentRuntimeConfig, "privateRegistry">,
   payload:
     | DeleteVolumePayload
     | (DatabaseProvisionPayload & { runtimeMetadata?: RuntimeMetadata | null })
@@ -2090,15 +2135,16 @@ async function handleWipeVolume(
 
   await docker.removeVolume(getManagedVolumeName(payload), true);
 
-  return await handleDatabaseProvision(docker, payload);
+  return await handleDatabaseProvision(docker, config, payload);
 }
 
 async function handleCreateArchiveBackup(
   docker: DockerApiClient,
+  config: Pick<AgentRuntimeConfig, "privateRegistry">,
   payload: CreateVolumeBackupPayload
 ) {
   const remoteExpression = buildArchiveRemoteExpression(payload.destination.verifyTls);
-  const { logs } = await runTaskContainer(docker, {
+  const { logs } = await runTaskContainer(docker, config, {
     name: `nouva-backup-${payload.backupId.slice(0, 12)}`,
     image: BACKUP_HELPER_IMAGE,
     env: [
@@ -2135,10 +2181,11 @@ async function handleCreateArchiveBackup(
 
 async function handleDeleteArchiveBackup(
   docker: DockerApiClient,
+  config: Pick<AgentRuntimeConfig, "privateRegistry">,
   payload: DeleteVolumeBackupPayload
 ) {
   const remoteExpression = buildArchiveRemoteExpression(payload.destination.verifyTls);
-  await runTaskContainer(docker, {
+  await runTaskContainer(docker, config, {
     name: `nouva-delete-backup-${payload.backupId.slice(0, 12)}`,
     image: BACKUP_HELPER_IMAGE,
     env: [
@@ -2163,11 +2210,12 @@ async function handleDeleteArchiveBackup(
 
 async function handleRestoreArchiveBackup(
   docker: DockerApiClient,
+  config: Pick<AgentRuntimeConfig, "privateRegistry">,
   payload: RestoreVolumeBackupPayload
 ) {
   const remoteExpression = buildArchiveRemoteExpression(payload.destination.verifyTls);
   await docker.createVolume(payload.targetVolumeName);
-  await runTaskContainer(docker, {
+  await runTaskContainer(docker, config, {
     name: `nouva-restore-backup-${payload.backupId.slice(0, 12)}`,
     image: BACKUP_HELPER_IMAGE,
     env: [
@@ -2202,10 +2250,11 @@ async function handleRestoreArchiveBackup(
 
 async function handleCreatePgBackrestBackup(
   docker: DockerApiClient,
+  config: Pick<AgentRuntimeConfig, "privateRegistry">,
   payload: CreateVolumeBackupPayload
 ) {
   const spec = resolveHydratedHelperSpec(payload);
-  const { logs } = await runTaskContainer(docker, {
+  const { logs } = await runTaskContainer(docker, config, {
     name: `nouva-pgbackrest-backup-${payload.backupId.slice(0, 12)}`,
     image: spec.image,
     env: [
@@ -2256,6 +2305,7 @@ async function handleCreatePgBackrestBackup(
 
 async function handleRestorePgBackrestBackup(
   docker: DockerApiClient,
+  config: Pick<AgentRuntimeConfig, "privateRegistry">,
   payload: RestoreVolumeBackupPayload
 ) {
   if (!payload.backupCompletedAt) {
@@ -2265,7 +2315,7 @@ async function handleRestorePgBackrestBackup(
   const spec = resolveHydratedHelperSpec(payload);
 
   await docker.createVolume(payload.targetVolumeName);
-  await runTaskContainer(docker, {
+  await runTaskContainer(docker, config, {
     name: `nouva-pgbackrest-restore-${payload.targetVolumeId.slice(0, 12)}`,
     image: spec.image,
     env: [
@@ -2299,9 +2349,10 @@ async function handleRestorePgBackrestBackup(
 
 async function handleExpireVolumeBackupRepository(
   docker: DockerApiClient,
+  config: Pick<AgentRuntimeConfig, "privateRegistry">,
   payload: ExpireVolumeBackupRepositoryPayload
 ) {
-  const { logs } = await runTaskContainer(docker, {
+  const { logs } = await runTaskContainer(docker, config, {
     name: `nouva-pgbackrest-expire-${payload.volumeId.slice(0, 12)}`,
     image: payload.imageUrl ?? "postgres:17",
     env: Object.entries(toRecord(payload.envVars)).map(([key, value]) => `${key}=${value}`),
@@ -2329,43 +2380,47 @@ async function handleExpireVolumeBackupRepository(
 
 async function handleCreateVolumeBackup(
   docker: DockerApiClient,
+  config: Pick<AgentRuntimeConfig, "privateRegistry">,
   payload: CreateVolumeBackupPayload
 ) {
   if (payload.engine === "pgbackrest") {
-    return await handleCreatePgBackrestBackup(docker, payload);
+    return await handleCreatePgBackrestBackup(docker, config, payload);
   }
 
-  return await handleCreateArchiveBackup(docker, payload);
+  return await handleCreateArchiveBackup(docker, config, payload);
 }
 
 async function handleDeleteVolumeBackup(
   docker: DockerApiClient,
+  config: Pick<AgentRuntimeConfig, "privateRegistry">,
   payload: DeleteVolumeBackupPayload
 ) {
   if (payload.engine === "pgbackrest") {
     return {};
   }
 
-  return await handleDeleteArchiveBackup(docker, payload);
+  return await handleDeleteArchiveBackup(docker, config, payload);
 }
 
 async function handleRestoreVolumeBackup(
   docker: DockerApiClient,
+  config: Pick<AgentRuntimeConfig, "privateRegistry">,
   payload: RestoreVolumeBackupPayload
 ) {
   if (payload.engine === "pgbackrest") {
-    return await handleRestorePgBackrestBackup(docker, payload);
+    return await handleRestorePgBackrestBackup(docker, config, payload);
   }
 
-  return await handleRestoreArchiveBackup(docker, payload);
+  return await handleRestoreArchiveBackup(docker, config, payload);
 }
 
 export async function handleRestorePostgresPitr(
   docker: DockerApiClient,
+  config: Pick<AgentRuntimeConfig, "privateRegistry">,
   payload: RestorePostgresPitrPayload
 ) {
   const spec = resolveDatabaseProvisionSpec(payload);
-  await runTaskContainer(docker, {
+  await runTaskContainer(docker, config, {
     name: `nouva-pgbackrest-pitr-${payload.serviceId.slice(0, 12)}`,
     image: spec.image,
     env: [
@@ -2593,11 +2648,12 @@ async function processWorkItem(
       case "provision_database":
         result = await handleDatabaseProvision(
           docker,
+          config,
           payload as unknown as DatabaseProvisionPayload
         );
         break;
       case "apply_database_volume":
-        result = await handleApplyDatabaseVolume(docker, {
+        result = await handleApplyDatabaseVolume(docker, config, {
           ...(payload as unknown as DatabaseProvisionPayload),
           runtimeMetadata: toRuntimeMetadata(payload.runtimeMetadata),
         });
@@ -2614,6 +2670,7 @@ async function processWorkItem(
       case "wipe_volume":
         result = await handleWipeVolume(
           docker,
+          config,
           "serviceId" in payload
             ? {
                 ...(payload as unknown as DatabaseProvisionPayload),
@@ -2625,30 +2682,35 @@ async function processWorkItem(
       case "create_volume_backup":
         result = await handleCreateVolumeBackup(
           docker,
+          config,
           payload as unknown as CreateVolumeBackupPayload
         );
         break;
       case "delete_volume_backup":
         result = await handleDeleteVolumeBackup(
           docker,
+          config,
           payload as unknown as DeleteVolumeBackupPayload
         );
         break;
       case "restore_volume_backup":
         result = await handleRestoreVolumeBackup(
           docker,
+          config,
           payload as unknown as RestoreVolumeBackupPayload
         );
         break;
       case "restore_postgres_pitr":
         result = await handleRestorePostgresPitr(
           docker,
+          config,
           payload as unknown as RestorePostgresPitrPayload
         );
         break;
       case "expire_volume_backup_repository":
         result = await handleExpireVolumeBackupRepository(
           docker,
+          config,
           payload as unknown as ExpireVolumeBackupRepositoryPayload
         );
         break;

@@ -736,7 +736,7 @@ describe("database runtime recreate paths", () => {
   test("applies Docker resource limits during database provision", async () => {
     const docker = createDockerMock();
 
-    await handleDatabaseProvision(docker as never, databasePayload);
+    await handleDatabaseProvision(docker as never, runtimeConfig, databasePayload);
 
     expect(docker.ensureContainer.mock.calls[0]?.[0]).toEqual(
       expect.objectContaining({
@@ -751,7 +751,7 @@ describe("database runtime recreate paths", () => {
   test("applies Docker resource limits when reapplying a database volume", async () => {
     const docker = createDockerMock();
 
-    await handleApplyDatabaseVolume(docker as never, {
+    await handleApplyDatabaseVolume(docker as never, runtimeConfig, {
       ...databasePayload,
       resourceLimits: {
         memoryBytes: 1024 * 1024 * 1024,
@@ -772,10 +772,60 @@ describe("database runtime recreate paths", () => {
     expect(docker.ensureContainer.mock.calls[0]?.[0]?.hostConfig).not.toHaveProperty("NanoCpus");
   });
 
+  test("attaches registry auth only for images hosted on the configured private registry", async () => {
+    const docker = createDockerMock();
+
+    await handleDatabaseProvision(
+      docker as never,
+      {
+        ...runtimeConfig,
+        privateRegistry: {
+          host: "registry.nouva.sh",
+          username: "srv_srv_1",
+          password: "registry-password",
+        },
+      },
+      {
+        ...databasePayload,
+        imageUrl: "registry.nouva.sh/nouva/postgres:17",
+      }
+    );
+
+    expect(docker.ensureContainer.mock.calls[0]?.[2]).toEqual({
+      auth: {
+        host: "registry.nouva.sh",
+        username: "srv_srv_1",
+        password: "registry-password",
+      },
+    });
+
+    docker.ensureContainer.mockClear();
+
+    await handleDatabaseProvision(
+      docker as never,
+      {
+        ...runtimeConfig,
+        privateRegistry: {
+          host: "registry.nouva.sh",
+          username: "srv_srv_1",
+          password: "registry-password",
+        },
+      },
+      {
+        ...databasePayload,
+        imageUrl: "postgres:17",
+      }
+    );
+
+    expect(docker.ensureContainer.mock.calls[0]?.[2]).toEqual({
+      auth: undefined,
+    });
+  });
+
   test("restores PITR into the staged volume without touching the live container", async () => {
     const docker = createDockerMock();
 
-    const result = await handleRestorePostgresPitr(docker as never, {
+    const result = await handleRestorePostgresPitr(docker as never, runtimeConfig, {
       ...databasePayload,
       destination: {} as never,
       restoreTarget: "2026-03-25T00:00:00Z",
@@ -793,6 +843,58 @@ describe("database runtime recreate paths", () => {
     expect(
       docker.removeContainer.mock.calls.some((call) => call[0] === "nouva-postgres-prev")
     ).toBe(false);
+  });
+
+  test("uses private registry auth when a PITR helper image is hosted on the private registry", async () => {
+    const docker = createDockerMock();
+
+    await handleRestorePostgresPitr(
+      docker as never,
+      {
+        ...runtimeConfig,
+        privateRegistry: {
+          host: "registry.nouva.sh",
+          username: "srv_srv_1",
+          password: "registry-password",
+        },
+      },
+      {
+        ...databasePayload,
+        imageUrl: "registry.nouva.sh/nouva/postgres:17",
+        destination: {} as never,
+        restoreTarget: "2026-03-25T00:00:00Z",
+      }
+    );
+
+    expect(docker.pullImage).toHaveBeenCalledWith("registry.nouva.sh/nouva/postgres:17", {
+      host: "registry.nouva.sh",
+      username: "srv_srv_1",
+      password: "registry-password",
+    });
+  });
+
+  test("does not attach private registry auth when a PITR helper image is public", async () => {
+    const docker = createDockerMock();
+
+    await handleRestorePostgresPitr(
+      docker as never,
+      {
+        ...runtimeConfig,
+        privateRegistry: {
+          host: "registry.nouva.sh",
+          username: "srv_srv_1",
+          password: "registry-password",
+        },
+      },
+      {
+        ...databasePayload,
+        imageUrl: "postgres:17",
+        destination: {} as never,
+        restoreTarget: "2026-03-25T00:00:00Z",
+      }
+    );
+
+    expect(docker.pullImage).toHaveBeenCalledWith("postgres:17", undefined);
   });
 
   test("deduplicates overlapping runtime log batches and preserves offsets", () => {

@@ -1,5 +1,5 @@
-import { describe, expect, test } from "bun:test";
-import { parseDockerLogBuffer } from "./docker-api.js";
+import { describe, expect, spyOn, test } from "bun:test";
+import { DockerApiClient, parseDockerLogBuffer } from "./docker-api.js";
 
 function encodeFrame(streamType: 1 | 2, payload: string): Buffer {
   const content = Buffer.from(payload, "utf8");
@@ -45,5 +45,33 @@ describe("parseDockerLogBuffer", () => {
         line: "second line",
       },
     ]);
+  });
+});
+
+describe("DockerApiClient.pullImage", () => {
+  test("sends X-Registry-Auth only when auth is provided", async () => {
+    const DockerApiClientCtor = DockerApiClient as unknown as {
+      new (apiVersion: string): DockerApiClient;
+    };
+    const client = new DockerApiClientCtor("v1.51");
+    const requestSpy = spyOn(client, "request").mockResolvedValue("");
+
+    await client.pullImage("postgres:17");
+    await client.pullImage("registry.nouva.sh/nouva/postgres:17", {
+      host: "registry.nouva.sh",
+      username: "srv_srv_1",
+      password: "registry-password",
+    });
+
+    expect(requestSpy.mock.calls[0]?.[4]?.headers?.["X-Registry-Auth"]).toBeUndefined();
+    const encodedHeader = requestSpy.mock.calls[1]?.[4]?.headers?.["X-Registry-Auth"];
+    expect(typeof encodedHeader).toBe("string");
+    expect(JSON.parse(Buffer.from(encodedHeader as string, "base64").toString("utf8"))).toEqual({
+      username: "srv_srv_1",
+      password: "registry-password",
+      serveraddress: "registry.nouva.sh",
+    });
+
+    requestSpy.mockRestore();
   });
 });
