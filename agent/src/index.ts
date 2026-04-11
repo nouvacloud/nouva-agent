@@ -183,9 +183,10 @@ function resolveHydratedHelperSpec(payload: {
   imageUrl?: string;
   envVars?: Record<string, string> | undefined;
   containerArgs?: string[] | undefined;
+  mountPath?: string;
   dataPath?: string;
 }) {
-  if (!payload.imageUrl || !payload.dataPath || !payload.envVars) {
+  if (!payload.imageUrl || !payload.mountPath || !payload.dataPath || !payload.envVars) {
     throw new Error("Backup helper payload is missing hydrated executor fields");
   }
 
@@ -195,6 +196,7 @@ function resolveHydratedHelperSpec(payload: {
     containerArgs: Array.isArray(payload.containerArgs)
       ? payload.containerArgs.filter((value): value is string => typeof value === "string")
       : [],
+    mountPath: payload.mountPath,
     dataPath: payload.dataPath,
   };
 }
@@ -1524,6 +1526,7 @@ async function runTaskContainer(
     name: string;
     image: string;
     env?: string[];
+    entrypoint?: string[];
     cmd: string[];
     mounts?: Array<{ source: string; target: string }>;
     timeoutMs?: number;
@@ -1536,6 +1539,7 @@ async function runTaskContainer(
     name: options.name,
     image: options.image,
     env: options.env,
+    entrypoint: options.entrypoint,
     cmd: options.cmd,
     tty: true,
     labels: buildLabels({ kind: "task" }),
@@ -1973,7 +1977,7 @@ export function buildDatabaseContainerSpec(payload: DatabaseProvisionPayload): {
       {
         Type: "volume",
         Source: volumeName,
-        Target: resolved.dataPath,
+        Target: resolved.mountPath,
       },
     ],
     RestartPolicy: {
@@ -2073,7 +2077,8 @@ export async function handleDatabaseProvision(
       image: resolved.image,
       publishedPort: payload.publicAccessEnabled ? payload.externalPort : null,
       volumeName,
-      mountPath: resolved.dataPath,
+      mountPath: resolved.mountPath,
+      dataPath: resolved.dataPath,
     },
     runtimeInstance: {
       kind: "database",
@@ -2253,7 +2258,26 @@ async function handleCreatePgBackrestBackup(
   config: Pick<AgentRuntimeConfig, "privateRegistry">,
   payload: CreateVolumeBackupPayload
 ) {
-  const spec = resolveHydratedHelperSpec(payload);
+  const spec = resolveHydratedHelperSpec({
+    imageUrl: payload.imageUrl,
+    envVars: payload.envVars,
+    containerArgs: payload.containerArgs,
+    mountPath: payload.mountPath,
+    dataPath: payload.dataPath,
+  });
+  const script = [
+    "set -eu",
+    'printf "%s\\n" "*:*:*:$POSTGRES_USER:$POSTGRES_PASSWORD" > /tmp/.pgpass',
+    "chmod 0600 /tmp/.pgpass",
+    "export PGPASSFILE=/tmp/.pgpass",
+    'metadata_dir="$NOUVA_DATA_PATH/.nouva/pgbackrest"',
+    'mkdir -p "$metadata_dir"',
+    "if [ -x /nouva/generate_config.sh ]; then /nouva/generate_config.sh; fi",
+    'pgbackrest --stanza="$PGBACKREST_STANZA" --type="$NOUVA_PGBACKREST_BACKUP_TYPE" --annotation="nouva-backup-id=$NOUVA_BACKUP_ID" --log-level-console=info backup',
+    'if info_output=$(pgbackrest --stanza="$PGBACKREST_STANZA" --output=json info 2>/dev/null); then',
+    `  printf 'NOUVA_PGBACKREST_INFO:%s\\n' "$(printf '%s' "$info_output" | tr -d '\\n')"`,
+    "fi",
+  ].join("\n");
   const { logs } = await runTaskContainer(docker, config, {
     name: `nouva-pgbackrest-backup-${payload.backupId.slice(0, 12)}`,
     image: spec.image,
@@ -2263,24 +2287,9 @@ async function handleCreatePgBackrestBackup(
       `NOUVA_PGBACKREST_BACKUP_TYPE=${payload.pgbackrestType ?? "full"}`,
       `NOUVA_DATA_PATH=${spec.dataPath}`,
     ],
-    cmd: [
-      "sh",
-      "-c",
-      [
-        "set -eu",
-        'printf "%s\\n" "*:*:*:$POSTGRES_USER:$POSTGRES_PASSWORD" > /tmp/.pgpass',
-        "chmod 0600 /tmp/.pgpass",
-        "export PGPASSFILE=/tmp/.pgpass",
-        'metadata_dir="$NOUVA_DATA_PATH/.nouva/pgbackrest"',
-        'mkdir -p "$metadata_dir"',
-        "if [ -x /nouva/generate_config.sh ]; then /nouva/generate_config.sh; fi",
-        'pgbackrest --stanza="$PGBACKREST_STANZA" --type="$NOUVA_PGBACKREST_BACKUP_TYPE" --annotation="nouva-backup-id=$NOUVA_BACKUP_ID" --log-level-console=info backup',
-        'if info_output=$(pgbackrest --stanza="$PGBACKREST_STANZA" --output=json info 2>/dev/null); then',
-        `  printf 'NOUVA_PGBACKREST_INFO:%s\\n' "$(printf '%s' "$info_output" | tr -d '\\n')"`,
-        "fi",
-      ].join("\n"),
-    ],
-    mounts: [{ source: payload.volumeName, target: spec.dataPath }],
+    entrypoint: ["sh", "-c"],
+    cmd: [script],
+    mounts: [{ source: payload.volumeName, target: spec.mountPath }],
     timeoutMs: 30 * 60_000,
   });
 
@@ -2312,7 +2321,23 @@ async function handleRestorePgBackrestBackup(
     throw new Error("Backup restore is missing backupCompletedAt");
   }
 
-  const spec = resolveHydratedHelperSpec(payload);
+  const spec = resolveHydratedHelperSpec({
+    imageUrl: payload.imageUrl,
+    envVars: payload.envVars,
+    containerArgs: payload.containerArgs,
+    mountPath: payload.targetMountPath,
+    dataPath: payload.dataPath,
+  });
+  const script = [
+    "set -eu",
+    'mkdir -p "$NOUVA_DATA_PATH"',
+    'chown -R 999:999 "$NOUVA_DATA_PATH" || true',
+    "if [ -x /nouva/generate_config.sh ]; then /nouva/generate_config.sh; fi",
+    `if [ -n "\${RESTORE_SET:-}" ]; then`,
+    '  exec pgbackrest --stanza="$PGBACKREST_STANZA" --set="$RESTORE_SET" --delta --type=time --target="$RESTORE_TARGET" --target-action=promote --log-level-console=info restore',
+    "fi",
+    'exec pgbackrest --stanza="$PGBACKREST_STANZA" --delta --type=time --target="$RESTORE_TARGET" --target-action=promote --log-level-console=info restore',
+  ].join("\n");
 
   await docker.createVolume(payload.targetVolumeName);
   await runTaskContainer(docker, config, {
@@ -2324,21 +2349,9 @@ async function handleRestorePgBackrestBackup(
       `RESTORE_SET=${payload.pgbackrestSet ?? ""}`,
       `NOUVA_DATA_PATH=${spec.dataPath}`,
     ],
-    cmd: [
-      "sh",
-      "-c",
-      [
-        "set -eu",
-        'mkdir -p "$NOUVA_DATA_PATH"',
-        'chown -R 999:999 "$NOUVA_DATA_PATH" || true',
-        "if [ -x /nouva/generate_config.sh ]; then /nouva/generate_config.sh; fi",
-        `if [ -n "\${RESTORE_SET:-}" ]; then`,
-        '  exec pgbackrest --stanza="$PGBACKREST_STANZA" --set="$RESTORE_SET" --delta --type=time --target="$RESTORE_TARGET" --target-action=promote --log-level-console=info restore',
-        "fi",
-        'exec pgbackrest --stanza="$PGBACKREST_STANZA" --delta --type=time --target="$RESTORE_TARGET" --target-action=promote --log-level-console=info restore',
-      ].join("\n"),
-    ],
-    mounts: [{ source: payload.targetVolumeName, target: spec.dataPath }],
+    entrypoint: ["sh", "-c"],
+    cmd: [script],
+    mounts: [{ source: payload.targetVolumeName, target: spec.mountPath }],
     timeoutMs: 30 * 60_000,
   });
 
@@ -2352,22 +2365,20 @@ async function handleExpireVolumeBackupRepository(
   config: Pick<AgentRuntimeConfig, "privateRegistry">,
   payload: ExpireVolumeBackupRepositoryPayload
 ) {
+  const script = [
+    "set -eu",
+    "if [ -x /nouva/generate_config.sh ]; then /nouva/generate_config.sh; fi",
+    'pgbackrest --stanza="$PGBACKREST_STANZA" --log-level-console=info expire',
+    'if info_output=$(pgbackrest --stanza="$PGBACKREST_STANZA" --output=json info 2>/dev/null); then',
+    `  printf 'NOUVA_PGBACKREST_INFO:%s\\n' "$(printf '%s' "$info_output" | tr -d '\\n')"`,
+    "fi",
+  ].join("\n");
   const { logs } = await runTaskContainer(docker, config, {
     name: `nouva-pgbackrest-expire-${payload.volumeId.slice(0, 12)}`,
     image: payload.imageUrl ?? "postgres:17",
     env: Object.entries(toRecord(payload.envVars)).map(([key, value]) => `${key}=${value}`),
-    cmd: [
-      "sh",
-      "-c",
-      [
-        "set -eu",
-        "if [ -x /nouva/generate_config.sh ]; then /nouva/generate_config.sh; fi",
-        'pgbackrest --stanza="$PGBACKREST_STANZA" --log-level-console=info expire',
-        'if info_output=$(pgbackrest --stanza="$PGBACKREST_STANZA" --output=json info 2>/dev/null); then',
-        `  printf 'NOUVA_PGBACKREST_INFO:%s\\n' "$(printf '%s' "$info_output" | tr -d '\\n')"`,
-        "fi",
-      ].join("\n"),
-    ],
+    entrypoint: ["sh", "-c"],
+    cmd: [script],
     timeoutMs: 30 * 60_000,
   });
 
@@ -2420,6 +2431,11 @@ export async function handleRestorePostgresPitr(
   payload: RestorePostgresPitrPayload
 ) {
   const spec = resolveDatabaseProvisionSpec(payload);
+  const script = [
+    "set -eu",
+    "if [ -x /nouva/generate_config.sh ]; then /nouva/generate_config.sh; fi",
+    'pgbackrest --stanza="$PGBACKREST_STANZA" --delta --type=time --target="$RESTORE_TARGET" --target-action=promote --log-level-console=info restore',
+  ].join("\n");
   await runTaskContainer(docker, config, {
     name: `nouva-pgbackrest-pitr-${payload.serviceId.slice(0, 12)}`,
     image: spec.image,
@@ -2428,16 +2444,9 @@ export async function handleRestorePostgresPitr(
       `RESTORE_TARGET=${payload.restoreTarget}`,
       `NOUVA_DATA_PATH=${spec.dataPath}`,
     ],
-    cmd: [
-      "sh",
-      "-c",
-      [
-        "set -eu",
-        "if [ -x /nouva/generate_config.sh ]; then /nouva/generate_config.sh; fi",
-        'pgbackrest --stanza="$PGBACKREST_STANZA" --delta --type=time --target="$RESTORE_TARGET" --target-action=promote --log-level-console=info restore',
-      ].join("\n"),
-    ],
-    mounts: [{ source: payload.volumeName, target: spec.dataPath }],
+    entrypoint: ["sh", "-c"],
+    cmd: [script],
+    mounts: [{ source: payload.volumeName, target: spec.mountPath }],
     timeoutMs: 30 * 60_000,
   });
 

@@ -4,6 +4,7 @@ interface ResolvedDatabaseProvisionSpec {
   image: string;
   envVars: Record<string, string>;
   containerArgs: string[];
+  mountPath: string;
   dataPath: string;
   internalPort: number;
 }
@@ -57,6 +58,7 @@ export function resolveDatabaseProvisionSpec(
     containerArgs: payload.containerArgs.filter(
       (value): value is string => typeof value === "string"
     ),
+    mountPath: payload.mountPath,
     dataPath: payload.dataPath,
     internalPort: payload.internalPort,
   };

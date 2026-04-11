@@ -16,7 +16,7 @@ describe("service runtime", () => {
         POSTGRES_USER: "nouva_user",
       },
       containerArgs: ["postgres", "-c", "shared_buffers=128MB"],
-      dataPath: "/var/lib/postgresql",
+      dataPath: "/var/lib/postgresql/pgdata",
       internalPort: 5432,
       storageSizeGb: 10,
       externalHost: null,
@@ -31,7 +31,8 @@ describe("service runtime", () => {
         POSTGRES_USER: "nouva_user",
       },
       containerArgs: ["postgres", "-c", "shared_buffers=128MB"],
-      dataPath: "/var/lib/postgresql",
+      mountPath: "/var/lib/postgresql",
+      dataPath: "/var/lib/postgresql/pgdata",
       internalPort: 5432,
     });
   });
@@ -95,7 +96,7 @@ describe("service runtime", () => {
         BROKEN: 123 as unknown as string,
       },
       containerArgs: [],
-      dataPath: "/var/lib/postgresql",
+      dataPath: "/var/lib/postgresql/pgdata",
       internalPort: 5432,
       storageSizeGb: 10,
       externalHost: null,
@@ -136,6 +137,7 @@ describe("service runtime", () => {
         MONGO_INITDB_ROOT_USERNAME: "root",
       },
       containerArgs: ["--bind_ip_all"],
+      mountPath: "/data/db",
       dataPath: "/data/db",
       internalPort: 27017,
     });

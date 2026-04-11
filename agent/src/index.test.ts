@@ -116,7 +116,7 @@ const databasePayload: DatabaseProvisionPayload = {
     POSTGRES_PASSWORD: "super-secret",
   },
   containerArgs: [],
-  dataPath: "/var/lib/postgresql",
+  dataPath: "/var/lib/postgresql/pgdata",
   internalPort: 5432,
   storageSizeGb: 20,
   externalHost: null,
@@ -713,8 +713,20 @@ describe("buildDatabaseContainerSpec", () => {
   test("includes Docker resource limits for provisioned database containers", () => {
     const spec = buildDatabaseContainerSpec(databasePayload);
 
+    expect(spec.resolved).toEqual(
+      expect.objectContaining({
+        mountPath: "/var/lib/postgresql",
+        dataPath: "/var/lib/postgresql/pgdata",
+      })
+    );
     expect(spec.spec.hostConfig).toEqual(
       expect.objectContaining({
+        Mounts: [
+          expect.objectContaining({
+            Source: "nouva-vol-vol_1",
+            Target: "/var/lib/postgresql",
+          }),
+        ],
         NanoCpus: 1_500_000_000,
         Memory: 2 * 1024 * 1024 * 1024,
       })
@@ -736,14 +748,26 @@ describe("database runtime recreate paths", () => {
   test("applies Docker resource limits during database provision", async () => {
     const docker = createDockerMock();
 
-    await handleDatabaseProvision(docker as never, runtimeConfig, databasePayload);
+    const result = await handleDatabaseProvision(docker as never, runtimeConfig, databasePayload);
 
     expect(docker.ensureContainer.mock.calls[0]?.[0]).toEqual(
       expect.objectContaining({
         hostConfig: expect.objectContaining({
+          Mounts: [
+            expect.objectContaining({
+              Source: "nouva-vol-vol_1",
+              Target: "/var/lib/postgresql",
+            }),
+          ],
           NanoCpus: 1_500_000_000,
           Memory: 2 * 1024 * 1024 * 1024,
         }),
+      })
+    );
+    expect(result.runtimeMetadata).toEqual(
+      expect.objectContaining({
+        mountPath: "/var/lib/postgresql",
+        dataPath: "/var/lib/postgresql/pgdata",
       })
     );
   });
@@ -840,6 +864,22 @@ describe("database runtime recreate paths", () => {
     expect(docker.stopContainer).not.toHaveBeenCalled();
     expect(docker.ensureContainer).not.toHaveBeenCalled();
     expect(docker.createContainer).toHaveBeenCalledTimes(1);
+    expect(docker.createContainer.mock.calls[0]?.[0]).toEqual(
+      expect.objectContaining({
+        image: "postgres:17",
+        entrypoint: ["sh", "-c"],
+        cmd: [expect.stringContaining('pgbackrest --stanza="$PGBACKREST_STANZA"')],
+        hostConfig: expect.objectContaining({
+          Mounts: [
+            expect.objectContaining({
+              Source: "nouva-vol-vol_1",
+              Target: "/var/lib/postgresql",
+            }),
+          ],
+        }),
+        env: expect.arrayContaining(["NOUVA_DATA_PATH=/var/lib/postgresql/pgdata"]),
+      })
+    );
     expect(
       docker.removeContainer.mock.calls.some((call) => call[0] === "nouva-postgres-prev")
     ).toBe(false);

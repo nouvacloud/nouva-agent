@@ -199,7 +199,7 @@ describe("agent protocol", () => {
         PGBACKREST_REPO1_S3_BUCKET: "nouva-backups",
       },
       containerArgs: [],
-      dataPath: "/var/lib/postgresql",
+      dataPath: "/var/lib/postgresql/pgdata",
     };
 
     expect(JSON.parse(JSON.stringify(payload))).toEqual(payload);
@@ -246,7 +246,7 @@ describe("agent protocol", () => {
         POSTGRES_PASSWORD: "super-secret",
       },
       containerArgs: [],
-      dataPath: "/var/lib/postgresql",
+      dataPath: "/var/lib/postgresql/pgdata",
       internalPort: 5432,
       storageSizeGb: 20,
       externalHost: null,

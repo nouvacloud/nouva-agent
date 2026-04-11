@@ -75,3 +75,32 @@ describe("DockerApiClient.pullImage", () => {
     requestSpy.mockRestore();
   });
 });
+
+describe("DockerApiClient.createContainer", () => {
+  test("serializes Entrypoint when it is provided", async () => {
+    const DockerApiClientCtor = DockerApiClient as unknown as {
+      new (apiVersion: string): DockerApiClient;
+    };
+    const client = new DockerApiClientCtor("v1.51");
+    const requestSpy = spyOn(client, "request").mockResolvedValue({ Id: "ctr_1" });
+
+    await client.createContainer({
+      name: "nouva-pgbackrest-test",
+      image: "registry.nouva.sh/nouva/postgres:17",
+      entrypoint: ["sh", "-c"],
+      cmd: ["echo ok"],
+    });
+
+    expect(requestSpy).toHaveBeenCalledWith(
+      "POST",
+      "/containers/create?name=nouva-pgbackrest-test",
+      expect.objectContaining({
+        Image: "registry.nouva.sh/nouva/postgres:17",
+        Entrypoint: ["sh", "-c"],
+        Cmd: ["echo ok"],
+      })
+    );
+
+    requestSpy.mockRestore();
+  });
+});

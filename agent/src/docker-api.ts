@@ -65,6 +65,7 @@ export interface DockerContainerSpec {
   name: string;
   image: string;
   env?: string[];
+  entrypoint?: string[];
   cmd?: string[];
   tty?: boolean;
   labels?: Record<string, string>;
@@ -411,6 +412,7 @@ export class DockerApiClient {
       {
         Image: spec.image,
         Env: spec.env,
+        Entrypoint: spec.entrypoint,
         Cmd: spec.cmd,
         Tty: spec.tty ?? false,
         Labels: spec.labels,
