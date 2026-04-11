@@ -2273,6 +2273,15 @@ async function handleCreatePgBackrestBackup(
     'metadata_dir="$NOUVA_DATA_PATH/.nouva/pgbackrest"',
     'mkdir -p "$metadata_dir"',
     "if [ -x /nouva/generate_config.sh ]; then /nouva/generate_config.sh; fi",
+    'stanza_info_log="/tmp/pgbackrest-stanza-info.log"',
+    'if ! pgbackrest --stanza="$PGBACKREST_STANZA" info >"$stanza_info_log" 2>&1; then',
+    '  if grep -Eq "missing stanza path|backup\\.info cannot be opened" "$stanza_info_log"; then',
+    '    pgbackrest --stanza="$PGBACKREST_STANZA" --log-level-console=info stanza-create',
+    "  else",
+    '    cat "$stanza_info_log" >&2',
+    "    exit 1",
+    "  fi",
+    "fi",
     'pgbackrest --stanza="$PGBACKREST_STANZA" --type="$NOUVA_PGBACKREST_BACKUP_TYPE" --annotation="nouva-backup-id=$NOUVA_BACKUP_ID" --log-level-console=info backup',
     'if info_output=$(pgbackrest --stanza="$PGBACKREST_STANZA" --output=json info 2>/dev/null); then',
     `  printf 'NOUVA_PGBACKREST_INFO:%s\\n' "$(printf '%s' "$info_output" | tr -d '\\n')"`,
@@ -2389,7 +2398,7 @@ async function handleExpireVolumeBackupRepository(
   };
 }
 
-async function handleCreateVolumeBackup(
+export async function handleCreateVolumeBackup(
   docker: DockerApiClient,
   config: Pick<AgentRuntimeConfig, "privateRegistry">,
   payload: CreateVolumeBackupPayload

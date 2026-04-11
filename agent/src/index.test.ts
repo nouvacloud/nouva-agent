@@ -9,6 +9,7 @@ import {
   buildUpdateAgentRuntimeEnv,
   deployAppImageWithDependencies,
   handleApplyDatabaseVolume,
+  handleCreateVolumeBackup,
   handleDatabaseProvision,
   handleRestorePostgresPitr,
   normalizeRuntimeLogEntries,
@@ -21,6 +22,7 @@ import type {
   AgentRuntimeConfig,
   AppDeployPayload,
   AppRolloutConfig,
+  CreateVolumeBackupPayload,
   DatabaseProvisionPayload,
 } from "./protocol.js";
 
@@ -124,6 +126,30 @@ const databasePayload: DatabaseProvisionPayload = {
   publicAccessEnabled: false,
   resourceLimits,
   runtimeMetadata: null,
+};
+
+const pgBackrestBackupPayload: CreateVolumeBackupPayload = {
+  projectId: "proj_1",
+  serviceId: "svc_1",
+  serviceName: "main-db",
+  variant: "postgres",
+  version: "17",
+  volumeId: "vol_1",
+  volumeName: "nouva-vol-vol_1",
+  mountPath: "/var/lib/postgresql",
+  backupId: "backup_1",
+  kind: "MANUAL",
+  engine: "pgbackrest",
+  pgbackrestType: "full",
+  destination: {} as never,
+  imageUrl: "postgres:17",
+  envVars: {
+    POSTGRES_USER: "nouva_user",
+    POSTGRES_PASSWORD: "super-secret",
+    PGBACKREST_STANZA: "vol-vol_1",
+  },
+  containerArgs: [],
+  dataPath: "/var/lib/postgresql/pgdata",
 };
 
 function createDockerMock() {
@@ -883,6 +909,34 @@ describe("database runtime recreate paths", () => {
     expect(
       docker.removeContainer.mock.calls.some((call) => call[0] === "nouva-postgres-prev")
     ).toBe(false);
+  });
+
+  test("initializes a missing pgBackRest stanza before the first backup", async () => {
+    const docker = createDockerMock();
+
+    await handleCreateVolumeBackup(docker as never, runtimeConfig, pgBackrestBackupPayload);
+
+    expect(docker.createContainer).toHaveBeenCalledTimes(1);
+    expect(docker.createContainer.mock.calls[0]?.[0]).toEqual(
+      expect.objectContaining({
+        image: "postgres:17",
+        entrypoint: ["sh", "-c"],
+        cmd: [
+          expect.stringContaining(
+            'pgbackrest --stanza="$PGBACKREST_STANZA" --log-level-console=info stanza-create'
+          ),
+        ],
+        hostConfig: expect.objectContaining({
+          Mounts: [
+            expect.objectContaining({
+              Source: "nouva-vol-vol_1",
+              Target: "/var/lib/postgresql",
+            }),
+          ],
+        }),
+        env: expect.arrayContaining(["NOUVA_DATA_PATH=/var/lib/postgresql/pgdata"]),
+      })
+    );
   });
 
   test("uses private registry auth when a PITR helper image is hosted on the private registry", async () => {
