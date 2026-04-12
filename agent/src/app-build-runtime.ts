@@ -4,6 +4,7 @@ import type { AgentRuntimeConfig, AppDeployPayload, RuntimeMetadata } from "./pr
 
 export interface DeployAppImageInput {
   projectId: string;
+  environmentId?: string | null;
   serviceId: string;
   deploymentId: string;
   commitHash: string;

@@ -40,11 +40,22 @@ const runtimeConfig: AgentRuntimeConfig = {
     buildkit: true,
     localRegistry: true,
     localTraefik: true,
+    hostMetrics: true,
+    containerMetrics: true,
+    runtimeLogs: true,
     postgresObservability: true,
   },
   localRegistryHost: "127.0.0.1",
   localRegistryPort: 5000,
   localTraefikNetwork: "nouva-local",
+  observability: {
+    enabled: false,
+    organizationId: null,
+    alloyImage: "grafana/alloy:latest",
+    scrapeIntervalSeconds: 30,
+    collectorScope: "services_and_traefik",
+    noneLabelValue: "__none__",
+  },
 };
 
 const resourceLimits = {
@@ -62,6 +73,7 @@ const appPayload: AppDeployPayload = {
   projectId: "proj_1",
   serviceId: "svc_1",
   deploymentId: "dep_1",
+  environmentId: "env_1",
   envVars: {},
   appBuildType: "dockerfile",
   appBuildConfig: {
@@ -83,6 +95,7 @@ const appRuntimePayload: DeployAppImageInput = {
   projectId: "proj_1",
   serviceId: "svc_1",
   deploymentId: "dep_1",
+  environmentId: "env_1",
   commitHash: "abc123",
   serviceName: "app",
   subdomain: "app",
@@ -109,6 +122,7 @@ const databasePayload: DatabaseProvisionPayload = {
   serviceId: "svc_1",
   serviceName: "main-db",
   variant: "postgres",
+  environmentId: "env_1",
   volumeId: "vol_1",
   volumeName: "nouva-vol-vol_1",
   mountPath: "/var/lib/postgresql",
@@ -421,6 +435,20 @@ describe("buildAppContainerSpec", () => {
             Target: "/data",
           },
         ],
+      })
+    );
+  });
+
+  test("stamps environment labels for app containers", () => {
+    const spec = buildAppContainerSpec(runtimeConfig, appRuntimePayload);
+
+    expect(spec.spec.labels).toEqual(
+      expect.objectContaining({
+        "nouva.environment.id": "env_1",
+        "nouva.project.id": "proj_1",
+        "nouva.service.id": "svc_1",
+        "nouva.deployment.id": "dep_1",
+        "nouva.kind": "app",
       })
     );
   });
@@ -768,6 +796,20 @@ describe("buildDatabaseContainerSpec", () => {
     expect(spec.spec.hostConfig).not.toHaveProperty("NanoCpus");
     expect(spec.spec.hostConfig).not.toHaveProperty("Memory");
   });
+
+  test("stamps environment labels for database containers", () => {
+    const spec = buildDatabaseContainerSpec(databasePayload);
+
+    expect(spec.spec.labels).toEqual(
+      expect.objectContaining({
+        "nouva.environment.id": "env_1",
+        "nouva.project.id": "proj_1",
+        "nouva.service.id": "svc_1",
+        "nouva.service.variant": "postgres",
+        "nouva.kind": "database",
+      })
+    );
+  });
 });
 
 describe("database runtime recreate paths", () => {
@@ -877,6 +919,9 @@ describe("database runtime recreate paths", () => {
 
     const result = await handleRestorePostgresPitr(docker as never, runtimeConfig, {
       ...databasePayload,
+      sourceVolumeId: "vol_source",
+      sourceVolumeName: "nouva-vol-vol_source",
+      sourceMountPath: "/var/lib/postgresql",
       destination: {} as never,
       restoreTarget: "2026-03-25T00:00:00Z",
       runtimeMetadata: {
@@ -894,7 +939,7 @@ describe("database runtime recreate paths", () => {
       expect.objectContaining({
         image: "postgres:17",
         entrypoint: ["sh", "-c"],
-        cmd: [expect.stringContaining('pgbackrest --stanza="$PGBACKREST_STANZA"')],
+        cmd: [expect.any(String)],
         hostConfig: expect.objectContaining({
           Mounts: [
             expect.objectContaining({
@@ -906,6 +951,10 @@ describe("database runtime recreate paths", () => {
         env: expect.arrayContaining(["NOUVA_DATA_PATH=/var/lib/postgresql/pgdata"]),
       })
     );
+    const pitrScript = docker.createContainer.mock.calls[0]?.[0]?.cmd?.[0];
+    expect(pitrScript).toContain('pgbackrest --stanza="$PGBACKREST_STANZA"');
+    expect(pitrScript).toContain("/nouva/entrypoint.sh &");
+    expect(pitrScript).toContain("pg_is_in_recovery()");
     expect(
       docker.removeContainer.mock.calls.some((call) => call[0] === "nouva-postgres-prev")
     ).toBe(false);
@@ -954,6 +1003,9 @@ describe("database runtime recreate paths", () => {
       },
       {
         ...databasePayload,
+        sourceVolumeId: "vol_source",
+        sourceVolumeName: "nouva-vol-vol_source",
+        sourceMountPath: "/var/lib/postgresql",
         imageUrl: "registry.nouva.sh/nouva/postgres:17",
         destination: {} as never,
         restoreTarget: "2026-03-25T00:00:00Z",
@@ -982,6 +1034,9 @@ describe("database runtime recreate paths", () => {
       },
       {
         ...databasePayload,
+        sourceVolumeId: "vol_source",
+        sourceVolumeName: "nouva-vol-vol_source",
+        sourceMountPath: "/var/lib/postgresql",
         imageUrl: "postgres:17",
         destination: {} as never,
         restoreTarget: "2026-03-25T00:00:00Z",

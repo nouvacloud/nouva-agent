@@ -31,6 +31,11 @@ export interface DockerContainerInspection {
   };
   HostConfig?: {
     NetworkMode?: string;
+    Binds?: string[];
+    Privileged?: boolean;
+    RestartPolicy?: {
+      Name?: string;
+    };
     PortBindings?: Record<
       string,
       Array<{

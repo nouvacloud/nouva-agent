@@ -15,6 +15,8 @@ import {
   negotiateDockerApiVersion,
   parseDockerStatsSnapshot,
   parseHostMetricsSnapshot,
+  resolveAgentCapabilities,
+  resolveAgentRuntimeConfigForServer,
 } from "./protocol.js";
 import { buildTraefikRouteConfig } from "./traefik-runtime.js";
 
@@ -27,6 +29,9 @@ const runtimeEnvKeys = [
   "NOUVA_AGENT_LOCAL_REGISTRY_HOST",
   "NOUVA_AGENT_LOCAL_REGISTRY_PORT",
   "NOUVA_AGENT_INGRESS_NETWORK",
+  "NOUVA_OBSERVABILITY_ENABLED",
+  "NOUVA_OBSERVABILITY_ALLOY_IMAGE",
+  "NOUVA_OBSERVABILITY_SCRAPE_INTERVAL_SECONDS",
 ] as const;
 
 const originalRuntimeEnv = Object.fromEntries(
@@ -216,6 +221,7 @@ describe("agent protocol", () => {
       projectId: "proj_1",
       serviceId: "svc_1",
       deploymentId: "dep_1",
+      environmentId: "env_1",
       envVars: {
         NODE_ENV: "production",
       },
@@ -238,6 +244,7 @@ describe("agent protocol", () => {
       serviceId: "svc_1",
       serviceName: "main-db",
       variant: "postgres" as const,
+      environmentId: "env_1",
       volumeId: "vol_1",
       volumeName: "nouva-vol-vol_1",
       mountPath: "/var/lib/postgresql",
@@ -397,6 +404,9 @@ describe("agent protocol", () => {
     process.env.NOUVA_AGENT_LOCAL_REGISTRY_HOST = "registry.internal";
     process.env.NOUVA_AGENT_LOCAL_REGISTRY_PORT = "not-a-number";
     process.env.NOUVA_AGENT_INGRESS_NETWORK = "nouva-public";
+    process.env.NOUVA_OBSERVABILITY_ENABLED = "true";
+    process.env.NOUVA_OBSERVABILITY_ALLOY_IMAGE = "grafana/alloy:v1.0.0";
+    process.env.NOUVA_OBSERVABILITY_SCRAPE_INTERVAL_SECONDS = "45";
 
     const config = getAgentRuntimeConfig();
 
@@ -414,8 +424,41 @@ describe("agent protocol", () => {
         buildkit: true,
         localRegistry: true,
         postgresObservability: true,
+        runtimeLogs: false,
+        alloyObservability: true,
       })
     );
+    expect(config.observability).toEqual({
+      enabled: true,
+      organizationId: null,
+      alloyImage: "grafana/alloy:v1.0.0",
+      scrapeIntervalSeconds: 45,
+      collectorScope: "services_and_traefik",
+      noneLabelValue: "__none__",
+    });
+  });
+
+  test("resolves server-scoped observability config for authenticated agents", () => {
+    const config = resolveAgentRuntimeConfigForServer(getAgentRuntimeConfig(), "org_123");
+
+    expect(config.observability.organizationId).toBe("org_123");
+  });
+
+  test("flips runtime log capability off when observability is enabled", () => {
+    const capabilities = resolveAgentCapabilities({
+      ...getAgentRuntimeConfig(),
+      observability: {
+        enabled: true,
+        organizationId: "org_123",
+        alloyImage: "grafana/alloy:latest",
+        scrapeIntervalSeconds: 30,
+        collectorScope: "services_and_traefik",
+        noneLabelValue: "__none__",
+      },
+    });
+
+    expect(capabilities.runtimeLogs).toBe(false);
+    expect(capabilities.alloyObservability).toBe(true);
   });
 
   test("parses host metrics snapshots with cpu, memory, disk, and load data", () => {

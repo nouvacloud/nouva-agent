@@ -160,10 +160,22 @@ function buildTraefikRuntimeConfig(networkName: string): AgentRuntimeConfig {
       buildkit: true,
       localRegistry: true,
       localTraefik: true,
+      hostMetrics: true,
+      containerMetrics: true,
+      runtimeLogs: true,
+      postgresObservability: true,
     },
     localRegistryHost: "127.0.0.1",
     localRegistryPort: 5000,
     localTraefikNetwork: networkName,
+    observability: {
+      enabled: false,
+      organizationId: null,
+      alloyImage: "grafana/alloy:latest",
+      scrapeIntervalSeconds: 30,
+      collectorScope: "services_and_traefik",
+      noneLabelValue: "__none__",
+    },
   };
 }
 

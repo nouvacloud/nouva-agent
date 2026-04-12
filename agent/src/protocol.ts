@@ -188,6 +188,7 @@ export type AgentCapabilities = {
   buildkit?: boolean;
   localRegistry?: boolean;
   localTraefik?: boolean;
+  alloyObservability?: boolean;
   hostMetrics?: boolean;
   containerMetrics?: boolean;
   runtimeLogs?: boolean;
@@ -204,6 +205,15 @@ export const DEFAULT_AGENT_POSTGRES_OBSERVABILITY_INTERVAL_SECONDS = 30;
 export type AgentIngressMode = "local_traefik";
 export type AgentBuildkitMode = "docker-container";
 
+export interface AgentObservabilityConfig {
+  enabled: boolean;
+  organizationId: string | null;
+  alloyImage: string;
+  scrapeIntervalSeconds: number;
+  collectorScope: "services_and_traefik";
+  noneLabelValue: "__none__";
+}
+
 export interface AgentRuntimeConfig {
   heartbeatIntervalSeconds: number;
   pollIntervalSeconds: number;
@@ -217,6 +227,7 @@ export interface AgentRuntimeConfig {
   localRegistryHost: string;
   localRegistryPort: number;
   localTraefikNetwork: string;
+  observability: AgentObservabilityConfig;
   privateRegistry?: {
     host: string;
     username: string;
@@ -378,6 +389,7 @@ export interface AppDeployPayload {
   subdomain: string;
   serviceName: string;
   projectId: string;
+  environmentId?: string | null;
   serviceId: string;
   deploymentId: string;
   envVars: Record<string, string>;
@@ -397,6 +409,7 @@ export interface DeployOnlyPayload {
   commitMessage: string;
   subdomain: string;
   projectId: string;
+  environmentId?: string | null;
   serviceId: string;
   deploymentId: string;
   envVars: Record<string, string>;
@@ -417,6 +430,7 @@ export type BackupDatabaseServiceVariant = "postgres" | "redis";
 
 export interface DatabaseProvisionPayload {
   projectId: string;
+  environmentId?: string | null;
   serviceId: string;
   serviceName: string;
   variant: DatabaseServiceVariant;
@@ -533,6 +547,9 @@ export interface RestoreVolumeBackupPayload {
 
 export interface RestorePostgresPitrPayload extends Omit<DatabaseProvisionPayload, "variant"> {
   variant: "postgres";
+  sourceVolumeId?: string;
+  sourceVolumeName?: string;
+  sourceMountPath?: string;
   restoreTarget: string;
   destination: PlatformBackupDestination;
 }
@@ -593,14 +610,47 @@ export function getDefaultAgentCapabilities(): AgentCapabilities {
   };
 }
 
+export function resolveAgentCapabilities(config: AgentRuntimeConfig): AgentCapabilities {
+  const capabilities = getDefaultAgentCapabilities();
+
+  if (!config.observability.enabled) {
+    return capabilities;
+  }
+
+  return {
+    ...capabilities,
+    alloyObservability: true,
+    runtimeLogs: false,
+  };
+}
+
+export function resolveAgentRuntimeConfigForServer(
+  baseConfig: AgentRuntimeConfig,
+  organizationId: string
+): AgentRuntimeConfig {
+  return {
+    ...baseConfig,
+    observability: {
+      ...baseConfig.observability,
+      organizationId,
+    },
+    capabilities: resolveAgentCapabilities({
+      ...baseConfig,
+      observability: {
+        ...baseConfig.observability,
+        organizationId,
+      },
+    }),
+  };
+}
+
 export function getAgentRuntimeConfig(): AgentRuntimeConfig {
   const registryPort = Number.parseInt(process.env.NOUVA_AGENT_LOCAL_REGISTRY_PORT ?? "5000", 10);
   const imageStoreMode =
     process.env.NOUVA_AGENT_IMAGE_STORE_MODE === "local-registry"
       ? "local-registry"
       : "docker-local";
-
-  return {
+  const config = {
     heartbeatIntervalSeconds: Number.parseInt(
       process.env.NOUVA_AGENT_HEARTBEAT_INTERVAL_SECONDS ??
         String(DEFAULT_AGENT_HEARTBEAT_INTERVAL_SECONDS),
@@ -627,10 +677,26 @@ export function getAgentRuntimeConfig(): AgentRuntimeConfig {
     ingressMode: "local_traefik",
     buildkitMode: "docker-container",
     imageStoreMode,
-    capabilities: getDefaultAgentCapabilities(),
+    capabilities: {},
     localRegistryHost: process.env.NOUVA_AGENT_LOCAL_REGISTRY_HOST ?? "127.0.0.1",
     localRegistryPort: Number.isFinite(registryPort) ? registryPort : 5000,
     localTraefikNetwork: process.env.NOUVA_AGENT_INGRESS_NETWORK ?? "nouva-ingress",
+    observability: {
+      enabled: process.env.NOUVA_OBSERVABILITY_ENABLED === "true",
+      organizationId: null,
+      alloyImage: process.env.NOUVA_OBSERVABILITY_ALLOY_IMAGE ?? "grafana/alloy:latest",
+      scrapeIntervalSeconds: Number.parseInt(
+        process.env.NOUVA_OBSERVABILITY_SCRAPE_INTERVAL_SECONDS ?? "30",
+        10
+      ),
+      collectorScope: "services_and_traefik",
+      noneLabelValue: "__none__",
+    },
+  } satisfies AgentRuntimeConfig;
+
+  return {
+    ...config,
+    capabilities: resolveAgentCapabilities(config),
   };
 }
 

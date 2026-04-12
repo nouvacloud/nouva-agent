@@ -6,6 +6,13 @@ import path from "node:path";
 import { promisify } from "node:util";
 import agentPackageJson from "../package.json" with { type: "json" };
 import {
+  type AlloyRuntimeInput,
+  buildUnavailableAlloyChecks,
+  collectAlloyValidationChecks,
+  ensureAlloyRuntime,
+  getAlloyRuntimePaths,
+} from "./alloy-runtime.js";
+import {
   buildAndDeployAppWithDependencies,
   type DeployAppImageInput,
 } from "./app-build-runtime.js";
@@ -44,7 +51,6 @@ import {
   type DeployOnlyPayload,
   type ExpireVolumeBackupRepositoryPayload,
   getAgentRuntimeConfig,
-  getDefaultAgentCapabilities,
   parseHostMetricsSnapshot,
   type RemoveServicePayload,
   type RestartServicePayload,
@@ -53,6 +59,7 @@ import {
   type RuntimeLogMessage,
   type RuntimeMetadata,
   type RuntimeRetainedImage,
+  resolveAgentCapabilities,
   resolveAppRolloutConfig,
   type ServerValidationReport,
   type ServiceResourceLimits,
@@ -90,6 +97,7 @@ const LOCAL_REGISTRY_CONTAINER_NAME =
 const TRAEFIK_CONTAINER_NAME = process.env.NOUVA_AGENT_TRAEFIK_CONTAINER || "nouva-traefik";
 const TRAEFIK_IMAGE = process.env.NOUVA_AGENT_TRAEFIK_IMAGE || DEFAULT_TRAEFIK_IMAGE;
 const TRAEFIK_PATHS = buildTraefikRuntimePaths(DATA_DIR);
+const ALLOY_PATHS = getAlloyRuntimePaths(DATA_DIR);
 const BUILDKIT_ADDRESS = process.env.NOUVA_AGENT_BUILDKIT_ADDR || "tcp://127.0.0.1:1234";
 const DEFAULT_BUILDKIT_PORT = 1234;
 const BACKUP_HELPER_IMAGE =
@@ -556,7 +564,8 @@ async function waitForLocalTraefikCutover(
 
 async function collectValidationSnapshot(
   docker: DockerApiClient,
-  config: AgentRuntimeConfig
+  config: AgentRuntimeConfig,
+  credentials?: StoredCredentials | null
 ): Promise<ValidationSnapshot> {
   const checks: ValidationSnapshot["latestValidationReport"]["checks"] = [];
   const hostOsId = (process.env.NOUVA_HOST_OS_ID || "unknown").toLowerCase();
@@ -708,6 +717,37 @@ async function collectValidationSnapshot(
         );
       }
     }
+
+    if (config.observability.enabled) {
+      if (!credentials?.agentToken || !config.observability.organizationId) {
+        checks.push(
+          ...buildUnavailableAlloyChecks(
+            "Observability is enabled but Alloy is waiting for server-scoped credentials"
+          )
+        );
+      } else {
+        let alloyBootstrapError: Error | null = null;
+        try {
+          await ensureAlloyRuntime(docker, getAlloyRuntimeInput(credentials, config), {
+            paths: ALLOY_PATHS,
+          });
+        } catch (error) {
+          alloyBootstrapError =
+            error instanceof Error ? error : new Error("Failed to reconcile Alloy");
+        }
+
+        checks.push(
+          ...(await collectAlloyValidationChecks(
+            docker,
+            getAlloyRuntimeInput(credentials, config),
+            {
+              paths: ALLOY_PATHS,
+            },
+            alloyBootstrapError
+          ))
+        );
+      }
+    }
   } else {
     checks.push(...buildUnavailableTraefikChecks("Docker Engine is unavailable"));
     checks.push(
@@ -729,6 +769,10 @@ async function collectValidationSnapshot(
           `127.0.0.1:${config.localRegistryPort}`
         )
       );
+    }
+
+    if (config.observability.enabled) {
+      checks.push(...buildUnavailableAlloyChecks("Docker Engine is unavailable"));
     }
   }
 
@@ -955,7 +999,7 @@ async function collectValidationSnapshot(
       summary,
       checks,
     },
-    capabilities: getDefaultAgentCapabilities(),
+    capabilities: resolveAgentCapabilities(config),
   };
 }
 
@@ -1047,7 +1091,7 @@ async function sendHeartbeat(
   credentials: StoredCredentials,
   config: AgentRuntimeConfig
 ): Promise<AgentRuntimeConfig> {
-  const snapshot = await collectValidationSnapshot(docker, config);
+  const snapshot = await collectValidationSnapshot(docker, config, credentials);
 
   const response = await fetch(`${API_URL}/api/agent/heartbeat`, {
     method: "POST",
@@ -1089,6 +1133,7 @@ function buildLabels(input: {
   serviceId?: string | null;
   deploymentId?: string | null;
   serviceVariant?: string | null;
+  environmentId?: string | null;
 }): Record<string, string> {
   return {
     "nouva.managed": "true",
@@ -1098,6 +1143,7 @@ function buildLabels(input: {
     ...(input.serviceId ? { "nouva.service.id": input.serviceId } : {}),
     ...(input.deploymentId ? { "nouva.deployment.id": input.deploymentId } : {}),
     ...(input.serviceVariant ? { "nouva.service.variant": input.serviceVariant } : {}),
+    ...(input.environmentId ? { "nouva.environment.id": input.environmentId } : {}),
   };
 }
 
@@ -1110,6 +1156,20 @@ function getTraefikRuntimeInput(config: AgentRuntimeConfig): TraefikRuntimeInput
     serverId: SERVER_ID!,
     image: TRAEFIK_IMAGE,
     acmeEmail: process.env.NOUVA_AGENT_TRAEFIK_ACME_EMAIL ?? null,
+  };
+}
+
+function getAlloyRuntimeInput(
+  credentials: StoredCredentials,
+  config: AgentRuntimeConfig
+): AlloyRuntimeInput {
+  return {
+    dataDir: DATA_DIR,
+    dataVolume: DATA_VOLUME,
+    serverId: SERVER_ID!,
+    apiUrl: API_URL!,
+    agentToken: credentials.agentToken,
+    config,
   };
 }
 
@@ -1519,6 +1579,58 @@ function extractPrefixedLogLine(logs: string, prefix: string): string | null {
   return null;
 }
 
+function buildPgBackrestRestoreAndPromoteScript() {
+  return [
+    "set -eu",
+    'mkdir -p "$NOUVA_DATA_PATH" "' +
+      "$" +
+      "{POSTGRES_SOCKET_DIR:-/var/lib/postgresql/.sockets}" +
+      '" /var/run/postgresql',
+    'chown -R 999:999 "$NOUVA_DATA_PATH" || true',
+    "if [ -x /nouva/generate_config.sh ]; then /nouva/generate_config.sh; fi",
+    `if [ -n "\${RESTORE_SET:-}" ]; then`,
+    '  pgbackrest --stanza="$PGBACKREST_STANZA" --set="$RESTORE_SET" --delta --type=time --target="$RESTORE_TARGET" --target-action=promote --log-level-console=info restore',
+    "else",
+    '  pgbackrest --stanza="$PGBACKREST_STANZA" --delta --type=time --target="$RESTORE_TARGET" --target-action=promote --log-level-console=info restore',
+    "fi",
+    'export PGHOST="' + "$" + "{POSTGRES_SOCKET_DIR:-/var/lib/postgresql/.sockets}" + '"',
+    'export PGPORT="' + "$" + "{POSTGRES_PORT:-5433}" + '"',
+    'export NOUVA_PROMOTE_DB="' + "$" + "{POSTGRES_DB:-postgres}" + '"',
+    'export NOUVA_PROMOTE_USER="' + "$" + "{POSTGRES_USER:-postgres}" + '"',
+    'if [ -n "' +
+      "$" +
+      "{POSTGRES_PASSWORD:-}" +
+      '" ]; then export PGPASSWORD="' +
+      "$" +
+      "{POSTGRES_PASSWORD}" +
+      '"; fi',
+    "/nouva/entrypoint.sh &",
+    'entrypoint_pid="$!"',
+    "cleanup() {",
+    '  if kill -0 "$entrypoint_pid" 2>/dev/null; then',
+    '    kill -TERM "$entrypoint_pid" || true',
+    '    wait "$entrypoint_pid" || true',
+    "  fi",
+    "}",
+    "trap cleanup EXIT INT TERM",
+    "for i in $(seq 1 180); do",
+    '  recovery_state=$(psql -h "$PGHOST" -p "$PGPORT" -U "$NOUVA_PROMOTE_USER" -d "$NOUVA_PROMOTE_DB" -Atqc "select case when pg_is_in_recovery() then \'t\' else \'f\' end" 2>/dev/null || true)',
+    '  if [ "$recovery_state" = "f" ]; then',
+    '    psql -h "$PGHOST" -p "$PGPORT" -U "$NOUVA_PROMOTE_USER" -d "$NOUVA_PROMOTE_DB" -c "checkpoint" >/dev/null 2>&1 || true',
+    "    exit 0",
+    "  fi",
+    '  if ! kill -0 "$entrypoint_pid" 2>/dev/null; then',
+    '    wait "$entrypoint_pid"',
+    "  fi",
+    "  sleep 1",
+    '  if [ "$i" -eq 180 ]; then',
+    '    echo "Restored Postgres did not promote within 180 seconds" >&2',
+    "    exit 1",
+    "  fi",
+    "done",
+  ].join("\n");
+}
+
 async function runTaskContainer(
   docker: DockerApiClient,
   config: Pick<AgentRuntimeConfig, "privateRegistry">,
@@ -1635,6 +1747,7 @@ export function buildAppContainerSpec(
       labels: buildLabels({
         kind: "app",
         projectId: payload.projectId,
+        environmentId: payload.environmentId ?? null,
         serviceId: payload.serviceId,
         deploymentId: payload.deploymentId,
       }),
@@ -2010,6 +2123,7 @@ export function buildDatabaseContainerSpec(payload: DatabaseProvisionPayload): {
       labels: buildLabels({
         kind: "database",
         projectId: payload.projectId,
+        environmentId: payload.environmentId ?? null,
         serviceId: payload.serviceId,
         serviceVariant: payload.variant,
       }),
@@ -2337,16 +2451,7 @@ async function handleRestorePgBackrestBackup(
     mountPath: payload.targetMountPath,
     dataPath: payload.dataPath,
   });
-  const script = [
-    "set -eu",
-    'mkdir -p "$NOUVA_DATA_PATH"',
-    'chown -R 999:999 "$NOUVA_DATA_PATH" || true',
-    "if [ -x /nouva/generate_config.sh ]; then /nouva/generate_config.sh; fi",
-    `if [ -n "\${RESTORE_SET:-}" ]; then`,
-    '  exec pgbackrest --stanza="$PGBACKREST_STANZA" --set="$RESTORE_SET" --delta --type=time --target="$RESTORE_TARGET" --target-action=promote --log-level-console=info restore',
-    "fi",
-    'exec pgbackrest --stanza="$PGBACKREST_STANZA" --delta --type=time --target="$RESTORE_TARGET" --target-action=promote --log-level-console=info restore',
-  ].join("\n");
+  const script = buildPgBackrestRestoreAndPromoteScript();
 
   await docker.createVolume(payload.targetVolumeName);
   await runTaskContainer(docker, config, {
@@ -2440,17 +2545,14 @@ export async function handleRestorePostgresPitr(
   payload: RestorePostgresPitrPayload
 ) {
   const spec = resolveDatabaseProvisionSpec(payload);
-  const script = [
-    "set -eu",
-    "if [ -x /nouva/generate_config.sh ]; then /nouva/generate_config.sh; fi",
-    'pgbackrest --stanza="$PGBACKREST_STANZA" --delta --type=time --target="$RESTORE_TARGET" --target-action=promote --log-level-console=info restore',
-  ].join("\n");
+  const script = buildPgBackrestRestoreAndPromoteScript();
   await runTaskContainer(docker, config, {
     name: `nouva-pgbackrest-pitr-${payload.serviceId.slice(0, 12)}`,
     image: spec.image,
     env: [
       ...Object.entries(spec.envVars).map(([key, value]) => `${key}=${value}`),
       `RESTORE_TARGET=${payload.restoreTarget}`,
+      "RESTORE_SET=",
       `NOUVA_DATA_PATH=${spec.dataPath}`,
     ],
     entrypoint: ["sh", "-c"],
@@ -3005,6 +3107,10 @@ async function main() {
   }, config.heartbeatIntervalSeconds * 1000);
 
   setInterval(() => {
+    if (config.observability.enabled || isShuttingDown) {
+      return;
+    }
+
     collectMetrics(docker)
       .then((metrics) =>
         apiRequest("/api/agent/metrics", {
@@ -3040,7 +3146,7 @@ async function main() {
 
   if (RUNTIME_LOG_SYNC_INTERVAL_MS > 0) {
     setInterval(() => {
-      if (runtimeLogLoopActive || isShuttingDown) {
+      if (config.observability.enabled || runtimeLogLoopActive || isShuttingDown) {
         return;
       }
 
