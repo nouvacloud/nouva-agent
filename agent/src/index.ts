@@ -100,8 +100,8 @@ const TRAEFIK_PATHS = buildTraefikRuntimePaths(DATA_DIR);
 const ALLOY_PATHS = getAlloyRuntimePaths(DATA_DIR);
 const BUILDKIT_ADDRESS = process.env.NOUVA_AGENT_BUILDKIT_ADDR || "tcp://127.0.0.1:1234";
 const DEFAULT_BUILDKIT_PORT = 1234;
-const BACKUP_HELPER_IMAGE =
-  process.env.NOUVA_BACKUP_HELPER_IMAGE || "ghcr.io/nouvacloud/backup-helper:latest";
+const DEFAULT_AGENT_CONTAINER_NAME = "nouva-agent";
+const DEFAULT_AGENT_IMAGE = "ghcr.io/nouvacloud/nouva-agent:latest";
 const RUNTIME_LOG_SYNC_INTERVAL_MS = Number.parseInt(
   process.env.NOUVA_AGENT_RUNTIME_LOG_SYNC_INTERVAL_MS || "2000",
   10
@@ -118,9 +118,41 @@ export function resolveReportedAgentVersion(packageVersion: string): string {
     : `v${trimmedPackageVersion}`;
 }
 
+export async function resolveAgentTaskImage(
+  docker: Pick<DockerApiClient, "inspectContainer">,
+  env: Record<string, string | undefined> = process.env
+): Promise<string> {
+  const configuredImage = env.NOUVA_AGENT_IMAGE?.trim() || env.NOUVA_AGENT_TARGET_IMAGE?.trim();
+  if (configuredImage?.length) {
+    return configuredImage;
+  }
+
+  const candidates = [
+    env.HOSTNAME?.trim(),
+    env.NOUVA_AGENT_CONTAINER_NAME?.trim(),
+    DEFAULT_AGENT_CONTAINER_NAME,
+  ].filter((value): value is string => Boolean(value));
+
+  for (const candidate of new Set(candidates)) {
+    const inspection = await docker.inspectContainer(candidate);
+    const inspectedImage = inspection?.Config?.Image?.trim();
+    if (inspectedImage) {
+      return inspectedImage;
+    }
+  }
+
+  return DEFAULT_AGENT_IMAGE;
+}
+
 function getInheritedNouvaEnvKeys(env: Record<string, string | undefined>): string[] {
   return Object.keys(env)
-    .filter((key) => key.startsWith("NOUVA_") && key !== "NOUVA_AGENT_VERSION")
+    .filter(
+      (key) =>
+        key.startsWith("NOUVA_") &&
+        key !== "NOUVA_AGENT_VERSION" &&
+        key !== "NOUVA_AGENT_IMAGE" &&
+        key !== "NOUVA_AGENT_TARGET_IMAGE"
+    )
     .sort();
 }
 
@@ -134,9 +166,10 @@ export function buildUpdateAgentRuntimeEnv(
   const inheritedNouvaEnvKeys = getInheritedNouvaEnvKeys(env);
   const updaterEnv = [
     ...inheritedNouvaEnvKeys.map((key) => `${key}=${env[key] ?? ""}`),
+    `NOUVA_AGENT_IMAGE=${imageRef}`,
     `NOUVA_AGENT_TARGET_IMAGE=${imageRef}`,
   ];
-  const envInheritFlags = [...inheritedNouvaEnvKeys, "NOUVA_AGENT_TARGET_IMAGE"]
+  const envInheritFlags = [...inheritedNouvaEnvKeys, "NOUVA_AGENT_IMAGE", "NOUVA_AGENT_TARGET_IMAGE"]
     .map((key) => `-e ${key}`)
     .join(" ");
 
@@ -2263,9 +2296,10 @@ async function handleCreateArchiveBackup(
   payload: CreateVolumeBackupPayload
 ) {
   const remoteExpression = buildArchiveRemoteExpression(payload.destination.verifyTls);
+  const agentTaskImage = await resolveAgentTaskImage(docker);
   const { logs } = await runTaskContainer(docker, config, {
     name: `nouva-backup-${payload.backupId.slice(0, 12)}`,
-    image: BACKUP_HELPER_IMAGE,
+    image: agentTaskImage,
     env: [
       `BACKUP_ACCESS_KEY_ID=${payload.destination.accessKeyId}`,
       `BACKUP_SECRET_ACCESS_KEY=${payload.destination.secretAccessKey}`,
@@ -2304,9 +2338,10 @@ async function handleDeleteArchiveBackup(
   payload: DeleteVolumeBackupPayload
 ) {
   const remoteExpression = buildArchiveRemoteExpression(payload.destination.verifyTls);
+  const agentTaskImage = await resolveAgentTaskImage(docker);
   await runTaskContainer(docker, config, {
     name: `nouva-delete-backup-${payload.backupId.slice(0, 12)}`,
-    image: BACKUP_HELPER_IMAGE,
+    image: agentTaskImage,
     env: [
       `BACKUP_ACCESS_KEY_ID=${payload.destination.accessKeyId}`,
       `BACKUP_SECRET_ACCESS_KEY=${payload.destination.secretAccessKey}`,
@@ -2333,10 +2368,11 @@ async function handleRestoreArchiveBackup(
   payload: RestoreVolumeBackupPayload
 ) {
   const remoteExpression = buildArchiveRemoteExpression(payload.destination.verifyTls);
+  const agentTaskImage = await resolveAgentTaskImage(docker);
   await docker.createVolume(payload.targetVolumeName);
   await runTaskContainer(docker, config, {
     name: `nouva-restore-backup-${payload.backupId.slice(0, 12)}`,
-    image: BACKUP_HELPER_IMAGE,
+    image: agentTaskImage,
     env: [
       `BACKUP_ACCESS_KEY_ID=${payload.destination.accessKeyId}`,
       `BACKUP_SECRET_ACCESS_KEY=${payload.destination.secretAccessKey}`,

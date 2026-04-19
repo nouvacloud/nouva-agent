@@ -18,6 +18,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     bash \
     ca-certificates \
+    gzip \
+    rclone \
+    tar \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -sSL https://mise.run | sh

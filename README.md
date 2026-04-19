@@ -75,7 +75,6 @@ docker run -d \
 | `NOUVA_HOST_OS_VERSION_ID` | — | Host OS version |
 | `NOUVA_IMAGE_REGISTRY` | — | Custom image registry |
 | `NOUVA_POSTGRES_IMAGE` | — | PostgreSQL image URL |
-| `NOUVA_BACKUP_HELPER_IMAGE` | `ghcr.io/nouvacloud/backup-helper:latest` | Backup helper image |
 
 The agent reports its version from `agent/package.json`, normalized to the release tag format
 (`v${version}`). Publish releases with a matching GitHub release tag.

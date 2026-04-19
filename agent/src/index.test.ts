@@ -1,4 +1,4 @@
-import { describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import agentPackageJson from "../package.json" with { type: "json" };
 import type { DeployAppImageInput } from "./app-build-runtime.js";
 import { buildAndDeployAppWithDependencies } from "./app-build-runtime.js";
@@ -14,6 +14,7 @@ import {
   handleRestorePostgresPitr,
   normalizeRuntimeLogEntries,
   prepareAppBuildkitRuntime,
+  resolveAgentTaskImage,
   resolveReportedAgentVersion,
   resolveServiceContainerIdentifier,
   shouldStopRetryingAgentWorkMutation,
@@ -166,6 +167,47 @@ const pgBackrestBackupPayload: CreateVolumeBackupPayload = {
   dataPath: "/var/lib/postgresql/pgdata",
 };
 
+const snapshotBackupPayload: CreateVolumeBackupPayload = {
+  projectId: "proj_1",
+  serviceId: "svc_redis_1",
+  serviceName: "redis-cache",
+  variant: "redis",
+  version: "7.4",
+  volumeId: "vol_redis_1",
+  volumeName: "nouva-vol-vol_redis_1",
+  mountPath: "/data",
+  backupId: "backup_redis_1",
+  kind: "MANUAL",
+  engine: "snapshot",
+  destination: {
+    id: "dest_1",
+    type: "s3",
+    bucket: "nouva-backups",
+    endpoint: "https://s3.example.com",
+    region: "us-east-1",
+    pathStyle: false,
+    verifyTls: true,
+    accessKeyId: "key-id",
+    secretAccessKey: "secret-key",
+    pgbackrestRepoType: "s3",
+    pgbackrestCipherType: null,
+    pgbackrestRetentionFullType: null,
+    pgbackrestRetentionFull: null,
+    pgbackrestRetentionDiff: null,
+    pgbackrestRetentionArchiveType: null,
+    pgbackrestRetentionArchive: null,
+    pgbackrestRetentionHistory: null,
+    pgbackrestArchiveAsync: null,
+    pgbackrestSpoolPath: null,
+    pgbackrestCipherPass: null,
+  },
+};
+
+const originalAgentImage = process.env.NOUVA_AGENT_IMAGE;
+const originalAgentTargetImage = process.env.NOUVA_AGENT_TARGET_IMAGE;
+const originalAgentContainerName = process.env.NOUVA_AGENT_CONTAINER_NAME;
+const originalHostname = process.env.HOSTNAME;
+
 function createDockerMock() {
   return {
     ensureNetwork: mock(async () => {}),
@@ -217,6 +259,8 @@ describe("agent version reporting", () => {
         NOUVA_API_URL: "https://api.nouvacloud.com",
         NOUVA_SERVER_ID: "srv_1",
         NOUVA_AGENT_DATA_VOLUME: "nouva-agent-data",
+        NOUVA_AGENT_IMAGE: "ghcr.io/nouvacloud/nouva-agent:v0.1.0",
+        NOUVA_AGENT_TARGET_IMAGE: "ghcr.io/nouvacloud/nouva-agent:v0.1.0",
         NOUVA_AGENT_VERSION: "v0.1.0",
         PATH: "/usr/bin",
       },
@@ -228,11 +272,61 @@ describe("agent version reporting", () => {
         "NOUVA_AGENT_DATA_VOLUME=nouva-agent-data",
         "NOUVA_API_URL=https://api.nouvacloud.com",
         "NOUVA_SERVER_ID=srv_1",
+        "NOUVA_AGENT_IMAGE=ghcr.io/nouvacloud/nouva-agent:latest",
         "NOUVA_AGENT_TARGET_IMAGE=ghcr.io/nouvacloud/nouva-agent:latest",
       ],
       envInheritFlags:
-        "-e NOUVA_AGENT_DATA_VOLUME -e NOUVA_API_URL -e NOUVA_SERVER_ID -e NOUVA_AGENT_TARGET_IMAGE",
+        "-e NOUVA_AGENT_DATA_VOLUME -e NOUVA_API_URL -e NOUVA_SERVER_ID -e NOUVA_AGENT_IMAGE -e NOUVA_AGENT_TARGET_IMAGE",
     });
+  });
+});
+
+describe("resolveAgentTaskImage", () => {
+  beforeEach(() => {
+    delete process.env.NOUVA_AGENT_IMAGE;
+    delete process.env.NOUVA_AGENT_TARGET_IMAGE;
+    delete process.env.NOUVA_AGENT_CONTAINER_NAME;
+    delete process.env.HOSTNAME;
+  });
+
+  afterEach(() => {
+    if (originalAgentImage === undefined) delete process.env.NOUVA_AGENT_IMAGE;
+    else process.env.NOUVA_AGENT_IMAGE = originalAgentImage;
+    if (originalAgentTargetImage === undefined) delete process.env.NOUVA_AGENT_TARGET_IMAGE;
+    else process.env.NOUVA_AGENT_TARGET_IMAGE = originalAgentTargetImage;
+    if (originalAgentContainerName === undefined) delete process.env.NOUVA_AGENT_CONTAINER_NAME;
+    else process.env.NOUVA_AGENT_CONTAINER_NAME = originalAgentContainerName;
+    if (originalHostname === undefined) delete process.env.HOSTNAME;
+    else process.env.HOSTNAME = originalHostname;
+  });
+
+  test("returns the configured agent image when NOUVA_AGENT_IMAGE is set", async () => {
+    const docker = createDockerMock();
+    process.env.NOUVA_AGENT_IMAGE = "example.com/custom/nouva-agent:1.0.0";
+
+    await expect(resolveAgentTaskImage(docker as never)).resolves.toBe(
+      "example.com/custom/nouva-agent:1.0.0"
+    );
+    expect(docker.inspectContainer).not.toHaveBeenCalled();
+  });
+
+  test("falls back to inspecting the running agent container image when env is missing", async () => {
+    const docker = createDockerMock();
+    process.env.HOSTNAME = "ctr_agent_1";
+    docker.inspectContainer.mockImplementation(async (nameOrId: string) =>
+      nameOrId === "ctr_agent_1"
+        ? {
+            Id: "ctr_agent_1",
+            Config: {
+              Image: "ghcr.io/nouvacloud/nouva-agent:v0.4.10",
+            },
+          }
+        : null
+    );
+
+    await expect(resolveAgentTaskImage(docker as never)).resolves.toBe(
+      "ghcr.io/nouvacloud/nouva-agent:v0.4.10"
+    );
   });
 });
 
@@ -984,6 +1078,44 @@ describe("database runtime recreate paths", () => {
           ],
         }),
         env: expect.arrayContaining(["NOUVA_DATA_PATH=/var/lib/postgresql/pgdata"]),
+      })
+    );
+  });
+
+  test("uses the installed agent image for snapshot backup tasks", async () => {
+    const docker = createDockerMock();
+    process.env.NOUVA_AGENT_IMAGE = "registry.nouva.sh/nouva/nouva-agent:v0.4.10";
+
+    await handleCreateVolumeBackup(
+      docker as never,
+      {
+        ...runtimeConfig,
+        privateRegistry: {
+          host: "registry.nouva.sh",
+          username: "srv_srv_1",
+          password: "registry-password",
+        },
+      },
+      snapshotBackupPayload
+    );
+
+    expect(docker.pullImage).toHaveBeenCalledWith("registry.nouva.sh/nouva/nouva-agent:v0.4.10", {
+      host: "registry.nouva.sh",
+      username: "srv_srv_1",
+      password: "registry-password",
+    });
+    expect(docker.createContainer.mock.calls[0]?.[0]).toEqual(
+      expect.objectContaining({
+        image: "registry.nouva.sh/nouva/nouva-agent:v0.4.10",
+        cmd: [expect.any(String), expect.any(String), expect.any(String)],
+        hostConfig: expect.objectContaining({
+          Mounts: [
+            expect.objectContaining({
+              Source: "nouva-vol-vol_redis_1",
+              Target: "/source",
+            }),
+          ],
+        }),
       })
     );
   });
