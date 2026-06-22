@@ -169,7 +169,11 @@ export function buildUpdateAgentRuntimeEnv(
     `NOUVA_AGENT_IMAGE=${imageRef}`,
     `NOUVA_AGENT_TARGET_IMAGE=${imageRef}`,
   ];
-  const envInheritFlags = [...inheritedNouvaEnvKeys, "NOUVA_AGENT_IMAGE", "NOUVA_AGENT_TARGET_IMAGE"]
+  const envInheritFlags = [
+    ...inheritedNouvaEnvKeys,
+    "NOUVA_AGENT_IMAGE",
+    "NOUVA_AGENT_TARGET_IMAGE",
+  ]
     .map((key) => `-e ${key}`)
     .join(" ");
 
