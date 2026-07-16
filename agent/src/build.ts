@@ -14,6 +14,7 @@ import type {
   AppStaticBuildConfig,
   ServiceResourceLimits,
 } from "./protocol.js";
+import { redactSensitiveText } from "./security.js";
 
 const execFile = promisify(execFileCallback);
 
@@ -165,8 +166,13 @@ async function cloneRepository(
     await execFile("git", ["-C", targetDir, "checkout", commitHash]);
   } catch {
     await rm(targetDir, { recursive: true, force: true });
-    await execFile("git", ["clone", repoUrl, targetDir]);
-    await execFile("git", ["-C", targetDir, "checkout", commitHash]);
+    try {
+      await execFile("git", ["clone", repoUrl, targetDir]);
+      await execFile("git", ["-C", targetDir, "checkout", commitHash]);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Repository clone failed";
+      throw new Error(redactSensitiveText(message));
+    }
   }
 }
 

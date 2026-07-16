@@ -3,6 +3,8 @@ import {
   AGENT_WORK_KINDS,
   type AgentHeartbeatRequest,
   type AgentHeartbeatResponse,
+  type AgentLeaseRenewRequest,
+  type AgentLeaseRenewResponse,
   type AgentLeaseRequest,
   type AgentLeaseResponse,
   type AgentMetricsRequest,
@@ -98,6 +100,16 @@ describe("agent protocol", () => {
       workItems: [],
     } satisfies AgentLeaseResponse;
 
+    const leaseRenewRequest = {
+      serverId: "srv_123",
+      leaseId: "lease_123",
+    } satisfies AgentLeaseRenewRequest;
+
+    const leaseRenewResponse = {
+      ok: true,
+      leaseExpiresAt: new Date().toISOString(),
+    } satisfies AgentLeaseRenewResponse;
+
     const mutationRequest = {
       serverId: "srv_123",
       leaseId: "lease_123",
@@ -138,15 +150,17 @@ describe("agent protocol", () => {
       heartbeatResponse,
       leaseRequest,
       leaseResponse,
+      leaseRenewRequest,
+      leaseRenewResponse,
       mutationRequest,
       metricsRequest,
       postgresObservabilityRequest,
     ].map((value) => JSON.parse(JSON.stringify(value)));
 
-    expect(roundTrips).toHaveLength(9);
+    expect(roundTrips).toHaveLength(11);
     expect(roundTrips[0]).toEqual(registrationRequest);
-    expect(roundTrips[7]).toEqual(metricsRequest);
-    expect(roundTrips[8]).toEqual(postgresObservabilityRequest);
+    expect(roundTrips[9]).toEqual(metricsRequest);
+    expect(roundTrips[10]).toEqual(postgresObservabilityRequest);
   });
 
   test("includes the backup and PITR work kinds in the wire contract", () => {

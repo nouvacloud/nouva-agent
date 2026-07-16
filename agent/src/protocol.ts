@@ -742,6 +742,16 @@ export interface AgentLeaseRequest {
 
 export type AgentLeaseResponse = AgentWorkLeaseResult;
 
+export interface AgentLeaseRenewRequest {
+  serverId: string;
+  leaseId: string;
+}
+
+export interface AgentLeaseRenewResponse {
+  ok: true;
+  leaseExpiresAt: string;
+}
+
 export interface AgentWorkMutationRequest {
   serverId: string;
   leaseId: string;

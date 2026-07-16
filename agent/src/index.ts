@@ -30,6 +30,8 @@ import {
   type AgentCapabilities,
   type AgentHeartbeatResponse,
   type AgentImageStoreMode,
+  type AgentLeaseRenewRequest,
+  type AgentLeaseRenewResponse,
   type AgentLeaseResponse,
   type AgentMetricsEnvelope,
   type AgentMetricsRequest,
@@ -46,6 +48,7 @@ import {
   type AppRolloutResult,
   type CreateVolumeBackupPayload,
   type DatabaseProvisionPayload,
+  DEFAULT_AGENT_LEASE_TTL_SECONDS,
   type DeleteVolumeBackupPayload,
   type DeleteVolumePayload,
   type DeployOnlyPayload,
@@ -65,6 +68,7 @@ import {
   type ServiceResourceLimits,
   type SyncRoutingPayload,
 } from "./protocol.js";
+import { redactSensitiveText } from "./security.js";
 import { resolveDatabaseProvisionSpec } from "./service-runtime.js";
 import {
   buildTraefikRuntimePaths,
@@ -1069,6 +1073,7 @@ async function apiRequest<T>(
     method?: string;
     body?: unknown;
     token?: string;
+    signal?: AbortSignal;
   } = {}
 ): Promise<T> {
   const response = await fetch(`${API_URL}${pathName}`, {
@@ -1078,6 +1083,7 @@ async function apiRequest<T>(
       ...(options.token ? { authorization: `Bearer ${options.token}` } : {}),
     },
     body: options.body ? JSON.stringify(options.body) : undefined,
+    signal: options.signal,
   });
 
   if (!response.ok) {
@@ -1091,6 +1097,126 @@ async function apiRequest<T>(
   }
 
   return (await response.json()) as T;
+}
+
+type AgentWorkLeaseRenewalTimer = unknown;
+
+export interface AgentWorkLeaseRenewalController {
+  ready: Promise<boolean>;
+  leaseLost(): boolean;
+  stop(): Promise<void>;
+}
+
+export function resolveAgentWorkLeaseRenewalIntervalMs(leaseTtlSeconds: number): number {
+  const safeLeaseTtlSeconds =
+    Number.isFinite(leaseTtlSeconds) && leaseTtlSeconds > 0
+      ? leaseTtlSeconds
+      : DEFAULT_AGENT_LEASE_TTL_SECONDS;
+  return Math.max(1_000, Math.floor((safeLeaseTtlSeconds * 1_000) / 3));
+}
+
+export function startAgentWorkLeaseRenewal(input: {
+  leaseTtlSeconds: number;
+  renewLease: (signal: AbortSignal) => Promise<AgentLeaseRenewResponse>;
+  onTransientError?: (error: unknown) => void;
+  onLeaseLost?: (error: unknown) => void;
+  schedule?: (callback: () => void, delayMs: number) => AgentWorkLeaseRenewalTimer;
+  clearScheduled?: (timer: AgentWorkLeaseRenewalTimer) => void;
+}): AgentWorkLeaseRenewalController {
+  const normalIntervalMs = resolveAgentWorkLeaseRenewalIntervalMs(input.leaseTtlSeconds);
+  const transientRetryIntervalMs = Math.min(normalIntervalMs, 5_000);
+  const schedule = input.schedule ?? ((callback, delayMs) => setTimeout(callback, delayMs));
+  const clearScheduled =
+    input.clearScheduled ?? ((timer) => clearTimeout(timer as ReturnType<typeof setTimeout>));
+  let stopped = false;
+  let leaseLost = false;
+  let scheduled: AgentWorkLeaseRenewalTimer | null = null;
+  let activeAbortController: AbortController | null = null;
+  let inFlight: Promise<void> | null = null;
+
+  const runRenewal = async (): Promise<void> => {
+    if (stopped || leaseLost) {
+      return;
+    }
+
+    activeAbortController = new AbortController();
+    let nextDelayMs = normalIntervalMs;
+
+    try {
+      await input.renewLease(activeAbortController.signal);
+    } catch (error) {
+      if (stopped && error instanceof Error && error.name === "AbortError") {
+        return;
+      }
+
+      if (shouldStopRetryingAgentWorkMutation(error)) {
+        leaseLost = true;
+        input.onLeaseLost?.(error);
+        return;
+      }
+
+      nextDelayMs = transientRetryIntervalMs;
+      input.onTransientError?.(error);
+    } finally {
+      activeAbortController = null;
+      if (!stopped && !leaseLost) {
+        scheduled = schedule(() => {
+          scheduled = null;
+          void startRenewal();
+        }, nextDelayMs);
+      }
+    }
+  };
+
+  const startRenewal = (): Promise<void> => {
+    const renewal = runRenewal();
+    inFlight = renewal;
+    void renewal.finally(() => {
+      if (inFlight === renewal) {
+        inFlight = null;
+      }
+    });
+    return renewal;
+  };
+
+  const ready = startRenewal().then(() => !leaseLost);
+
+  return {
+    ready,
+    leaseLost: () => leaseLost,
+    async stop() {
+      stopped = true;
+      if (scheduled !== null) {
+        clearScheduled(scheduled);
+        scheduled = null;
+      }
+      activeAbortController?.abort();
+      await inFlight;
+    },
+  };
+}
+
+async function renewAgentWorkLease(
+  credentials: StoredCredentials,
+  workItem: AgentWorkRecord,
+  signal: AbortSignal
+): Promise<AgentLeaseRenewResponse> {
+  if (!workItem.leaseId) {
+    throw new Error(`Leased work ${workItem.id} is missing leaseId`);
+  }
+
+  return await apiRequest<AgentLeaseRenewResponse>(
+    `/api/agent/work/${encodeURIComponent(workItem.id)}/renew`,
+    {
+      method: "POST",
+      token: credentials.agentToken,
+      signal,
+      body: {
+        serverId: SERVER_ID!,
+        leaseId: workItem.leaseId,
+      } satisfies AgentLeaseRenewRequest,
+    }
+  );
 }
 
 let registrationUsed = false;
@@ -2771,6 +2897,27 @@ async function processWorkItem(
   workItem: AgentWorkRecord
 ) {
   console.log(`[nouva-agent] processing work ${workItem.id} (${workItem.kind})`);
+  if (!workItem.leaseId) {
+    console.error(`[nouva-agent] refusing work ${workItem.id} without a lease ID`);
+    return;
+  }
+
+  const leaseRenewal = startAgentWorkLeaseRenewal({
+    leaseTtlSeconds: config.leaseTtlSeconds,
+    renewLease: (signal) => renewAgentWorkLease(credentials, workItem, signal),
+    onLeaseLost: (error) => {
+      console.warn(`[nouva-agent] lease for work ${workItem.id} is no longer active:`, error);
+    },
+    onTransientError: (error) => {
+      console.error(`[nouva-agent] failed to renew lease for work ${workItem.id}:`, error);
+    },
+  });
+  const leaseIsActive = await leaseRenewal.ready;
+  if (!leaseIsActive) {
+    await leaseRenewal.stop();
+    return;
+  }
+
   const payload = toObject(workItem.payload);
 
   let result: Record<string, unknown> | undefined;
@@ -2891,9 +3038,20 @@ async function processWorkItem(
       failureResult = err.result;
     }
     workError = err instanceof Error ? err : new Error("Unknown agent work failure");
+  } finally {
+    await leaseRenewal.stop();
+  }
+
+  if (leaseRenewal.leaseLost()) {
+    console.warn(
+      `[nouva-agent] work ${workItem.id} finished locally after its lease was superseded; ` +
+        "skipping the stale terminal report"
+    );
+    return;
   }
 
   if (workError) {
+    const errorMessage = redactSensitiveText(workError.message);
     try {
       await apiRequest(`/api/agent/work/${workItem.id}/fail`, {
         method: "POST",
@@ -2902,7 +3060,7 @@ async function processWorkItem(
           serverId: SERVER_ID!,
           leaseId: workItem.leaseId,
           result: failureResult ?? null,
-          errorMessage: workError.message,
+          errorMessage,
         },
       });
     } catch (reportErr) {
@@ -3213,7 +3371,7 @@ async function main() {
         token: credentials!.agentToken,
         body: {
           serverId: SERVER_ID!,
-          limit: 5,
+          limit: 1,
         },
       });
 

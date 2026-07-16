@@ -15,9 +15,11 @@ import {
   normalizeRuntimeLogEntries,
   prepareAppBuildkitRuntime,
   resolveAgentTaskImage,
+  resolveAgentWorkLeaseRenewalIntervalMs,
   resolveReportedAgentVersion,
   resolveServiceContainerIdentifier,
   shouldStopRetryingAgentWorkMutation,
+  startAgentWorkLeaseRenewal,
 } from "./index.js";
 import type {
   AgentRuntimeConfig,
@@ -366,6 +368,116 @@ describe("agent work mutation errors", () => {
       )
     ).toBe(false);
     expect(shouldStopRetryingAgentWorkMutation(new Error("network exploded"))).toBe(false);
+  });
+});
+
+describe("agent work lease renewal", () => {
+  test("renews at one third of the configured lease TTL with a one-second floor", () => {
+    expect(resolveAgentWorkLeaseRenewalIntervalMs(120)).toBe(40_000);
+    expect(resolveAgentWorkLeaseRenewalIntervalMs(1)).toBe(1_000);
+    expect(resolveAgentWorkLeaseRenewalIntervalMs(0)).toBe(40_000);
+    expect(resolveAgentWorkLeaseRenewalIntervalMs(Number.NaN)).toBe(40_000);
+  });
+
+  test("does not schedule another renewal while the current request is in flight", async () => {
+    let resolveRenewal: (() => void) | undefined;
+    const renewLease = mock(
+      () =>
+        new Promise<{ ok: true; leaseExpiresAt: string }>((resolve) => {
+          resolveRenewal = () => resolve({ ok: true, leaseExpiresAt: "2026-03-26T12:02:00.000Z" });
+        })
+    );
+    const scheduled: Array<{ callback: () => void; delayMs: number }> = [];
+    const controller = startAgentWorkLeaseRenewal({
+      leaseTtlSeconds: 120,
+      renewLease,
+      schedule: (callback, delayMs) => {
+        scheduled.push({ callback, delayMs });
+        return callback;
+      },
+      clearScheduled: () => undefined,
+    });
+
+    expect(renewLease).toHaveBeenCalledTimes(1);
+    expect(scheduled).toEqual([]);
+
+    resolveRenewal?.();
+    await controller.ready;
+
+    expect(scheduled).toEqual([{ callback: expect.any(Function), delayMs: 40_000 }]);
+    await controller.stop();
+  });
+
+  test("retries transient renewal failures sooner and returns to the normal cadence", async () => {
+    const renewLease = mock()
+      .mockRejectedValueOnce(new Error("network unavailable"))
+      .mockResolvedValueOnce({ ok: true, leaseExpiresAt: "2026-03-26T12:02:00.000Z" });
+    const onTransientError = mock();
+    const scheduled: Array<{ callback: () => void; delayMs: number }> = [];
+    const controller = startAgentWorkLeaseRenewal({
+      leaseTtlSeconds: 120,
+      renewLease,
+      onTransientError,
+      schedule: (callback, delayMs) => {
+        scheduled.push({ callback, delayMs });
+        return callback;
+      },
+      clearScheduled: () => undefined,
+    });
+
+    expect(await controller.ready).toBe(true);
+    expect(onTransientError).toHaveBeenCalledTimes(1);
+    expect(scheduled[0]?.delayMs).toBe(5_000);
+
+    scheduled.shift()?.callback();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(renewLease).toHaveBeenCalledTimes(2);
+    expect(scheduled[0]?.delayMs).toBe(40_000);
+    await controller.stop();
+  });
+
+  test("stops permanently when the control plane rejects lease ownership", async () => {
+    const onLeaseLost = mock();
+    const schedule = mock();
+    const controller = startAgentWorkLeaseRenewal({
+      leaseTtlSeconds: 120,
+      renewLease: async () => {
+        throw new ApiRequestError({
+          method: "POST",
+          pathName: "/api/agent/work/work_1/renew",
+          status: 409,
+          message: "Work item lease is no longer active",
+        });
+      },
+      onLeaseLost,
+      schedule,
+    });
+
+    expect(await controller.ready).toBe(false);
+    expect(controller.leaseLost()).toBe(true);
+    expect(onLeaseLost).toHaveBeenCalledTimes(1);
+    expect(schedule).not.toHaveBeenCalled();
+    await controller.stop();
+  });
+
+  test("clears scheduled renewals during terminal work reporting", async () => {
+    const timer = Symbol("lease-renewal-timer");
+    const clearScheduled = mock();
+    const controller = startAgentWorkLeaseRenewal({
+      leaseTtlSeconds: 120,
+      renewLease: async () => ({
+        ok: true,
+        leaseExpiresAt: "2026-03-26T12:02:00.000Z",
+      }),
+      schedule: () => timer,
+      clearScheduled,
+    });
+
+    expect(await controller.ready).toBe(true);
+    await controller.stop();
+
+    expect(clearScheduled).toHaveBeenCalledWith(timer);
   });
 });
 
