@@ -12,6 +12,7 @@ import {
   handleCreateVolumeBackup,
   handleDatabaseProvision,
   handleRestorePostgresPitr,
+  handleRestoreVolumeBackup,
   normalizeRuntimeLogEntries,
   prepareAppBuildkitRuntime,
   resolveAgentTaskImage,
@@ -27,6 +28,7 @@ import type {
   AppRolloutConfig,
   CreateVolumeBackupPayload,
   DatabaseProvisionPayload,
+  RestoreVolumeBackupPayload,
 } from "./protocol.js";
 
 const runtimeConfig: AgentRuntimeConfig = {
@@ -203,6 +205,33 @@ const snapshotBackupPayload: CreateVolumeBackupPayload = {
     pgbackrestSpoolPath: null,
     pgbackrestCipherPass: null,
   },
+};
+
+const pgBackrestRestorePayload: RestoreVolumeBackupPayload = {
+  projectId: "proj_1",
+  serviceId: "svc_1",
+  serviceName: "main-db",
+  variant: "postgres",
+  version: "17",
+  sourceVolumeId: "vol_1",
+  sourceVolumeName: "nouva-vol-vol_1",
+  sourceMountPath: "/var/lib/postgresql",
+  targetVolumeId: "vol_restored_1",
+  targetVolumeName: "nouva-vol-vol_restored_1",
+  targetMountPath: "/var/lib/postgresql",
+  backupId: "backup_1",
+  engine: "pgbackrest",
+  backupCompletedAt: "2026-03-25T00:00:00Z",
+  pgbackrestSet: "20260325-000000F",
+  destination: {} as never,
+  imageUrl: "postgres:17",
+  envVars: {
+    POSTGRES_USER: "nouva_user",
+    POSTGRES_PASSWORD: "super-secret",
+    PGBACKREST_STANZA: "vol-vol_1",
+  },
+  containerArgs: [],
+  dataPath: "/var/lib/postgresql/pgdata",
 };
 
 const originalAgentImage = process.env.NOUVA_AGENT_IMAGE;
@@ -1159,8 +1188,13 @@ describe("database runtime recreate paths", () => {
     );
     const pitrScript = docker.createContainer.mock.calls[0]?.[0]?.cmd?.[0];
     expect(pitrScript).toContain('pgbackrest --stanza="$PGBACKREST_STANZA"');
+    expect(pitrScript).toContain("--type=time");
+    expect(pitrScript).toContain("--target-timeline=current");
     expect(pitrScript).toContain("/nouva/entrypoint.sh &");
     expect(pitrScript).toContain("pg_is_in_recovery()");
+    expect(docker.createContainer.mock.calls[0]?.[0]?.env).toEqual(
+      expect.arrayContaining(["RESTORE_TYPE=time", "NOUVA_STAGED_RESTORE=1"])
+    );
     expect(
       docker.removeContainer.mock.calls.some((call) => call[0] === "nouva-postgres-prev")
     ).toBe(false);
@@ -1192,6 +1226,77 @@ describe("database runtime recreate paths", () => {
         env: expect.arrayContaining(["NOUVA_DATA_PATH=/var/lib/postgresql/pgdata"]),
       })
     );
+  });
+
+  test("selects the newest pgBackRest backup when annotations are unavailable", async () => {
+    const docker = createDockerMock();
+    docker.containerLogs.mockResolvedValue(
+      `NOUVA_PGBACKREST_INFO:${JSON.stringify([
+        {
+          backup: [
+            {
+              label: "20260324-000000F",
+              type: "full",
+              timestamp: { stop: 1_774_310_400 },
+            },
+            {
+              label: "20260325-000000F",
+              type: "full",
+              timestamp: { stop: 1_774_396_800 },
+            },
+          ],
+        },
+      ])}`
+    );
+
+    const result = await handleCreateVolumeBackup(
+      docker as never,
+      runtimeConfig,
+      pgBackrestBackupPayload
+    );
+
+    expect(result.pgbackrestSet).toBe("20260325-000000F");
+    expect(result.activePgbackrestSets).toEqual(["20260325-000000F", "20260324-000000F"]);
+  });
+
+  test("restores a named pgBackRest backup to consistency without a time target", async () => {
+    const docker = createDockerMock();
+
+    await handleRestoreVolumeBackup(docker as never, runtimeConfig, {
+      ...pgBackrestRestorePayload,
+      backupCompletedAt: null,
+    });
+
+    const task = docker.createContainer.mock.calls[0]?.[0];
+    expect(task?.env).toEqual(
+      expect.arrayContaining([
+        "RESTORE_TYPE=immediate",
+        "RESTORE_TARGET=",
+        "RESTORE_SET=20260325-000000F",
+        "NOUVA_STAGED_RESTORE=1",
+      ])
+    );
+    expect(task?.cmd?.[0]).toContain("--type=immediate");
+  });
+
+  test("keeps timestamp-only pgBackRest backups on time recovery", async () => {
+    const docker = createDockerMock();
+
+    await handleRestoreVolumeBackup(docker as never, runtimeConfig, {
+      ...pgBackrestRestorePayload,
+      pgbackrestSet: null,
+    });
+
+    const task = docker.createContainer.mock.calls[0]?.[0];
+    expect(task?.env).toEqual(
+      expect.arrayContaining([
+        "RESTORE_TYPE=time",
+        "RESTORE_TARGET=2026-03-25T00:00:00Z",
+        "RESTORE_SET=",
+        "NOUVA_STAGED_RESTORE=1",
+      ])
+    );
+    expect(task?.cmd?.[0]).toContain("--target-timeline=current");
   });
 
   test("uses the installed agent image for snapshot backup tasks", async () => {

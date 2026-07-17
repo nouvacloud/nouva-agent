@@ -1709,7 +1709,12 @@ function parsePgBackrestInfo(raw: string): PgBackrestInfoBackup[] {
         annotationBackupId,
       };
     })
-    .filter((entry: PgBackrestInfoBackup | null): entry is PgBackrestInfoBackup => entry !== null);
+    .filter((entry: PgBackrestInfoBackup | null): entry is PgBackrestInfoBackup => entry !== null)
+    .sort((left: PgBackrestInfoBackup, right: PgBackrestInfoBackup) => {
+      const leftStopAt = left.stopAt ? Date.parse(left.stopAt) : Number.NEGATIVE_INFINITY;
+      const rightStopAt = right.stopAt ? Date.parse(right.stopAt) : Number.NEGATIVE_INFINITY;
+      return rightStopAt - leftStopAt;
+    });
 }
 
 function selectCurrentPgBackrestEntry(
@@ -1751,11 +1756,24 @@ function buildPgBackrestRestoreAndPromoteScript() {
       '" /var/run/postgresql',
     'chown -R 999:999 "$NOUVA_DATA_PATH" || true',
     "if [ -x /nouva/generate_config.sh ]; then /nouva/generate_config.sh; fi",
-    `if [ -n "\${RESTORE_SET:-}" ]; then`,
-    '  pgbackrest --stanza="$PGBACKREST_STANZA" --set="$RESTORE_SET" --delta --type=time --target="$RESTORE_TARGET" --target-action=promote --log-level-console=info restore',
-    "else",
-    '  pgbackrest --stanza="$PGBACKREST_STANZA" --delta --type=time --target="$RESTORE_TARGET" --target-action=promote --log-level-console=info restore',
-    "fi",
+    `case "\${RESTORE_TYPE:-time}" in`,
+    "  immediate)",
+    `    if [ -z "\${RESTORE_SET:-}" ]; then echo "Immediate restore requires RESTORE_SET" >&2; exit 1; fi`,
+    '    pgbackrest --stanza="$PGBACKREST_STANZA" --set="$RESTORE_SET" --delta --type=immediate --target-action=promote --log-level-console=info restore',
+    "    ;;",
+    "  time)",
+    `    if [ -z "\${RESTORE_TARGET:-}" ]; then echo "Time restore requires RESTORE_TARGET" >&2; exit 1; fi`,
+    `    if [ -n "\${RESTORE_SET:-}" ]; then`,
+    '      pgbackrest --stanza="$PGBACKREST_STANZA" --set="$RESTORE_SET" --delta --type=time --target="$RESTORE_TARGET" --target-timeline=current --target-action=promote --log-level-console=info restore',
+    "    else",
+    '      pgbackrest --stanza="$PGBACKREST_STANZA" --delta --type=time --target="$RESTORE_TARGET" --target-timeline=current --target-action=promote --log-level-console=info restore',
+    "    fi",
+    "    ;;",
+    "  *)",
+    '    echo "Unsupported RESTORE_TYPE: $RESTORE_TYPE" >&2',
+    "    exit 1",
+    "    ;;",
+    "esac",
     'export PGHOST="' + "$" + "{POSTGRES_SOCKET_DIR:-/var/lib/postgresql/.sockets}" + '"',
     'export PGPORT="' + "$" + "{POSTGRES_PORT:-5433}" + '"',
     'export NOUVA_PROMOTE_DB="' + "$" + "{POSTGRES_DB:-postgres}" + '"',
@@ -2606,8 +2624,8 @@ async function handleRestorePgBackrestBackup(
   config: Pick<AgentRuntimeConfig, "privateRegistry">,
   payload: RestoreVolumeBackupPayload
 ) {
-  if (!payload.backupCompletedAt) {
-    throw new Error("Backup restore is missing backupCompletedAt");
+  if (!payload.pgbackrestSet && !payload.backupCompletedAt) {
+    throw new Error("Backup restore is missing both pgbackrestSet and backupCompletedAt");
   }
 
   const spec = resolveHydratedHelperSpec({
@@ -2625,8 +2643,10 @@ async function handleRestorePgBackrestBackup(
     image: spec.image,
     env: [
       ...Object.entries(spec.envVars).map(([key, value]) => `${key}=${value}`),
-      `RESTORE_TARGET=${payload.backupCompletedAt}`,
+      `RESTORE_TYPE=${payload.pgbackrestSet ? "immediate" : "time"}`,
+      `RESTORE_TARGET=${payload.backupCompletedAt ?? ""}`,
       `RESTORE_SET=${payload.pgbackrestSet ?? ""}`,
+      "NOUVA_STAGED_RESTORE=1",
       `NOUVA_DATA_PATH=${spec.dataPath}`,
     ],
     entrypoint: ["sh", "-c"],
@@ -2693,7 +2713,7 @@ async function handleDeleteVolumeBackup(
   return await handleDeleteArchiveBackup(docker, config, payload);
 }
 
-async function handleRestoreVolumeBackup(
+export async function handleRestoreVolumeBackup(
   docker: DockerApiClient,
   config: Pick<AgentRuntimeConfig, "privateRegistry">,
   payload: RestoreVolumeBackupPayload
@@ -2717,8 +2737,10 @@ export async function handleRestorePostgresPitr(
     image: spec.image,
     env: [
       ...Object.entries(spec.envVars).map(([key, value]) => `${key}=${value}`),
+      "RESTORE_TYPE=time",
       `RESTORE_TARGET=${payload.restoreTarget}`,
       "RESTORE_SET=",
+      "NOUVA_STAGED_RESTORE=1",
       `NOUVA_DATA_PATH=${spec.dataPath}`,
     ],
     entrypoint: ["sh", "-c"],
