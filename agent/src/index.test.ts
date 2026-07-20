@@ -769,7 +769,7 @@ describe("deployAppImageWithDependencies", () => {
       expect.anything(),
       "svc_1",
       {
-        providedHostname: "app.nouva.cloud",
+        providedHostname: "app.up.nouva.cloud",
         customHostnames: [],
       },
       "http://nouva-app-svc_1-dep_1:8080"
@@ -941,7 +941,7 @@ describe("deployAppImageWithDependencies", () => {
         expect.anything(),
         "svc_1",
         {
-          providedHostname: "app.nouva.cloud",
+          providedHostname: "app.up.nouva.cloud",
           customHostnames: [],
         },
         "http://nouva-app-svc_1-dep_1:8080",
@@ -950,7 +950,7 @@ describe("deployAppImageWithDependencies", () => {
         expect.anything(),
         "svc_1",
         {
-          providedHostname: "app.nouva.cloud",
+          providedHostname: "app.up.nouva.cloud",
           customHostnames: [],
         },
         "http://nouva-app-svc_1-live:8080",

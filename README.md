@@ -65,7 +65,7 @@ docker run -d \
 | Variable | Default | Description |
 |---|---|---|
 | `NOUVA_REGISTRATION_TOKEN` | — | Initial registration token |
-| `NOUVA_APP_DOMAIN` | `nouva.cloud` | Base domain for deployed apps |
+| `NOUVA_APP_DOMAIN` | `up.nouva.cloud` | Base domain for deployed apps |
 | `NOUVA_AGENT_DATA_VOLUME` | `nouva-agent-data` | Agent data volume name |
 | `NOUVA_AGENT_BUILDKIT_CONTAINER` | `nouva-buildkitd` | BuildKit container name |
 | `NOUVA_AGENT_REGISTRY_CONTAINER` | `nouva-registry` | Local registry container name |
