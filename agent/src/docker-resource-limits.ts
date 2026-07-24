@@ -1,11 +1,13 @@
 export interface DockerResourceSettings {
-  NanoCpus?: number;
-  Memory?: number;
+  NanoCpus: number;
+  Memory: number;
+  MemorySwap: number;
+  PidsLimit: number;
 }
 
 function toPositiveIntegerField(
   value: unknown,
-  fieldName: "cpuMillicores" | "memoryBytes"
+  fieldName: "cpuMillicores" | "memoryBytes" | "pidsLimit"
 ): number {
   if (
     typeof value !== "number" ||
@@ -13,7 +15,8 @@ function toPositiveIntegerField(
     !Number.isInteger(value) ||
     value <= 0
   ) {
-    const unit = fieldName === "cpuMillicores" ? "millicores" : "bytes";
+    const unit =
+      fieldName === "cpuMillicores" ? "millicores" : fieldName === "memoryBytes" ? "bytes" : "PIDs";
     throw new Error(
       `Invalid resourceLimits.${fieldName}: expected a positive integer number of ${unit}`
     );
@@ -23,39 +26,34 @@ function toPositiveIntegerField(
 }
 
 export function toDockerResourceSettings(resourceLimits: unknown): DockerResourceSettings {
-  if (resourceLimits === null || typeof resourceLimits === "undefined") {
-    return {};
-  }
-
   if (
     typeof resourceLimits !== "object" ||
     resourceLimits === null ||
     Array.isArray(resourceLimits)
   ) {
     throw new Error(
-      "Invalid resourceLimits payload: expected an object with cpuMillicores and/or memoryBytes, or null for unlimited"
+      "Invalid resourceLimits payload: expected complete effective CPU, memory, and PID limits"
     );
   }
 
   const record = resourceLimits as Record<string, unknown>;
   const hasCpuMillicores = Object.hasOwn(record, "cpuMillicores");
   const hasMemoryBytes = Object.hasOwn(record, "memoryBytes");
+  const hasPidsLimit = Object.hasOwn(record, "pidsLimit");
 
-  if (!hasCpuMillicores && !hasMemoryBytes) {
+  if (!hasCpuMillicores || !hasMemoryBytes || !hasPidsLimit) {
     throw new Error(
-      "Invalid resourceLimits payload: provide cpuMillicores and/or memoryBytes, or null for unlimited"
+      "Invalid resourceLimits payload: expected complete effective CPU, memory, and PID limits"
     );
   }
 
-  const settings: DockerResourceSettings = {};
+  const memoryBytes = toPositiveIntegerField(record.memoryBytes, "memoryBytes");
+  const pidsLimit = toPositiveIntegerField(record.pidsLimit, "pidsLimit");
 
-  if (hasCpuMillicores) {
-    settings.NanoCpus = toPositiveIntegerField(record.cpuMillicores, "cpuMillicores") * 1_000_000;
-  }
-
-  if (hasMemoryBytes) {
-    settings.Memory = toPositiveIntegerField(record.memoryBytes, "memoryBytes");
-  }
-
-  return settings;
+  return {
+    NanoCpus: toPositiveIntegerField(record.cpuMillicores, "cpuMillicores") * 1_000_000,
+    Memory: memoryBytes,
+    MemorySwap: memoryBytes,
+    PidsLimit: pidsLimit,
+  };
 }

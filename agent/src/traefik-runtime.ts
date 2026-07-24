@@ -106,6 +106,26 @@ interface ReconcileTraefikRuntimeOptions {
   intervalMs?: number;
 }
 
+async function connectTraefikToManagedProjectNetworks(
+  docker: Pick<DockerApiClient, "connectNetwork" | "listNetworks">,
+  containerName: string,
+  serverId: string | undefined
+): Promise<void> {
+  const networks = await docker.listNetworks();
+  const projectNetworks = networks.filter((network) => {
+    const labels = network.Labels ?? {};
+    return (
+      labels["nouva.managed"] === "true" &&
+      typeof labels["nouva.project.id"] === "string" &&
+      (!serverId || labels["nouva.server.id"] === serverId)
+    );
+  });
+
+  await Promise.all(
+    projectNetworks.map((network) => docker.connectNetwork(network.Name, containerName))
+  );
+}
+
 interface CollectTraefikValidationChecksOptions {
   paths?: TraefikRuntimePaths;
   fetchImpl?: typeof fetch;
@@ -680,8 +700,10 @@ export async function reconcileTraefikRuntime(
   await writeManagedFile(paths.staticConfigPath, staticConfig);
   const stateHash = createTraefikStateHash(staticConfig);
   const current = await docker.inspectContainer(TRAEFIK_CONTAINER_NAME);
+  const serverId = options.labels?.["nouva.server.id"];
 
   if (isTraefikContainerCurrent(current, stateHash)) {
+    await connectTraefikToManagedProjectNetworks(docker, TRAEFIK_CONTAINER_NAME, serverId);
     lastTraefikRuntimeFailure = null;
     return;
   }
@@ -701,6 +723,7 @@ export async function reconcileTraefikRuntime(
     }),
     true
   );
+  await connectTraefikToManagedProjectNetworks(docker, TRAEFIK_CANDIDATE_CONTAINER_NAME, serverId);
 
   try {
     await waitForTraefikHealth(docker, paths, {
@@ -730,6 +753,7 @@ export async function reconcileTraefikRuntime(
     }),
     true
   );
+  await connectTraefikToManagedProjectNetworks(docker, TRAEFIK_CONTAINER_NAME, serverId);
 
   try {
     await waitForTraefikHealth(docker, paths, {
@@ -756,6 +780,7 @@ export async function reconcileTraefikRuntime(
           }),
           true
         );
+        await connectTraefikToManagedProjectNetworks(docker, TRAEFIK_CONTAINER_NAME, serverId);
         await waitForTraefikHealth(docker, paths, {
           containerName: TRAEFIK_CONTAINER_NAME,
           adminPort: TRAEFIK_ADMIN_PORT,

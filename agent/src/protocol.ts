@@ -27,6 +27,7 @@ export const AGENT_WORK_KINDS = [
   "restore_volume_backup",
   "restore_postgres_pitr",
   "expire_volume_backup_repository",
+  "reconcile_service_resources",
   "sync_routing",
   "update_agent",
 ] as const;
@@ -178,6 +179,13 @@ export interface ServiceResourceLimits {
   memoryBytes?: number;
 }
 
+export interface EffectiveServiceResourceLimits {
+  cpuMillicores: number;
+  memoryBytes: number;
+  pidsLimit: number;
+  policyVersion: number;
+}
+
 export const APP_BUILD_TYPES = ["railpack", "dockerfile", "static"] as const;
 export type AppBuildType = (typeof APP_BUILD_TYPES)[number];
 
@@ -214,6 +222,8 @@ export type AgentCapabilities = {
   runtimeLogs?: boolean;
   postgresObservability?: boolean;
   cleanupProofV1?: boolean;
+  resourceIsolationV1?: boolean;
+  projectNetworkIsolationV1?: boolean;
   [key: string]: boolean | undefined;
 };
 
@@ -417,7 +427,7 @@ export interface AppDeployPayload {
   appBuildType?: AppBuildType | null;
   appBuildConfig?: AppBuildConfig | null;
   volume?: AppVolumeIdentity | null;
-  resourceLimits: ServiceResourceLimits | null;
+  resourceLimits: EffectiveServiceResourceLimits;
   buildCommand?: string;
   startCommand?: string;
   rollout?: AppRolloutConfig | null;
@@ -435,7 +445,7 @@ export interface DeployOnlyPayload {
   deploymentId: string;
   envVars: Record<string, string>;
   volume?: AppVolumeIdentity | null;
-  resourceLimits: ServiceResourceLimits | null;
+  resourceLimits: EffectiveServiceResourceLimits;
   rollout?: AppRolloutConfig | null;
   runtimeMetadata?: RuntimeMetadata | null;
 }
@@ -467,10 +477,17 @@ export interface DatabaseProvisionPayload {
   externalHost: string | null;
   externalPort: number | null;
   publicAccessEnabled: boolean;
-  resourceLimits: ServiceResourceLimits | null;
+  resourceLimits: EffectiveServiceResourceLimits;
   runtimeMetadata?: RuntimeMetadata | null;
   version?: string;
   credentials?: Record<string, string>;
+}
+
+export interface ReconcileServiceResourcesPayload {
+  serviceId: string;
+  containerName?: string | null;
+  runtimeMetadata?: RuntimeMetadata | null;
+  resourceLimits: EffectiveServiceResourceLimits;
 }
 
 export interface DeleteVolumePayload {
@@ -629,6 +646,8 @@ export function getDefaultAgentCapabilities(): AgentCapabilities {
     runtimeLogs: true,
     postgresObservability: true,
     cleanupProofV1: true,
+    resourceIsolationV1: true,
+    projectNetworkIsolationV1: true,
   };
 }
 

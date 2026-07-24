@@ -53,9 +53,11 @@ import {
   type DeleteVolumeBackupPayload,
   type DeleteVolumePayload,
   type DeployOnlyPayload,
+  type EffectiveServiceResourceLimits,
   type ExpireVolumeBackupRepositoryPayload,
   getAgentRuntimeConfig,
   parseHostMetricsSnapshot,
+  type ReconcileServiceResourcesPayload,
   type RemoveServicePayload,
   type RestartServicePayload,
   type RestorePostgresPitrPayload,
@@ -66,7 +68,6 @@ import {
   resolveAgentCapabilities,
   resolveAppRolloutConfig,
   type ServerValidationReport,
-  type ServiceResourceLimits,
   type SyncRoutingPayload,
 } from "./protocol.js";
 import { redactSensitiveText } from "./security.js";
@@ -1310,6 +1311,30 @@ function buildProjectNetwork(projectId: string): string {
   return `nouva-project-${hashProjectNetwork(projectId)}`;
 }
 
+function resolveRuntimeResourceLimits(
+  input: unknown,
+  workload: "app" | "postgres" | "mongodb" | "redis"
+): EffectiveServiceResourceLimits {
+  const record =
+    typeof input === "object" && input !== null && !Array.isArray(input)
+      ? (input as Record<string, unknown>)
+      : {};
+  const defaults =
+    workload === "app"
+      ? { cpuMillicores: 250, memoryBytes: 512 * 1024 * 1024, pidsLimit: 256 }
+      : workload === "redis"
+        ? { cpuMillicores: 250, memoryBytes: 256 * 1024 * 1024, pidsLimit: 256 }
+        : { cpuMillicores: 500, memoryBytes: 1024 * 1024 * 1024, pidsLimit: 512 };
+
+  return {
+    cpuMillicores:
+      typeof record.cpuMillicores === "number" ? record.cpuMillicores : defaults.cpuMillicores,
+    memoryBytes: typeof record.memoryBytes === "number" ? record.memoryBytes : defaults.memoryBytes,
+    pidsLimit: defaults.pidsLimit,
+    policyVersion: 1,
+  };
+}
+
 function buildLabels(input: {
   kind: string;
   projectId?: string | null;
@@ -1448,7 +1473,7 @@ async function waitForLocalRegistryAvailability(
 function buildBuildkitContainerSpec(options: {
   name: string;
   port: number;
-  resourceLimits: ServiceResourceLimits | null;
+  resourceLimits: EffectiveServiceResourceLimits;
   restartPolicyName: "no" | "unless-stopped";
   deploymentId?: string | null;
 }): DockerContainerSpec {
@@ -1471,6 +1496,21 @@ function buildBuildkitContainerSpec(options: {
   };
 }
 
+function getBuildkitResourceLimits(): EffectiveServiceResourceLimits {
+  const cpuMillicores = Math.min(2000, Math.max(500, Math.floor(os.cpus().length * 1000 * 0.15)));
+  const memoryBytes = Math.min(
+    2 * 1024 * 1024 * 1024,
+    Math.max(1024 * 1024 * 1024, Math.floor(os.totalmem() * 0.15))
+  );
+
+  return {
+    cpuMillicores,
+    memoryBytes,
+    pidsLimit: 512,
+    policyVersion: 1,
+  };
+}
+
 async function ensureSharedBuildkitRuntime(
   docker: Pick<DockerApiClient, "ensureContainer" | "inspectContainer" | "removeContainer">
 ): Promise<void> {
@@ -1483,7 +1523,7 @@ async function ensureSharedBuildkitRuntime(
     ...buildBuildkitContainerSpec({
       name: BUILDKIT_CONTAINER_NAME,
       port: resolveBuildkitPort(BUILDKIT_ADDRESS),
-      resourceLimits: null,
+      resourceLimits: getBuildkitResourceLimits(),
       restartPolicyName: "unless-stopped",
     }),
   });
@@ -1532,14 +1572,6 @@ export async function prepareAppBuildkitRuntime(
     waitUntilReady?: (address: string) => Promise<void>;
   } = {}
 ): Promise<PreparedAppBuildkitRuntime> {
-  const sharedAddress = options.sharedAddress ?? BUILDKIT_ADDRESS;
-  if (!payload.resourceLimits) {
-    return {
-      address: sharedAddress,
-      cleanup: async () => {},
-    };
-  }
-
   const port = await (options.allocatePort ?? allocateAvailableLocalPort)();
   const containerName = buildScopedBuildkitContainerName(payload.deploymentId);
   const address = createBuildkitAddress(port);
@@ -1549,7 +1581,7 @@ export async function prepareAppBuildkitRuntime(
       buildBuildkitContainerSpec({
         name: containerName,
         port,
-        resourceLimits: payload.resourceLimits,
+        resourceLimits: getBuildkitResourceLimits(),
         restartPolicyName: "no",
         deploymentId: payload.deploymentId,
       }),
@@ -1928,7 +1960,7 @@ function resolveAppPort(
 }
 
 export function buildAppContainerSpec(
-  config: AgentRuntimeConfig,
+  _config: AgentRuntimeConfig,
   payload: DeployAppImageInput
 ): {
   containerName: string;
@@ -1967,11 +1999,11 @@ export function buildAppContainerSpec(
         RestartPolicy: {
           Name: "unless-stopped",
         },
-        ...toDockerResourceSettings(payload.resourceLimits),
+        ...toDockerResourceSettings(resolveRuntimeResourceLimits(payload.resourceLimits, "app")),
       },
       networkingConfig: {
         EndpointsConfig: {
-          [config.localTraefikNetwork]: {},
+          [buildProjectNetwork(payload.projectId)]: {},
         },
       },
     },
@@ -1987,7 +2019,12 @@ export async function deployAppImageWithDependencies(
   await dependencies.ensureBaseRuntime(docker, config);
 
   const projectNetwork = buildProjectNetwork(payload.projectId);
-  await docker.ensureNetwork(projectNetwork);
+  await docker.ensureNetwork(projectNetwork, {
+    "nouva.managed": "true",
+    "nouva.server.id": SERVER_ID!,
+    "nouva.project.id": payload.projectId,
+  });
+  await docker.connectNetwork(projectNetwork, TRAEFIK_CONTAINER_NAME);
 
   const currentRuntimeImage = resolveCurrentRuntimeImage(payload.runtimeMetadata);
   const retainedPreviousImage = resolvePreviousRuntimeImage(payload.runtimeMetadata);
@@ -2026,12 +2063,6 @@ export async function deployAppImageWithDependencies(
   const containerId = await docker.ensureContainer(spec, true, {
     pull: !dockerLocalImages,
   });
-  await docker.connectNetwork(projectNetwork, containerId).catch((err: Error) => {
-    console.error(
-      `[nouva-agent] connectNetwork failed for service ${payload.serviceId}: ${err.message}`
-    );
-  });
-
   try {
     await waitForAppCandidateReadiness(dependencies, docker, containerName, appPort, rollout);
   } catch (error) {
@@ -2297,7 +2328,9 @@ export function buildDatabaseContainerSpec(payload: DatabaseProvisionPayload): {
     RestartPolicy: {
       Name: "unless-stopped",
     },
-    ...toDockerResourceSettings(payload.resourceLimits),
+    ...toDockerResourceSettings(
+      resolveRuntimeResourceLimits(payload.resourceLimits, payload.variant)
+    ),
   };
 
   if (payload.publicAccessEnabled && payload.externalPort) {
@@ -2358,7 +2391,12 @@ async function deployDatabaseContainer(
 ) {
   const { projectNetwork, resolved, volumeName, containerName, spec } =
     buildDatabaseContainerSpec(payload);
-  await docker.ensureNetwork(projectNetwork);
+  await docker.ensureNetwork(projectNetwork, {
+    "nouva.managed": "true",
+    "nouva.server.id": SERVER_ID!,
+    "nouva.project.id": payload.projectId,
+  });
+  await docker.connectNetwork(projectNetwork, TRAEFIK_CONTAINER_NAME);
   await docker.createVolume(volumeName);
   const containerId = await docker.ensureContainer(spec, true, {
     auth: resolveRegistryAuthForImage(config, resolved.image),
@@ -3125,6 +3163,38 @@ async function processWorkItem(
           payload as unknown as ExpireVolumeBackupRepositoryPayload
         );
         break;
+      case "reconcile_service_resources": {
+        const reconcilePayload = payload as unknown as ReconcileServiceResourcesPayload;
+        const container =
+          reconcilePayload.containerName ??
+          reconcilePayload.runtimeMetadata?.containerName ??
+          reconcilePayload.runtimeMetadata?.containerId;
+        if (!container) {
+          throw new Error(
+            `Service ${reconcilePayload.serviceId} has no runtime container to reconcile`
+          );
+        }
+        const resources = toDockerResourceSettings(reconcilePayload.resourceLimits);
+        await docker.updateContainer(container, resources);
+        const inspection = await docker.inspectContainer(container);
+        if (!inspection) {
+          throw new Error(
+            `Service ${reconcilePayload.serviceId} container disappeared after resource reconciliation`
+          );
+        }
+        result = {
+          serviceId: reconcilePayload.serviceId,
+          containerId: inspection.Id,
+          applied: {
+            nanoCpus: inspection.HostConfig?.NanoCpus ?? resources.NanoCpus,
+            memory: inspection.HostConfig?.Memory ?? resources.Memory,
+            memorySwap: inspection.HostConfig?.MemorySwap ?? resources.MemorySwap,
+            pidsLimit: inspection.HostConfig?.PidsLimit ?? resources.PidsLimit,
+            policyVersion: reconcilePayload.resourceLimits.policyVersion,
+          },
+        };
+        break;
+      }
       case "sync_routing":
         result = await handleSyncRouting(docker, config, {
           ...(payload as unknown as SyncRoutingPayload),

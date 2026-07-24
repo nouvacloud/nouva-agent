@@ -42,6 +42,10 @@ export interface DockerContainerInspection {
     };
   };
   HostConfig?: {
+    NanoCpus?: number;
+    Memory?: number;
+    MemorySwap?: number;
+    PidsLimit?: number;
     NetworkMode?: string;
     Binds?: string[];
     Privileged?: boolean;
@@ -349,8 +353,30 @@ export class DockerApiClient {
     );
   }
 
-  async ensureNetwork(name: string): Promise<void> {
-    const networks = (await this.request<Array<{ Name: string }>>("GET", "/networks")) ?? [];
+  async listNetworks(): Promise<
+    Array<{ Id: string; Name: string; Labels?: Record<string, string> }>
+  > {
+    return (
+      (await this.request<Array<{ Id: string; Name: string; Labels?: Record<string, string> }>>(
+        "GET",
+        "/networks"
+      )) ?? []
+    );
+  }
+
+  async inspectNetwork(name: string): Promise<Record<string, unknown> | null> {
+    try {
+      return await this.request("GET", `/networks/${encodeURIComponent(name)}`);
+    } catch (error) {
+      if (error instanceof DockerApiError && error.status === 404) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  async ensureNetwork(name: string, labels: Record<string, string> = {}): Promise<void> {
+    const networks = await this.listNetworks();
     if (networks.some((network) => network.Name === name)) {
       return;
     }
@@ -359,6 +385,7 @@ export class DockerApiClient {
       Name: name,
       Driver: "bridge",
       Attachable: true,
+      Labels: labels,
     });
   }
 
@@ -401,6 +428,18 @@ export class DockerApiClient {
       }
       throw error;
     }
+  }
+
+  async updateContainer(
+    nameOrId: string,
+    resources: {
+      NanoCpus: number;
+      Memory: number;
+      MemorySwap: number;
+      PidsLimit: number;
+    }
+  ): Promise<void> {
+    await this.request("POST", `/containers/${encodeURIComponent(nameOrId)}/update`, resources);
   }
 
   async inspectImage(nameOrId: string): Promise<DockerImageInspection | null> {
@@ -528,9 +567,28 @@ export class DockerApiClient {
   }
 
   async connectNetwork(network: string, container: string): Promise<void> {
-    await this.request("POST", `/networks/${encodeURIComponent(network)}/connect`, {
-      Container: container,
-    });
+    try {
+      await this.request("POST", `/networks/${encodeURIComponent(network)}/connect`, {
+        Container: container,
+      });
+    } catch (error) {
+      if (!(error instanceof DockerApiError && error.status === 403)) {
+        throw error;
+      }
+    }
+  }
+
+  async disconnectNetwork(network: string, container: string, force = false): Promise<void> {
+    try {
+      await this.request("POST", `/networks/${encodeURIComponent(network)}/disconnect`, {
+        Container: container,
+        Force: force,
+      });
+    } catch (error) {
+      if (!(error instanceof DockerApiError && (error.status === 403 || error.status === 404))) {
+        throw error;
+      }
+    }
   }
 
   async loadImage(archive: Buffer): Promise<void> {

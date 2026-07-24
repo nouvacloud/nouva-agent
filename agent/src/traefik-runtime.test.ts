@@ -205,6 +205,18 @@ describe("traefik-runtime", () => {
 
     const docker = {
       ensureNetwork: mock(async () => {}),
+      listNetworks: mock(async () => [
+        {
+          Id: "network-1",
+          Name: "nouva-project-one",
+          Labels: {
+            "nouva.managed": "true",
+            "nouva.server.id": "server-1",
+            "nouva.project.id": "project-1",
+          },
+        },
+      ]),
+      connectNetwork: mock(async () => {}),
       pullImage: mock(async () => {}),
       removeContainer: mock(async (name: string) => {
         dockerState[name] = null;
@@ -286,6 +298,70 @@ describe("traefik-runtime", () => {
       TRAEFIK_IMAGE,
       TRAEFIK_IMAGE,
       "traefik:v3.4",
+    ]);
+    expect(docker.connectNetwork.mock.calls).toEqual([
+      ["nouva-project-one", TRAEFIK_CANDIDATE_CONTAINER_NAME],
+      ["nouva-project-one", TRAEFIK_CONTAINER_NAME],
+      ["nouva-project-one", TRAEFIK_CONTAINER_NAME],
+    ]);
+  });
+
+  test("reconnects a current Traefik container to every managed project network", async () => {
+    tempDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-traefik-"));
+    const paths = getTraefikRuntimePaths(tempDir);
+    await ensureTraefikState(paths);
+    const stateHash = createTraefikStateHash(renderTraefikStaticConfig(paths));
+    const docker = {
+      ensureNetwork: mock(async () => {}),
+      inspectContainer: mock(async () => createTraefikInspection({ stateHash })),
+      listNetworks: mock(async () => [
+        {
+          Id: "network-1",
+          Name: "nouva-project-one",
+          Labels: {
+            "nouva.managed": "true",
+            "nouva.server.id": "server-1",
+            "nouva.project.id": "project-1",
+          },
+        },
+        {
+          Id: "network-2",
+          Name: "nouva-project-two",
+          Labels: {
+            "nouva.managed": "true",
+            "nouva.server.id": "server-1",
+            "nouva.project.id": "project-2",
+          },
+        },
+        {
+          Id: "network-foreign",
+          Name: "nouva-project-foreign",
+          Labels: {
+            "nouva.managed": "true",
+            "nouva.server.id": "server-2",
+            "nouva.project.id": "project-3",
+          },
+        },
+        {
+          Id: "network-ingress",
+          Name: "nouva-ingress",
+          Labels: {},
+        },
+      ]),
+      connectNetwork: mock(async () => {}),
+    };
+
+    await reconcileTraefikRuntime(docker as never, runtimeConfig, {
+      dataVolume: "nouva-agent-data",
+      labels: {
+        "nouva.server.id": "server-1",
+      },
+      paths,
+    });
+
+    expect(docker.connectNetwork.mock.calls).toEqual([
+      ["nouva-project-one", TRAEFIK_CONTAINER_NAME],
+      ["nouva-project-two", TRAEFIK_CONTAINER_NAME],
     ]);
   });
 

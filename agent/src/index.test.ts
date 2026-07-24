@@ -614,8 +614,10 @@ describe("prepareAppBuildkitRuntime", () => {
           RestartPolicy: {
             Name: "no",
           },
-          NanoCpus: 1_500_000_000,
-          Memory: 2 * 1024 * 1024 * 1024,
+          NanoCpus: expect.any(Number),
+          Memory: expect.any(Number),
+          MemorySwap: expect.any(Number),
+          PidsLimit: 512,
         }),
       }),
       true
@@ -627,7 +629,7 @@ describe("prepareAppBuildkitRuntime", () => {
     expect(docker.removeContainer).toHaveBeenCalledWith("nouva-buildkitd-dep_1", true);
   });
 
-  test("reuses the shared BuildKit daemon for unlimited app builds", async () => {
+  test("creates a scoped BuildKit worker when legacy payload limits are null", async () => {
     const docker = {
       ensureContainer: mock(async () => "buildkit_1"),
       removeContainer: mock(async () => {}),
@@ -640,16 +642,17 @@ describe("prepareAppBuildkitRuntime", () => {
         resourceLimits: null,
       },
       {
-        sharedAddress: "tcp://127.0.0.1:1234",
+        allocatePort: async () => 4568,
+        waitUntilReady: async () => {},
       }
     );
 
-    expect(runtime.address).toBe("tcp://127.0.0.1:1234");
-    expect(docker.ensureContainer).not.toHaveBeenCalled();
+    expect(runtime.address).toBe("tcp://127.0.0.1:4568");
+    expect(docker.ensureContainer).toHaveBeenCalled();
 
     await runtime.cleanup();
 
-    expect(docker.removeContainer).not.toHaveBeenCalled();
+    expect(docker.removeContainer).toHaveBeenCalledWith("nouva-buildkitd-dep_1", true);
   });
 });
 
@@ -665,14 +668,20 @@ describe("buildAppContainerSpec", () => {
     );
   });
 
-  test("omits Docker CPU and memory limits when resource limits are null", () => {
+  test("applies protected app defaults when legacy resource limits are null", () => {
     const spec = buildAppContainerSpec(runtimeConfig, {
       ...appRuntimePayload,
       resourceLimits: null,
     });
 
-    expect(spec.spec.hostConfig).not.toHaveProperty("NanoCpus");
-    expect(spec.spec.hostConfig).not.toHaveProperty("Memory");
+    expect(spec.spec.hostConfig).toEqual(
+      expect.objectContaining({
+        NanoCpus: 250_000_000,
+        Memory: 512 * 1024 * 1024,
+        MemorySwap: 512 * 1024 * 1024,
+        PidsLimit: 256,
+      })
+    );
   });
 
   test("mounts managed app volumes when they are provided", () => {
@@ -1039,14 +1048,20 @@ describe("buildDatabaseContainerSpec", () => {
     );
   });
 
-  test("omits Docker CPU and memory limits for unlimited database containers", () => {
+  test("applies protected database defaults when legacy resource limits are null", () => {
     const spec = buildDatabaseContainerSpec({
       ...databasePayload,
       resourceLimits: null,
     });
 
-    expect(spec.spec.hostConfig).not.toHaveProperty("NanoCpus");
-    expect(spec.spec.hostConfig).not.toHaveProperty("Memory");
+    expect(spec.spec.hostConfig).toEqual(
+      expect.objectContaining({
+        NanoCpus: 500_000_000,
+        Memory: 1024 * 1024 * 1024,
+        MemorySwap: 1024 * 1024 * 1024,
+        PidsLimit: 512,
+      })
+    );
   });
 
   test("stamps environment labels for database containers", () => {
@@ -1113,7 +1128,12 @@ describe("database runtime recreate paths", () => {
         }),
       })
     );
-    expect(docker.ensureContainer.mock.calls[0]?.[0]?.hostConfig).not.toHaveProperty("NanoCpus");
+    expect(docker.ensureContainer.mock.calls[0]?.[0]?.hostConfig).toEqual(
+      expect.objectContaining({
+        NanoCpus: 500_000_000,
+        PidsLimit: 512,
+      })
+    );
   });
 
   test("attaches registry auth only for images hosted on the configured private registry", async () => {
