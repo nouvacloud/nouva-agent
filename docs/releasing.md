@@ -1,8 +1,11 @@
 # Releasing Nouva Agent
 
-Production agent images are published only when a GitHub Release is published in
-[`nouvacloud/nouva-agent`](https://github.com/nouvacloud/nouva-agent). Merges to `main` and
-plain tag pushes do not publish container images.
+Production agent images are published automatically after the mirrored public repository's `CI`
+workflow succeeds on `main`. The automation reads `agent/package.json`, creates or reuses a draft
+`v${version}` release, and dispatches the image publication workflow for the exact tested commit.
+
+If that version is already published from the same commit, the automation exits without changing
+the release. If the version points to another commit, it fails and requires a new package version.
 
 ## Prerequisites
 
@@ -15,15 +18,17 @@ The release workflow fails before build and push if either secret is missing.
 
 ## Publish `v0.1.0`
 
-1. Ensure `main` is in the state you want to ship and that CI is green.
-2. Update `agent/package.json` to the version you intend to release, without a `v` prefix.
-3. Create tag `v0.1.0` from `main`, matching `v${agent/package.json version}` exactly.
-4. Publish a GitHub Release for `v0.1.0` targeting that tag.
-5. Wait for the `Release` workflow to complete successfully.
+1. Update `agent/package.json` in the monorepo to the version you intend to release, without a `v`
+   prefix.
+2. Merge the monorepo change to `main`.
+3. Wait for `Sync Agent Public Repo`, public-repository `CI`, `Auto Release`, and `Release` to
+   complete successfully.
 
-The release workflow now fails if the published GitHub release tag does not match
-`v${agent/package.json version}`. The running agent reports that normalized value on register and
-heartbeat.
+`Auto Release` keeps the GitHub Release as a draft until the image is built and signed. If
+publication fails, rerun the failed `Release` workflow or dispatch it with the draft tag and exact
+commit SHA. If release preparation must be repeated, dispatch `Auto Release` with the exact public
+repository commit SHA. The release workflow also supports manually published releases and rejects
+tags that do not match `v${agent/package.json version}`.
 
 ## Verify the published artifacts
 
