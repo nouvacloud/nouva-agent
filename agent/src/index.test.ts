@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import net from "node:net";
 import agentPackageJson from "../package.json" with { type: "json" };
 import type { DeployAppImageInput } from "./app-build-runtime.js";
 import { buildAndDeployAppWithDependencies } from "./app-build-runtime.js";
@@ -18,6 +19,7 @@ import {
   handleRestoreVolumeBackup,
   handleWipeVolume,
   normalizeRuntimeLogEntries,
+  preflightDatabasePublicPort,
   prepareAppBuildkitRuntime,
   resolveAgentTaskImage,
   resolveAgentWorkLeaseRenewalIntervalMs,
@@ -1181,6 +1183,132 @@ describe("buildDatabaseContainerSpec", () => {
 });
 
 describe("database runtime recreate paths", () => {
+  async function withOccupiedHostPort(callback: (port: number) => Promise<void>): Promise<void> {
+    const listener = net.createServer();
+    await new Promise<void>((resolve) =>
+      listener.listen({ host: "0.0.0.0", port: 0 }, () => resolve())
+    );
+    const address = listener.address();
+    if (!address || typeof address === "string") {
+      listener.close();
+      throw new Error("Failed to allocate test listener");
+    }
+
+    try {
+      await callback(address.port);
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        listener.close((error) => (error ? reject(error) : resolve()))
+      );
+    }
+  }
+
+  test("rejects an occupied public port before Docker mutations", async () => {
+    const docker = createDockerMock();
+
+    await withOccupiedHostPort(async (port) => {
+      await expect(
+        handleDatabaseProvision(docker as never, runtimeConfig, {
+          ...databasePayload,
+          publicAccessEnabled: true,
+          externalHost: "203.0.113.20",
+          externalPort: port,
+        })
+      ).rejects.toThrow(`Public database port ${port} is already occupied`);
+    });
+
+    expect(docker.ensureNetwork).not.toHaveBeenCalled();
+    expect(docker.createVolume).not.toHaveBeenCalled();
+    expect(docker.ensureContainer).not.toHaveBeenCalled();
+  });
+
+  test("checks an occupied public port before removing a database for volume apply", async () => {
+    const docker = createDockerMock();
+
+    await withOccupiedHostPort(async (port) => {
+      await expect(
+        handleApplyDatabaseVolume(docker as never, runtimeConfig, {
+          ...databasePayload,
+          publicAccessEnabled: true,
+          externalHost: "203.0.113.20",
+          externalPort: port,
+          runtimeMetadata: {
+            containerName: "nouva-postgres-prev",
+          },
+        })
+      ).rejects.toThrow(`Public database port ${port} is already occupied`);
+    });
+
+    expect(docker.removeContainer).not.toHaveBeenCalled();
+    expect(docker.removeVolume).not.toHaveBeenCalled();
+  });
+
+  test("checks an occupied public port before removing an attached database volume", async () => {
+    const docker = createDockerMock();
+
+    await withOccupiedHostPort(async (port) => {
+      await expect(
+        handleWipeVolume(docker as never, runtimeConfig, {
+          ...databasePayload,
+          publicAccessEnabled: true,
+          externalHost: "203.0.113.20",
+          externalPort: port,
+          runtimeMetadata: {
+            containerName: "nouva-postgres-prev",
+          },
+        })
+      ).rejects.toThrow(`Public database port ${port} is already occupied`);
+    });
+
+    expect(docker.removeContainer).not.toHaveBeenCalled();
+    expect(docker.removeVolume).not.toHaveBeenCalled();
+  });
+
+  test("allows a running Nouva container for the same service to retain its binding", async () => {
+    const docker = createDockerMock();
+    docker.inspectContainer.mockResolvedValue({
+      Id: "ctr_existing",
+      Name: "nouva-postgres-svc_1",
+      State: { Running: true },
+      Config: {
+        Labels: {
+          "nouva.managed": "true",
+          "nouva.service.id": "svc_1",
+        },
+      },
+      HostConfig: {
+        PortBindings: {
+          "5432/tcp": [{ HostIp: "0.0.0.0", HostPort: "61234" }],
+        },
+      },
+    });
+
+    await expect(
+      preflightDatabasePublicPort(docker as never, {
+        ...databasePayload,
+        publicAccessEnabled: true,
+        externalHost: "203.0.113.20",
+        externalPort: 61234,
+      })
+    ).resolves.toBeUndefined();
+  });
+
+  test("requires a valid port only when public access is enabled", async () => {
+    const docker = createDockerMock();
+
+    await expect(
+      preflightDatabasePublicPort(docker as never, databasePayload)
+    ).resolves.toBeUndefined();
+    await expect(
+      preflightDatabasePublicPort(docker as never, {
+        ...databasePayload,
+        publicAccessEnabled: true,
+        externalPort: null,
+      })
+    ).rejects.toThrow("valid external port between 1 and 65535");
+    expect(docker.inspectContainer).not.toHaveBeenCalled();
+  });
+
   test("applies Docker resource limits during database provision", async () => {
     const docker = createDockerMock();
 

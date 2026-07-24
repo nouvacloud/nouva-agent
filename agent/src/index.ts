@@ -2532,6 +2532,79 @@ function getDatabaseContainerName(payload: DatabaseProvisionPayload): string {
   return `nouva-${payload.variant}-${payload.serviceId.slice(0, 12)}`;
 }
 
+function canExistingContainerOwnPublicPort(
+  inspection: DockerContainerInspection,
+  payload: DatabaseProvisionPayload
+): boolean {
+  if (inspection.State?.Running !== true) {
+    return false;
+  }
+
+  const labels = inspection.Config?.Labels ?? {};
+  if (labels["nouva.managed"] !== "true" || labels["nouva.service.id"] !== payload.serviceId) {
+    return false;
+  }
+
+  const expectedPort = String(payload.externalPort);
+  return Object.values(inspection.HostConfig?.PortBindings ?? {}).some((bindings) =>
+    bindings?.some(
+      (binding) =>
+        binding.HostPort === expectedPort &&
+        (!binding.HostIp || binding.HostIp === "0.0.0.0" || binding.HostIp === "::")
+    )
+  );
+}
+
+async function assertHostPortAvailable(port: number): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const listener = net.createServer();
+    listener.once("error", (error) => {
+      reject(
+        new Error(
+          `Public database port ${port} is already occupied on this server. Remove the host listener or conflicting container, then retry provisioning.`,
+          { cause: error }
+        )
+      );
+    });
+    listener.listen({ host: "0.0.0.0", port, exclusive: true }, () => {
+      listener.close((error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve();
+      });
+    });
+  });
+}
+
+export async function preflightDatabasePublicPort(
+  docker: Pick<DockerApiClient, "inspectContainer">,
+  payload: DatabaseProvisionPayload
+): Promise<void> {
+  if (!payload.publicAccessEnabled) {
+    return;
+  }
+
+  if (
+    !Number.isInteger(payload.externalPort) ||
+    !payload.externalPort ||
+    payload.externalPort < 1 ||
+    payload.externalPort > 65535
+  ) {
+    throw new Error(
+      "Public database access requires a valid external port between 1 and 65535. Update the server agent and retry provisioning."
+    );
+  }
+
+  const existing = await docker.inspectContainer(getDatabaseContainerName(payload));
+  if (existing && canExistingContainerOwnPublicPort(existing, payload)) {
+    return;
+  }
+
+  await assertHostPortAvailable(payload.externalPort);
+}
+
 function getImageRegistryHost(imageReference: string): string | null {
   const trimmed = imageReference.trim();
   if (!trimmed) {
@@ -2650,6 +2723,7 @@ async function deployDatabaseContainer(
   config: Pick<AgentRuntimeConfig, "privateRegistry">,
   payload: DatabaseProvisionPayload
 ) {
+  await preflightDatabasePublicPort(docker, payload);
   const { projectNetwork, resolved, volumeName, containerName, spec } =
     buildDatabaseContainerSpec(payload);
   await docker.ensureNetwork(projectNetwork, {
@@ -2717,6 +2791,8 @@ export async function handleApplyDatabaseVolume(
     runtimeMetadata?: RuntimeMetadata | null;
   }
 ) {
+  await preflightDatabasePublicPort(docker, payload);
+
   const identifier = payload.runtimeMetadata?.containerId ?? payload.runtimeMetadata?.containerName;
   if (identifier) {
     await docker.removeContainer(identifier, true);
@@ -2769,6 +2845,8 @@ export async function handleWipeVolume(
       } satisfies AgentCleanupProof,
     };
   }
+
+  await preflightDatabasePublicPort(docker, payload);
 
   const containerTargets = [identifier, getDatabaseContainerName(payload)]
     .filter((target): target is string => Boolean(target))

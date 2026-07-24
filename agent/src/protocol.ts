@@ -230,6 +230,7 @@ export type AgentCapabilities = {
   resourceIsolationV1?: boolean;
   projectNetworkIsolationV1?: boolean;
   appVolumeRolloutV1?: boolean;
+  publicPortPreflightV1?: boolean;
   [key: string]: boolean | undefined;
 };
 
@@ -663,6 +664,7 @@ export function getDefaultAgentCapabilities(): AgentCapabilities {
     resourceIsolationV1: true,
     projectNetworkIsolationV1: true,
     appVolumeRolloutV1: true,
+    publicPortPreflightV1: true,
   };
 }
 
