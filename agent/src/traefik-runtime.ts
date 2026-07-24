@@ -49,6 +49,8 @@ export interface TraefikRouteConfig {
   providedHostnames?: string[];
   customHostnames?: string[];
   serviceUrl: string;
+  passHostHeader?: boolean;
+  replacePath?: string | null;
 }
 
 export interface TraefikRuntimeFailure {
@@ -188,6 +190,7 @@ function buildTraefikRuntimeConfig(networkName: string): AgentRuntimeConfig {
     localRegistryHost: "127.0.0.1",
     localRegistryPort: 5000,
     localTraefikNetwork: networkName,
+    clientIngressPlaceholderUrl: "https://nouva.sh/_nouva/domain-pending",
     observability: {
       enabled: false,
       organizationId: null,
@@ -492,6 +495,7 @@ export function buildTraefikRouteConfig(route: TraefikRouteConfig): string {
   const customHttpRouterName = `http-custom-${route.fileKey}`;
   const customHttpsRouterName = `https-${route.fileKey}`;
   const redirectMiddlewareName = `redirect-${route.fileKey}`;
+  const replacePathMiddlewareName = `replace-path-${route.fileKey}`;
   const serviceName = `svc-${route.fileKey}`;
   const lines = ["http:", "  routers:"];
 
@@ -513,11 +517,15 @@ export function buildTraefikRouteConfig(route: TraefikRouteConfig): string {
       "        - web",
       "      middlewares:",
       `        - ${redirectMiddlewareName}`,
+      ...(route.replacePath ? [`        - ${replacePathMiddlewareName}`] : []),
       `      service: ${serviceName}`,
       `    ${customHttpsRouterName}:`,
       `      rule: "${quoteHostnames(customHostnames)}"`,
       "      entryPoints:",
       "        - websecure",
+      ...(route.replacePath
+        ? ["      middlewares:", `        - ${replacePathMiddlewareName}`]
+        : []),
       `      service: ${serviceName}`,
       "      tls:",
       "        certResolver: letsencrypt",
@@ -525,7 +533,14 @@ export function buildTraefikRouteConfig(route: TraefikRouteConfig): string {
       `    ${redirectMiddlewareName}:`,
       "      redirectScheme:",
       "        scheme: https",
-      "        permanent: true"
+      "        permanent: true",
+      ...(route.replacePath
+        ? [
+            `    ${replacePathMiddlewareName}:`,
+            "      replacePath:",
+            `        path: ${route.replacePath}`,
+          ]
+        : [])
     );
   }
 
@@ -533,7 +548,7 @@ export function buildTraefikRouteConfig(route: TraefikRouteConfig): string {
     "  services:",
     `    ${serviceName}:`,
     "      loadBalancer:",
-    "        passHostHeader: true",
+    `        passHostHeader: ${route.passHostHeader !== false ? "true" : "false"}`,
     "        servers:",
     `          - url: ${route.serviceUrl}`
   );
@@ -635,7 +650,8 @@ export async function writeTraefikRouteFile(
     providedHostname?: string | null;
     customHostnames?: string[] | null;
   },
-  serviceUrl: string
+  serviceUrl: string,
+  options: { passHostHeader?: boolean; replacePath?: string | null } = {}
 ): Promise<void> {
   const providedHostnames = resolveRoutingHostnames({
     providedHostname: hostnames.providedHostname,
@@ -656,6 +672,7 @@ export async function writeTraefikRouteFile(
       providedHostnames,
       customHostnames,
       serviceUrl,
+      ...options,
     })
   );
 }
@@ -667,9 +684,10 @@ export async function writeLocalTraefikRoute(
     providedHostname?: string | null;
     customHostnames?: string[] | null;
   },
-  serviceUrl: string
+  serviceUrl: string,
+  options: { passHostHeader?: boolean; replacePath?: string | null } = {}
 ): Promise<void> {
-  await writeTraefikRouteFile(paths, serviceId, hostnames, serviceUrl);
+  await writeTraefikRouteFile(paths, serviceId, hostnames, serviceUrl, options);
 }
 
 export async function deleteTraefikRouteFile(

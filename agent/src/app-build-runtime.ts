@@ -22,6 +22,9 @@ export interface DeployAppImageInput {
   languageVersion?: string | null;
   internalPort?: number | null;
   buildDuration?: number | null;
+  providedHostname?: string;
+  customHostnames?: string[];
+  clientIngressConfigHash?: string;
 }
 
 export interface BuildAndDeployAppDependencies {

@@ -148,6 +148,21 @@ describe("traefik-runtime", () => {
     expect(config).not.toContain("redirectScheme:");
   });
 
+  test("should rewrite placeholder requests without preserving the custom Host header", () => {
+    const config = buildTraefikRouteConfig({
+      fileKey: "svc-placeholder",
+      customHostnames: ["pending.example.com"],
+      serviceUrl: "https://nouva.sh",
+      passHostHeader: false,
+      replacePath: "/_nouva/domain-pending",
+    });
+
+    expect(config).toContain("passHostHeader: false");
+    expect(config).toContain("replace-path-svc-placeholder");
+    expect(config).toContain("path: /_nouva/domain-pending");
+    expect(config).toContain("url: https://nouva.sh");
+  });
+
   test("should pin Traefik v3.5 and bind 80, 443, and localhost 8082", async () => {
     tempDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-traefik-"));
     const paths = getTraefikRuntimePaths(tempDir);

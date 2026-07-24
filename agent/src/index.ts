@@ -2087,13 +2087,15 @@ export async function deployAppImageWithDependencies(
   }
 
   const candidateServiceUrl = `http://${containerName}:${appPort}`;
+  const providedHostname = payload.providedHostname ?? `${payload.subdomain}.${APP_DOMAIN}`;
+  const customHostnames = payload.customHostnames ?? [];
   try {
     await dependencies.writeLocalTraefikRoute(
       TRAEFIK_PATHS,
       payload.serviceId,
       {
-        providedHostname: `${payload.subdomain}.${APP_DOMAIN}`,
-        customHostnames: [],
+        providedHostname,
+        customHostnames,
       },
       candidateServiceUrl
     );
@@ -2109,8 +2111,8 @@ export async function deployAppImageWithDependencies(
         TRAEFIK_PATHS,
         payload.serviceId,
         {
-          providedHostname: `${payload.subdomain}.${APP_DOMAIN}`,
-          customHostnames: [],
+          providedHostname,
+          customHostnames,
         },
         previousServiceUrl
       );
@@ -2122,6 +2124,15 @@ export async function deployAppImageWithDependencies(
           rollout
         );
       } catch {}
+    } else if (customHostnames.length > 0) {
+      const placeholderUrl = new URL(config.clientIngressPlaceholderUrl);
+      await dependencies.writeLocalTraefikRoute(
+        TRAEFIK_PATHS,
+        payload.serviceId,
+        { providedHostname: null, customHostnames },
+        placeholderUrl.origin,
+        { passHostHeader: false, replacePath: placeholderUrl.pathname }
+      );
     } else {
       await dependencies.deleteLocalTraefikRoute(TRAEFIK_PATHS, payload.serviceId);
     }
@@ -2188,6 +2199,7 @@ export async function deployAppImageWithDependencies(
       ingressPort: 80,
       internalPort: appPort,
       networkName: projectNetwork,
+      clientIngressConfigHash: payload.clientIngressConfigHash ?? null,
     },
     rollout: buildAppRolloutResult({
       outcome: "committed",
@@ -2952,18 +2964,27 @@ async function handleSyncRouting(
 ) {
   const runtimeMetadata = payload.runtimeMetadata ?? null;
   const containerName = runtimeMetadata?.containerName;
-  if (!containerName) {
-    throw new Error("Missing runtime metadata for routing sync");
-  }
 
   await ensureTraefikRuntime(docker, getTraefikRuntimeInput(config));
 
   const internalPort =
-    typeof runtimeMetadata.internalPort === "number"
+    typeof runtimeMetadata?.internalPort === "number"
       ? runtimeMetadata.internalPort
       : (payload.ingressPort ?? 3000);
 
-  if (!payload.providedHostname && payload.customHostnames.length === 0) {
+  if (!containerName && payload.customHostnames.length > 0) {
+    const placeholderUrl = new URL(config.clientIngressPlaceholderUrl);
+    await writeLocalTraefikRoute(
+      TRAEFIK_PATHS,
+      payload.serviceId,
+      { providedHostname: null, customHostnames: payload.customHostnames },
+      placeholderUrl.origin,
+      { passHostHeader: false, replacePath: placeholderUrl.pathname }
+    );
+  } else if (
+    !containerName ||
+    (!payload.providedHostname && payload.customHostnames.length === 0)
+  ) {
     await deleteLocalTraefikRoute(TRAEFIK_PATHS, payload.serviceId);
   } else {
     await writeLocalTraefikRoute(
@@ -2980,7 +3001,8 @@ async function handleSyncRouting(
     runtimeMetadata: {
       ...runtimeMetadata,
       configVersion:
-        typeof runtimeMetadata.configVersion === "number" ? runtimeMetadata.configVersion + 1 : 1,
+        typeof runtimeMetadata?.configVersion === "number" ? runtimeMetadata.configVersion + 1 : 1,
+      clientIngressConfigHash: payload.clientIngressConfigHash ?? null,
     },
   };
 }

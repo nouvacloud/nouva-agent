@@ -94,6 +94,7 @@ export type RuntimeMetadata = {
   containerName?: string | null;
   networkName?: string | null;
   runtimeInstanceId?: string | null;
+  clientIngressConfigHash?: string | null;
   [key: string]: unknown;
 };
 
@@ -258,6 +259,7 @@ export interface AgentRuntimeConfig {
   localRegistryHost: string;
   localRegistryPort: number;
   localTraefikNetwork: string;
+  clientIngressPlaceholderUrl: string;
   observability: AgentObservabilityConfig;
   privateRegistry?: {
     host: string;
@@ -432,6 +434,9 @@ export interface AppDeployPayload {
   startCommand?: string;
   rollout?: AppRolloutConfig | null;
   runtimeMetadata?: RuntimeMetadata | null;
+  providedHostname?: string;
+  customHostnames?: string[];
+  clientIngressConfigHash?: string;
 }
 
 export interface DeployOnlyPayload {
@@ -448,6 +453,9 @@ export interface DeployOnlyPayload {
   resourceLimits: EffectiveServiceResourceLimits;
   rollout?: AppRolloutConfig | null;
   runtimeMetadata?: RuntimeMetadata | null;
+  providedHostname?: string;
+  customHostnames?: string[];
+  clientIngressConfigHash?: string;
 }
 
 export interface AppVolumeIdentity {
@@ -632,6 +640,7 @@ export interface SyncRoutingPayload {
   providedHostname: string | null;
   customHostnames: string[];
   ingressPort: number;
+  clientIngressConfigHash?: string;
   runtimeMetadata?: RuntimeMetadata | null;
 }
 
@@ -722,6 +731,8 @@ export function getAgentRuntimeConfig(): AgentRuntimeConfig {
     localRegistryHost: process.env.NOUVA_AGENT_LOCAL_REGISTRY_HOST ?? "127.0.0.1",
     localRegistryPort: Number.isFinite(registryPort) ? registryPort : 5000,
     localTraefikNetwork: process.env.NOUVA_AGENT_INGRESS_NETWORK ?? "nouva-ingress",
+    clientIngressPlaceholderUrl:
+      process.env.NOUVA_CLIENT_INGRESS_PLACEHOLDER_URL ?? "https://nouva.sh/_nouva/domain-pending",
     observability: {
       enabled: process.env.NOUVA_OBSERVABILITY_ENABLED === "true",
       organizationId: null,
