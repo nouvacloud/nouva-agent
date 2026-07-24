@@ -251,6 +251,7 @@ function createDockerMock() {
     ensureContainer: mock(async () => "ctr_1"),
     connectNetwork: mock(async () => {}),
     inspectContainer: mock(async () => null),
+    listContainersUsingVolume: mock(async () => []),
     inspectImage: mock(async () => ({ Id: "img_candidate" })),
     inspectVolume: mock(async () => null),
     removeContainer: mock(async () => {}),
@@ -280,7 +281,6 @@ function createRolloutConfig(overrides?: Partial<AppRolloutConfig>): AppRolloutC
       verificationIntervalMs: 1,
       ...overrides?.cutover,
     },
-    blockSharedVolumes: overrides?.blockSharedVolumes ?? true,
   };
 }
 
@@ -985,15 +985,115 @@ describe("deployAppImageWithDependencies", () => {
     expect(docker.removeContainer.mock.calls).toEqual([["nouva-app-svc_1-dep_1", true]]);
   });
 
-  test("fails fast for attached app volumes before touching the live runtime", async () => {
+  test("stops and snapshots a volume app before launching its candidate", async () => {
     const docker = createDockerMock();
+    docker.listContainersUsingVolume
+      .mockImplementationOnce(async () => [
+        {
+          Id: "ctr_live",
+          Name: "/nouva-app-svc_1-live",
+          State: { Running: true },
+        },
+      ])
+      .mockImplementation(async () => []);
+    docker.ensureContainer.mockImplementation(async () => "ctr_candidate");
+    docker.inspectContainer.mockImplementation(async (name: string) => {
+      if (name === "nouva-app-svc_1-dep_1") {
+        return {
+          Id: "ctr_candidate",
+          Name: name,
+          State: { Running: true },
+          NetworkSettings: {
+            Networks: { "nouva-local": { IPAddress: "172.19.0.10" } },
+          },
+        };
+      }
+      return null;
+    });
+
+    let serviceUrl = "http://nouva-app-svc_1-live:8080";
+    const result = await deployAppImageWithDependencies(
+      {
+        ensureBaseRuntime: async () => undefined,
+        checkTcpConnect: mock(async () => true),
+        fetchImpl: mock(async () =>
+          Response.json([
+            {
+              name: "svc-svc_1@file",
+              loadBalancer: { servers: [{ url: serviceUrl }] },
+            },
+          ])
+        ) as typeof fetch,
+        writeLocalTraefikRoute: mock(
+          async (_paths: unknown, _serviceId: string, _hostnames: unknown, nextUrl: string) => {
+            serviceUrl = nextUrl;
+          }
+        ),
+        deleteLocalTraefikRoute: mock(async () => {}),
+      },
+      docker as never,
+      runtimeConfig,
+      {
+        ...appRuntimePayload,
+        rollout: createRolloutConfig(),
+        runtimeMetadata: {
+          containerName: "nouva-app-svc_1-live",
+          internalPort: 8080,
+        },
+      }
+    );
+
+    expect(docker.stopContainer).toHaveBeenCalledWith("nouva-app-svc_1-live");
+    expect(docker.stopContainer.mock.invocationCallOrder[0]).toBeLessThan(
+      docker.ensureContainer.mock.invocationCallOrder[0]!
+    );
+    expect(result.rollout).toEqual(
+      expect.objectContaining({
+        strategy: "single_writer_snapshot_cutover",
+        outcome: "committed",
+      })
+    );
+  });
+
+  test("restarts the previous app without launching a candidate when volume snapshot fails", async () => {
+    const docker = createDockerMock();
+    docker.listContainersUsingVolume.mockImplementationOnce(async () => [
+      {
+        Id: "ctr_live",
+        Name: "/nouva-app-svc_1-live",
+        State: { Running: true },
+      },
+    ]);
+    docker.waitContainer.mockImplementationOnce(async () => 1);
+    docker.containerLogs.mockImplementationOnce(async () => "Insufficient snapshot capacity");
+    docker.inspectContainer.mockImplementation(async (name: string) =>
+      name === "nouva-app-svc_1-live"
+        ? {
+            Id: "ctr_live",
+            Name: name,
+            State: { Running: true },
+            NetworkSettings: {
+              Networks: { "nouva-local": { IPAddress: "172.19.0.9" } },
+            },
+          }
+        : null
+    );
 
     await expect(
       deployAppImageWithDependencies(
         {
           ensureBaseRuntime: async () => undefined,
           checkTcpConnect: mock(async () => true),
-          fetchImpl: mock(async () => Response.json([])) as typeof fetch,
+          fetchImpl: mock(async () =>
+            Response.json([
+              {
+                name: "svc-svc_1@file",
+                loadBalancer: {
+                  servers: [{ url: "http://nouva-app-svc_1-live:8080" }],
+                },
+              },
+            ])
+          ) as typeof fetch,
           writeLocalTraefikRoute: mock(async () => {}),
           deleteLocalTraefikRoute: mock(async () => {}),
         },
@@ -1009,18 +1109,19 @@ describe("deployAppImageWithDependencies", () => {
         }
       )
     ).rejects.toMatchObject({
-      message:
-        "Safe app rollouts are blocked for services with attached volumes until single-writer support exists",
+      message: "Insufficient snapshot capacity",
       result: {
         rollout: expect.objectContaining({
           outcome: "aborted_before_cutover",
           liveRuntimePreserved: true,
+          strategy: "single_writer_snapshot_cutover",
         }),
       },
     });
 
     expect(docker.ensureContainer).not.toHaveBeenCalled();
-    expect(docker.removeContainer).not.toHaveBeenCalled();
+    expect(docker.stopContainer).toHaveBeenCalledWith("nouva-app-svc_1-live");
+    expect(docker.startContainer).toHaveBeenCalledWith("nouva-app-svc_1-live");
   });
 });
 

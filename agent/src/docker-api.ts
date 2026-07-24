@@ -74,6 +74,13 @@ export interface DockerContainerInspection {
       }
     >;
   };
+  Mounts?: Array<{
+    Type?: string;
+    Name?: string;
+    Source?: string;
+    Destination?: string;
+    RW?: boolean;
+  }>;
 }
 
 export interface DockerImageInspection {
@@ -428,6 +435,20 @@ export class DockerApiClient {
       }
       throw error;
     }
+  }
+
+  async listContainersUsingVolume(volumeName: string): Promise<DockerContainerInspection[]> {
+    const filters = encodeURIComponent(JSON.stringify({ volume: [volumeName] }));
+    const containers = await this.request<Array<{ Id?: string }>>(
+      "GET",
+      `/containers/json?all=true&filters=${filters}`
+    );
+    const inspections = await Promise.all(
+      containers.flatMap((container) => (container.Id ? [this.inspectContainer(container.Id)] : []))
+    );
+    return inspections.filter(
+      (inspection): inspection is DockerContainerInspection => inspection !== null
+    );
   }
 
   async updateContainer(

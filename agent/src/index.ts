@@ -108,6 +108,7 @@ const BUILDKIT_ADDRESS = process.env.NOUVA_AGENT_BUILDKIT_ADDR || "tcp://127.0.0
 const DEFAULT_BUILDKIT_PORT = 1234;
 const DEFAULT_AGENT_CONTAINER_NAME = "nouva-agent";
 const DEFAULT_AGENT_IMAGE = "ghcr.io/nouvacloud/nouva-agent:latest";
+const APP_VOLUME_SNAPSHOT_IMAGE = "alpine:3.21";
 const RUNTIME_LOG_SYNC_INTERVAL_MS = Number.parseInt(
   process.env.NOUVA_AGENT_RUNTIME_LOG_SYNC_INTERVAL_MS || "2000",
   10
@@ -480,6 +481,7 @@ function resolveContainerIpAddress(inspection: DockerContainerInspection | null)
 }
 
 function buildAppRolloutResult(input: {
+  strategy?: AppRolloutResult["strategy"];
   outcome: AppRolloutResult["outcome"];
   currentPhase: AppRolloutResult["currentPhase"];
   liveRuntimePreserved: boolean;
@@ -488,7 +490,7 @@ function buildAppRolloutResult(input: {
   candidateContainerName?: string | null;
 }): AppRolloutResult {
   return {
-    strategy: "candidate_ready_cutover",
+    strategy: input.strategy ?? "candidate_ready_cutover",
     outcome: input.outcome,
     currentPhase: input.currentPhase,
     liveRuntimePreserved: input.liveRuntimePreserved,
@@ -1873,7 +1875,7 @@ async function runTaskContainer(
     env?: string[];
     entrypoint?: string[];
     cmd: string[];
-    mounts?: Array<{ source: string; target: string }>;
+    mounts?: Array<{ source: string; target: string; readOnly?: boolean }>;
     timeoutMs?: number;
   }
 ): Promise<{ logs: string }> {
@@ -1894,6 +1896,7 @@ async function runTaskContainer(
         Type: "volume",
         Source: mount.source,
         Target: mount.target,
+        ReadOnly: mount.readOnly === true,
       })),
     },
   });
@@ -2010,6 +2013,121 @@ export function buildAppContainerSpec(
   };
 }
 
+function buildAppVolumeSnapshotName(payload: DeployAppImageInput): string {
+  return `${payload.serviceId}-${payload.deploymentId}.tar.gz`;
+}
+
+async function assertSingleRunningVolumeConsumer(
+  docker: DockerApiClient,
+  volumeName: string,
+  expectedContainer: string | null
+): Promise<void> {
+  const consumers = await docker.listContainersUsingVolume(volumeName);
+  const running = consumers.filter((container) => container.State?.Running);
+  const unexpected = running.filter(
+    (container) =>
+      !expectedContainer ||
+      (container.Id !== expectedContainer &&
+        container.Name.replace(/^\//, "") !== expectedContainer)
+  );
+  if (unexpected.length > 0 || running.length > (expectedContainer ? 1 : 0)) {
+    throw new Error(`Volume ${volumeName} has another running consumer`);
+  }
+}
+
+async function createAppVolumeSnapshot(
+  docker: DockerApiClient,
+  config: AgentRuntimeConfig,
+  payload: DeployAppImageInput
+): Promise<string> {
+  if (!payload.volume) {
+    throw new Error("App volume snapshot requires a volume");
+  }
+  const snapshotName = buildAppVolumeSnapshotName(payload);
+  await docker.createVolume(DATA_VOLUME);
+  await runTaskContainer(docker, config, {
+    name: `nouva-app-snapshot-${payload.deploymentId.slice(0, 12)}`,
+    image: APP_VOLUME_SNAPSHOT_IMAGE,
+    entrypoint: ["/bin/sh", "-ec"],
+    cmd: [
+      [
+        "mkdir -p /agent-data/app-volume-snapshots",
+        `final=/agent-data/app-volume-snapshots/${snapshotName}`,
+        'if [ -s "$final" ]; then exit 0; fi',
+        "required=$(du -sk /source | awk '{print $1}')",
+        "available=$(df -Pk /agent-data | awk 'NR==2 {print $4}')",
+        'if [ "$available" -le "$required" ]; then echo "Insufficient snapshot capacity" >&2; exit 1; fi',
+        'tmp="$final.tmp"',
+        'rm -f "$tmp"',
+        'tar -C /source -czpf "$tmp" .',
+        'test -s "$tmp"',
+        'mv "$tmp" "$final"',
+      ].join("\n"),
+    ],
+    mounts: [
+      { source: payload.volume.volumeName, target: "/source", readOnly: true },
+      { source: DATA_VOLUME, target: "/agent-data" },
+    ],
+  });
+  return snapshotName;
+}
+
+async function restoreAppVolumeSnapshot(
+  docker: DockerApiClient,
+  config: AgentRuntimeConfig,
+  payload: DeployAppImageInput,
+  snapshotName: string
+): Promise<void> {
+  if (!payload.volume) {
+    throw new Error("App volume restore requires a volume");
+  }
+  await runTaskContainer(docker, config, {
+    name: `nouva-app-restore-${payload.deploymentId.slice(0, 12)}`,
+    image: APP_VOLUME_SNAPSHOT_IMAGE,
+    entrypoint: ["/bin/sh", "-ec"],
+    cmd: [
+      [
+        `archive=/agent-data/app-volume-snapshots/${snapshotName}`,
+        'test -s "$archive"',
+        "find /target -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +",
+        'tar -C /target -xzpf "$archive"',
+      ].join("\n"),
+    ],
+    mounts: [
+      { source: payload.volume.volumeName, target: "/target" },
+      { source: DATA_VOLUME, target: "/agent-data", readOnly: true },
+    ],
+  });
+}
+
+async function deleteAppVolumeSnapshot(
+  docker: DockerApiClient,
+  config: AgentRuntimeConfig,
+  payload: DeployAppImageInput,
+  snapshotName: string
+): Promise<void> {
+  await runTaskContainer(docker, config, {
+    name: `nouva-app-snapshot-cleanup-${payload.deploymentId.slice(0, 12)}`,
+    image: APP_VOLUME_SNAPSHOT_IMAGE,
+    entrypoint: ["/bin/sh", "-ec"],
+    cmd: [[`rm -f /agent-data/app-volume-snapshots/${snapshotName}`].join("\n")],
+    mounts: [{ source: DATA_VOLUME, target: "/agent-data" }],
+  });
+}
+
+async function deleteAppVolumeSnapshotBestEffort(
+  docker: DockerApiClient,
+  config: AgentRuntimeConfig,
+  payload: DeployAppImageInput,
+  snapshotName: string
+): Promise<void> {
+  try {
+    await deleteAppVolumeSnapshot(docker, config, payload, snapshotName);
+  } catch (error) {
+    console.warn(`Failed to clean app volume snapshot ${snapshotName}`, error);
+  }
+}
+
 export async function deployAppImageWithDependencies(
   dependencies: DeployAppImageDependencies,
   docker: DockerApiClient,
@@ -2035,29 +2153,71 @@ export async function deployAppImageWithDependencies(
     ? `http://${previousContainer}:${resolveAppRuntimePort(payload.runtimeMetadata, appPort)}`
     : null;
   const rollout = resolveAppRolloutConfig(payload.rollout);
+  const rolloutStrategy = payload.volume
+    ? "single_writer_snapshot_cutover"
+    : "candidate_ready_cutover";
   const dockerLocalImages = isDockerLocalImageStore(config.imageStoreMode);
   let resolvedImageId = payload.imageId ?? null;
+  let snapshotName: string | null = null;
+  let volumeRolloutPhase: AppRolloutResult["currentPhase"] = "quiesce";
 
   if (dockerLocalImages && !resolvedImageId) {
     resolvedImageId = (await docker.inspectImage(payload.imageUrl))?.Id ?? null;
   }
 
-  if (payload.volume && rollout.blockSharedVolumes) {
-    throw new AppRolloutError(
-      "Safe app rollouts are blocked for services with attached volumes until single-writer support exists",
-      buildAppRolloutResult({
-        outcome: "aborted_before_cutover",
-        currentPhase: "candidate",
-        liveRuntimePreserved: Boolean(previousContainer),
-        rollbackCompleted: false,
-        activeContainerName: previousContainer,
-        candidateContainerName: containerName,
-      })
-    );
-  }
-
   if (payload.volume) {
     await docker.createVolume(payload.volume.volumeName);
+    try {
+      await assertSingleRunningVolumeConsumer(docker, payload.volume.volumeName, previousContainer);
+      if (previousContainer) {
+        await docker.stopContainer(previousContainer);
+      }
+      await assertSingleRunningVolumeConsumer(docker, payload.volume.volumeName, null);
+      volumeRolloutPhase = "snapshot";
+      snapshotName = await createAppVolumeSnapshot(docker, config, payload);
+    } catch (error) {
+      let liveRuntimePreserved = false;
+      if (previousContainer) {
+        try {
+          await docker.startContainer(previousContainer);
+          await waitForAppCandidateReadiness(
+            dependencies,
+            docker,
+            previousContainer,
+            resolveAppRuntimePort(payload.runtimeMetadata, appPort),
+            rollout
+          );
+          await dependencies.writeLocalTraefikRoute(
+            TRAEFIK_PATHS,
+            payload.serviceId,
+            {
+              providedHostname: `${payload.subdomain}.${APP_DOMAIN}`,
+              customHostnames: [],
+            },
+            previousServiceUrl!
+          );
+          await waitForLocalTraefikCutover(
+            dependencies.fetchImpl,
+            payload.serviceId,
+            previousServiceUrl!,
+            rollout
+          );
+          liveRuntimePreserved = true;
+        } catch {}
+      }
+      throw new AppRolloutError(
+        error instanceof Error ? error.message : "App volume snapshot failed",
+        buildAppRolloutResult({
+          strategy: rolloutStrategy,
+          outcome: "aborted_before_cutover",
+          currentPhase: volumeRolloutPhase,
+          liveRuntimePreserved,
+          rollbackCompleted: false,
+          activeContainerName: previousContainer,
+          candidateContainerName: containerName,
+        })
+      );
+    }
   }
 
   const containerId = await docker.ensureContainer(spec, true, {
@@ -2067,6 +2227,53 @@ export async function deployAppImageWithDependencies(
     await waitForAppCandidateReadiness(dependencies, docker, containerName, appPort, rollout);
   } catch (error) {
     await docker.removeContainer(containerName, true);
+    if (payload.volume && snapshotName) {
+      try {
+        await assertSingleRunningVolumeConsumer(docker, payload.volume.volumeName, null);
+        await restoreAppVolumeSnapshot(docker, config, payload, snapshotName);
+        if (previousContainer) {
+          await docker.startContainer(previousContainer);
+          await waitForAppCandidateReadiness(
+            dependencies,
+            docker,
+            previousContainer,
+            resolveAppRuntimePort(payload.runtimeMetadata, appPort),
+            rollout
+          );
+          await dependencies.writeLocalTraefikRoute(
+            TRAEFIK_PATHS,
+            payload.serviceId,
+            {
+              providedHostname: `${payload.subdomain}.${APP_DOMAIN}`,
+              customHostnames: [],
+            },
+            previousServiceUrl!
+          );
+          await waitForLocalTraefikCutover(
+            dependencies.fetchImpl,
+            payload.serviceId,
+            previousServiceUrl!,
+            rollout
+          );
+        } else {
+          await dependencies.deleteLocalTraefikRoute(TRAEFIK_PATHS, payload.serviceId);
+        }
+        await deleteAppVolumeSnapshotBestEffort(docker, config, payload, snapshotName);
+      } catch (restoreError) {
+        throw new AppRolloutError(
+          restoreError instanceof Error ? restoreError.message : "App volume restore failed",
+          buildAppRolloutResult({
+            strategy: rolloutStrategy,
+            outcome: "rolled_back",
+            currentPhase: "restore",
+            liveRuntimePreserved: false,
+            rollbackCompleted: false,
+            activeContainerName: null,
+            candidateContainerName: containerName,
+          })
+        );
+      }
+    }
     if (
       dockerLocalImages &&
       !shouldRetainImageReference(payload.runtimeMetadata, payload.imageUrl)
@@ -2076,6 +2283,7 @@ export async function deployAppImageWithDependencies(
     throw new AppRolloutError(
       error instanceof Error ? error.message : "Candidate container failed readiness checks",
       buildAppRolloutResult({
+        strategy: rolloutStrategy,
         outcome: "aborted_before_cutover",
         currentPhase: "ready",
         liveRuntimePreserved: Boolean(previousContainer),
@@ -2106,38 +2314,74 @@ export async function deployAppImageWithDependencies(
       rollout
     );
   } catch (error) {
-    if (previousServiceUrl) {
-      await dependencies.writeLocalTraefikRoute(
-        TRAEFIK_PATHS,
-        payload.serviceId,
-        {
-          providedHostname,
-          customHostnames,
-        },
-        previousServiceUrl
-      );
+    await docker.removeContainer(containerName, true);
+    let rollbackCompleted = true;
+    let liveRuntimePreserved = Boolean(previousContainer);
+    if (payload.volume && snapshotName) {
       try {
+        await assertSingleRunningVolumeConsumer(docker, payload.volume.volumeName, null);
+        await restoreAppVolumeSnapshot(docker, config, payload, snapshotName);
+        if (previousContainer) {
+          await docker.startContainer(previousContainer);
+          await waitForAppCandidateReadiness(
+            dependencies,
+            docker,
+            previousContainer,
+            resolveAppRuntimePort(payload.runtimeMetadata, appPort),
+            rollout
+          );
+        }
+      } catch (restoreError) {
+        throw new AppRolloutError(
+          restoreError instanceof Error ? restoreError.message : "App volume restore failed",
+          buildAppRolloutResult({
+            strategy: rolloutStrategy,
+            outcome: "rolled_back",
+            currentPhase: "restore",
+            liveRuntimePreserved: false,
+            rollbackCompleted: false,
+            activeContainerName: null,
+            candidateContainerName: containerName,
+          })
+        );
+      }
+    }
+    try {
+      if (previousServiceUrl) {
+        await dependencies.writeLocalTraefikRoute(
+          TRAEFIK_PATHS,
+          payload.serviceId,
+          {
+            providedHostname,
+            customHostnames,
+          },
+          previousServiceUrl
+        );
         await waitForLocalTraefikCutover(
           dependencies.fetchImpl,
           payload.serviceId,
           previousServiceUrl,
           rollout
         );
-      } catch {}
-    } else if (customHostnames.length > 0) {
-      const placeholderUrl = new URL(config.clientIngressPlaceholderUrl);
-      await dependencies.writeLocalTraefikRoute(
-        TRAEFIK_PATHS,
-        payload.serviceId,
-        { providedHostname: null, customHostnames },
-        placeholderUrl.origin,
-        { passHostHeader: false, replacePath: placeholderUrl.pathname }
-      );
-    } else {
-      await dependencies.deleteLocalTraefikRoute(TRAEFIK_PATHS, payload.serviceId);
+      } else if (customHostnames.length > 0) {
+        const placeholderUrl = new URL(config.clientIngressPlaceholderUrl);
+        await dependencies.writeLocalTraefikRoute(
+          TRAEFIK_PATHS,
+          payload.serviceId,
+          { providedHostname: null, customHostnames },
+          placeholderUrl.origin,
+          { passHostHeader: false, replacePath: placeholderUrl.pathname }
+        );
+      } else {
+        await dependencies.deleteLocalTraefikRoute(TRAEFIK_PATHS, payload.serviceId);
+      }
+      if (payload.volume && snapshotName) {
+        await deleteAppVolumeSnapshotBestEffort(docker, config, payload, snapshotName);
+      }
+    } catch {
+      rollbackCompleted = false;
+      liveRuntimePreserved = false;
     }
-
-    await docker.removeContainer(containerName, true);
     if (
       dockerLocalImages &&
       !shouldRetainImageReference(payload.runtimeMetadata, payload.imageUrl)
@@ -2148,10 +2392,11 @@ export async function deployAppImageWithDependencies(
     throw new AppRolloutError(
       error instanceof Error ? error.message : "Traefik cutover failed",
       buildAppRolloutResult({
+        strategy: rolloutStrategy,
         outcome: "rolled_back",
         currentPhase: "rollback",
-        liveRuntimePreserved: Boolean(previousContainer),
-        rollbackCompleted: true,
+        liveRuntimePreserved,
+        rollbackCompleted,
         activeContainerName: previousContainer,
         candidateContainerName: containerName,
       })
@@ -2160,6 +2405,9 @@ export async function deployAppImageWithDependencies(
 
   if (previousContainer) {
     await docker.removeContainer(previousContainer, true);
+  }
+  if (payload.volume && snapshotName) {
+    await deleteAppVolumeSnapshotBestEffort(docker, config, payload, snapshotName);
   }
 
   const nextCurrentImage = buildRetainedRuntimeImage({
@@ -2202,6 +2450,7 @@ export async function deployAppImageWithDependencies(
       clientIngressConfigHash: payload.clientIngressConfigHash ?? null,
     },
     rollout: buildAppRolloutResult({
+      strategy: rolloutStrategy,
       outcome: "committed",
       currentPhase: "retire",
       liveRuntimePreserved: false,

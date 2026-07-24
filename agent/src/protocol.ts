@@ -98,8 +98,16 @@ export type RuntimeMetadata = {
   [key: string]: unknown;
 };
 
-export type AppRolloutStrategy = "candidate_ready_cutover";
-export type AppRolloutPhase = "candidate" | "ready" | "cutover" | "retire" | "rollback";
+export type AppRolloutStrategy = "candidate_ready_cutover" | "single_writer_snapshot_cutover";
+export type AppRolloutPhase =
+  | "quiesce"
+  | "snapshot"
+  | "candidate"
+  | "ready"
+  | "cutover"
+  | "retire"
+  | "restore"
+  | "rollback";
 export type AppRolloutOutcome = "committed" | "aborted_before_cutover" | "rolled_back";
 
 export interface AppRolloutReadinessConfig {
@@ -117,7 +125,6 @@ export interface AppRolloutConfig {
   strategy: AppRolloutStrategy;
   readiness: AppRolloutReadinessConfig;
   cutover: AppRolloutCutoverConfig;
-  blockSharedVolumes: boolean;
 }
 
 export interface AppRolloutResult {
@@ -141,7 +148,6 @@ export const DEFAULT_APP_ROLLOUT_CONFIG: AppRolloutConfig = {
     verificationTimeoutMs: 15_000,
     verificationIntervalMs: 250,
   },
-  blockSharedVolumes: true,
 };
 
 export function getDefaultAppRolloutConfig(): AppRolloutConfig {
@@ -149,7 +155,6 @@ export function getDefaultAppRolloutConfig(): AppRolloutConfig {
     strategy: DEFAULT_APP_ROLLOUT_CONFIG.strategy,
     readiness: { ...DEFAULT_APP_ROLLOUT_CONFIG.readiness },
     cutover: { ...DEFAULT_APP_ROLLOUT_CONFIG.cutover },
-    blockSharedVolumes: DEFAULT_APP_ROLLOUT_CONFIG.blockSharedVolumes,
   };
 }
 
@@ -171,7 +176,6 @@ export function resolveAppRolloutConfig(config?: AppRolloutConfig | null): AppRo
         config?.cutover?.verificationIntervalMs ??
         DEFAULT_APP_ROLLOUT_CONFIG.cutover.verificationIntervalMs,
     },
-    blockSharedVolumes: config?.blockSharedVolumes ?? DEFAULT_APP_ROLLOUT_CONFIG.blockSharedVolumes,
   };
 }
 
@@ -225,6 +229,7 @@ export type AgentCapabilities = {
   cleanupProofV1?: boolean;
   resourceIsolationV1?: boolean;
   projectNetworkIsolationV1?: boolean;
+  appVolumeRolloutV1?: boolean;
   [key: string]: boolean | undefined;
 };
 
@@ -657,6 +662,7 @@ export function getDefaultAgentCapabilities(): AgentCapabilities {
     cleanupProofV1: true,
     resourceIsolationV1: true,
     projectNetworkIsolationV1: true,
+    appVolumeRolloutV1: true,
   };
 }
 
