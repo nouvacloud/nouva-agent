@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import agentPackageJson from "../package.json" with { type: "json" };
 import type { DeployAppImageInput } from "./app-build-runtime.js";
 import { buildAndDeployAppWithDependencies } from "./app-build-runtime.js";
+import { DockerApiError } from "./docker-api.js";
 import {
   ApiRequestError,
   buildAppContainerSpec,
@@ -11,8 +12,11 @@ import {
   handleApplyDatabaseVolume,
   handleCreateVolumeBackup,
   handleDatabaseProvision,
+  handleDeleteService,
+  handleDeleteVolume,
   handleRestorePostgresPitr,
   handleRestoreVolumeBackup,
+  handleWipeVolume,
   normalizeRuntimeLogEntries,
   prepareAppBuildkitRuntime,
   resolveAgentTaskImage,
@@ -49,6 +53,7 @@ const runtimeConfig: AgentRuntimeConfig = {
     containerMetrics: true,
     runtimeLogs: true,
     postgresObservability: true,
+    cleanupProofV1: true,
   },
   localRegistryHost: "127.0.0.1",
   localRegistryPort: 5000,
@@ -247,8 +252,10 @@ function createDockerMock() {
     connectNetwork: mock(async () => {}),
     inspectContainer: mock(async () => null),
     inspectImage: mock(async () => ({ Id: "img_candidate" })),
+    inspectVolume: mock(async () => null),
     removeContainer: mock(async () => {}),
     removeImage: mock(async () => {}),
+    removeVolume: mock(async () => {}),
     stopContainer: mock(async () => {}),
     pullImage: mock(async () => {}),
     loadImage: mock(async () => {}),
@@ -370,6 +377,16 @@ describe("agent work mutation errors", () => {
           pathName: "/api/agent/work/work_1/complete",
           status: 404,
           message: "Work item not found",
+        })
+      )
+    ).toBe(true);
+    expect(
+      shouldStopRetryingAgentWorkMutation(
+        new ApiRequestError({
+          method: "POST",
+          pathName: "/api/agent/work/work_1/complete",
+          status: 422,
+          message: "Cleanup verification failed",
         })
       )
     ).toBe(true);
@@ -1465,5 +1482,214 @@ describe("resolveServiceContainerIdentifier", () => {
         },
       })
     ).toBe("nouva-postgres-svc_1");
+  });
+});
+
+describe("verified volume cleanup", () => {
+  test("returns delete proof only after Docker confirms the volume is absent", async () => {
+    const docker = createDockerMock();
+
+    const result = await handleDeleteVolume(docker as never, {
+      projectId: "proj_1",
+      volumeId: "vol_1",
+      volumeName: "nouva-vol-vol_1",
+    });
+
+    expect(docker.removeVolume).toHaveBeenCalledWith("nouva-vol-vol_1", true);
+    expect(docker.inspectVolume).toHaveBeenCalledWith("nouva-vol-vol_1");
+    expect(result.cleanupProof).toEqual({
+      version: 1,
+      kind: "delete_volume",
+      volume: { name: "nouva-vol-vol_1", absent: true },
+    });
+  });
+
+  test("does not emit proof when Docker still reports the volume", async () => {
+    const docker = createDockerMock();
+    docker.inspectVolume.mockResolvedValueOnce({ Name: "nouva-vol-vol_1" });
+
+    await expect(
+      handleDeleteVolume(docker as never, {
+        projectId: "proj_1",
+        volumeId: "vol_1",
+        volumeName: "nouva-vol-vol_1",
+      })
+    ).rejects.toThrow("still exists after cleanup");
+  });
+
+  test("propagates a volume-in-use conflict without inspecting absence", async () => {
+    const docker = createDockerMock();
+    const conflict = new DockerApiError(
+      409,
+      "DELETE",
+      "/v1.51/volumes/nouva-vol-vol_1",
+      "volume is in use"
+    );
+    docker.removeVolume.mockRejectedValueOnce(conflict);
+
+    await expect(
+      handleDeleteVolume(docker as never, {
+        projectId: "proj_1",
+        volumeId: "vol_1",
+        volumeName: "nouva-vol-vol_1",
+      })
+    ).rejects.toBe(conflict);
+    expect(docker.inspectVolume).not.toHaveBeenCalled();
+  });
+});
+
+describe("verified service cleanup", () => {
+  test("retries partial cleanup and removes distinct tags sharing one image ID", async () => {
+    const docker = createDockerMock();
+    const previousImageFailure = new Error("Docker daemon became unavailable");
+    let shouldFailPreviousImage = true;
+    docker.inspectImage.mockResolvedValue(null);
+    docker.removeImage.mockImplementation(async (reference: string) => {
+      if (reference === "nouva-app:previous" && shouldFailPreviousImage) {
+        shouldFailPreviousImage = false;
+        throw previousImageFailure;
+      }
+    });
+    const payload = {
+      projectId: "proj_1",
+      serviceId: "svc_1",
+      serviceName: "app",
+      serviceType: "app" as const,
+      containerName: "nouva-app-svc_1",
+      runtimeMetadata: {
+        imageStoreMode: "docker-local" as const,
+        currentImage: {
+          reference: "nouva-app:current",
+          imageId: "sha256:shared",
+        },
+        previousImage: {
+          reference: "nouva-app:previous",
+          imageId: "sha256:shared",
+        },
+      },
+    };
+
+    await expect(handleDeleteService(docker as never, payload)).rejects.toBe(previousImageFailure);
+    const result = await handleDeleteService(docker as never, payload);
+
+    expect(docker.removeImage.mock.calls.map(([reference]) => reference)).toEqual([
+      "nouva-app:current",
+      "nouva-app:previous",
+      "nouva-app:current",
+      "nouva-app:previous",
+    ]);
+    expect(result.cleanupProof).toEqual({
+      version: 1,
+      kind: "delete_service",
+      container: { identifier: "nouva-app-svc_1", absent: true },
+      retainedImages: [
+        { reference: "nouva-app:current", absent: true },
+        { reference: "nouva-app:previous", absent: true },
+      ],
+    });
+  });
+});
+
+describe("verified volume wipe", () => {
+  test("proves detached volume absence before creating and proving a replacement", async () => {
+    const docker = createDockerMock();
+    const events: string[] = [];
+    let inspectionCount = 0;
+    docker.removeVolume.mockImplementation(async () => {
+      events.push("remove");
+    });
+    docker.inspectVolume.mockImplementation(async () => {
+      inspectionCount += 1;
+      events.push(inspectionCount === 1 ? "inspect-absent" : "inspect-present");
+      return inspectionCount === 1 ? null : { Name: "nouva-vol-vol_1" };
+    });
+    docker.createVolume.mockImplementation(async () => {
+      events.push("create");
+    });
+
+    const result = await handleWipeVolume(
+      docker as never,
+      {},
+      {
+        projectId: "proj_1",
+        volumeId: "vol_1",
+        volumeName: "nouva-vol-vol_1",
+      }
+    );
+
+    expect(events).toEqual(["remove", "inspect-absent", "create", "inspect-present"]);
+    expect(result.cleanupProof).toEqual({
+      version: 1,
+      kind: "wipe_volume",
+      previousContainer: { identifier: null, absent: true },
+      previousVolume: { name: "nouva-vol-vol_1", absent: true },
+      replacementVolume: { name: "nouva-vol-vol_1", present: true },
+    });
+  });
+
+  test("removes a replacement container left by a partial attached wipe before retrying", async () => {
+    const docker = createDockerMock();
+    const deterministicContainerName = "nouva-postgres-svc_1";
+    let replacementContainerPresent = false;
+    let volumePresent = true;
+    let volumeInspectionCount = 0;
+
+    docker.removeContainer.mockImplementation(async (identifier: string) => {
+      if (identifier === deterministicContainerName) {
+        replacementContainerPresent = false;
+      }
+    });
+    docker.inspectContainer.mockImplementation(async (identifier: string) =>
+      identifier === deterministicContainerName && replacementContainerPresent
+        ? ({ Id: "ctr_replacement" } as never)
+        : null
+    );
+    docker.removeVolume.mockImplementation(async () => {
+      if (replacementContainerPresent) {
+        throw new Error("volume is in use");
+      }
+      volumePresent = false;
+    });
+    docker.createVolume.mockImplementation(async () => {
+      volumePresent = true;
+    });
+    docker.ensureContainer.mockImplementation(async () => {
+      replacementContainerPresent = true;
+      return "ctr_replacement";
+    });
+    docker.inspectVolume.mockImplementation(async () => {
+      volumeInspectionCount += 1;
+      if (volumeInspectionCount === 2) {
+        return null;
+      }
+      return volumePresent ? { Name: "nouva-vol-vol_1" } : null;
+    });
+    const payload = {
+      ...databasePayload,
+      runtimeMetadata: {
+        containerId: "ctr_old",
+      },
+    };
+
+    await expect(handleWipeVolume(docker as never, runtimeConfig, payload)).rejects.toThrow(
+      "Replacement Docker volume nouva-vol-vol_1 was not created"
+    );
+    expect(replacementContainerPresent).toBe(true);
+
+    const result = await handleWipeVolume(docker as never, runtimeConfig, payload);
+
+    expect(docker.removeContainer.mock.calls).toEqual([
+      ["ctr_old", true],
+      [deterministicContainerName, true],
+      ["ctr_old", true],
+      [deterministicContainerName, true],
+    ]);
+    expect(result.cleanupProof).toEqual({
+      version: 1,
+      kind: "wipe_volume",
+      previousContainer: { identifier: "ctr_old", absent: true },
+      previousVolume: { name: "nouva-vol-vol_1", absent: true },
+      replacementVolume: { name: "nouva-vol-vol_1", present: true },
+    });
   });
 });

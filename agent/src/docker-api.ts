@@ -13,6 +13,18 @@ interface DockerRequestOptions {
   headers?: Record<string, string>;
 }
 
+export class DockerApiError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly method: HttpMethod,
+    public readonly path: string,
+    public readonly responseBody: string
+  ) {
+    super(`Docker API ${method} ${path} failed (${status}): ${responseBody}`);
+    this.name = "DockerApiError";
+  }
+}
+
 export interface RegistryAuth {
   host: string;
   username: string;
@@ -226,11 +238,7 @@ export class DockerApiClient {
             const raw = Buffer.concat(chunks);
             const statusCode = res.statusCode ?? 500;
             if (statusCode >= 400) {
-              reject(
-                new Error(
-                  `Docker API ${method} ${path} failed (${statusCode}): ${raw.toString("utf8")}`
-                )
-              );
+              reject(new DockerApiError(statusCode, method, path, raw.toString("utf8")));
               return;
             }
 
@@ -366,29 +374,54 @@ export class DockerApiClient {
         "DELETE",
         `/volumes/${encodeURIComponent(name)}${force ? "?force=true" : ""}`
       );
-    } catch {}
+    } catch (error) {
+      if (!(error instanceof DockerApiError && error.status === 404)) {
+        throw error;
+      }
+    }
+  }
+
+  async inspectVolume(name: string): Promise<Record<string, unknown> | null> {
+    try {
+      return await this.request("GET", `/volumes/${encodeURIComponent(name)}`);
+    } catch (error) {
+      if (error instanceof DockerApiError && error.status === 404) {
+        return null;
+      }
+      throw error;
+    }
   }
 
   async inspectContainer(nameOrId: string): Promise<DockerContainerInspection | null> {
     try {
       return await this.request("GET", `/containers/${encodeURIComponent(nameOrId)}/json`);
-    } catch {
-      return null;
+    } catch (error) {
+      if (error instanceof DockerApiError && error.status === 404) {
+        return null;
+      }
+      throw error;
     }
   }
 
   async inspectImage(nameOrId: string): Promise<DockerImageInspection | null> {
     try {
       return await this.request("GET", `/images/${encodeURIComponent(nameOrId)}/json`);
-    } catch {
-      return null;
+    } catch (error) {
+      if (error instanceof DockerApiError && error.status === 404) {
+        return null;
+      }
+      throw error;
     }
   }
 
   async removeContainer(nameOrId: string, force = false): Promise<void> {
     try {
       await this.request("DELETE", `/containers/${encodeURIComponent(nameOrId)}?force=${force}`);
-    } catch {}
+    } catch (error) {
+      if (!(error instanceof DockerApiError && error.status === 404)) {
+        throw error;
+      }
+    }
   }
 
   async removeImage(nameOrId: string, force = false): Promise<void> {
@@ -397,13 +430,21 @@ export class DockerApiClient {
         "DELETE",
         `/images/${encodeURIComponent(nameOrId)}?force=${force ? "1" : "0"}`
       );
-    } catch {}
+    } catch (error) {
+      if (!(error instanceof DockerApiError && error.status === 404)) {
+        throw error;
+      }
+    }
   }
 
   async stopContainer(nameOrId: string): Promise<void> {
     try {
       await this.request("POST", `/containers/${encodeURIComponent(nameOrId)}/stop`);
-    } catch {}
+    } catch (error) {
+      if (!(error instanceof DockerApiError && error.status === 404)) {
+        throw error;
+      }
+    }
   }
 
   async restartContainer(nameOrId: string): Promise<void> {

@@ -436,6 +436,7 @@ describe("agent protocol", () => {
       expect.objectContaining({
         dockerApi: true,
         buildkit: true,
+        cleanupProofV1: true,
         localRegistry: true,
         postgresObservability: true,
         runtimeLogs: false,

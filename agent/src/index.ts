@@ -28,6 +28,7 @@ import { toDockerResourceSettings } from "./docker-resource-limits.js";
 import { collectPostgresObservabilitySamples } from "./postgres-observability.js";
 import {
   type AgentCapabilities,
+  type AgentCleanupProof,
   type AgentHeartbeatResponse,
   type AgentImageStoreMode,
   type AgentLeaseRenewRequest,
@@ -350,19 +351,35 @@ async function removeRetainedRuntimeImages(
   docker: Pick<DockerApiClient, "removeImage">,
   runtimeMetadata: RuntimeMetadata | null | undefined
 ): Promise<void> {
-  const images = [
-    resolveCurrentRuntimeImage(runtimeMetadata),
-    resolvePreviousRuntimeImage(runtimeMetadata),
-  ];
+  for (const reference of getRetainedRuntimeImageReferences(runtimeMetadata)) {
+    await docker.removeImage(reference, true);
+  }
+}
 
-  const removed = new Set<string>();
-  for (const image of images) {
-    const key = image?.imageId ?? image?.reference ?? null;
-    if (!key || removed.has(key)) {
-      continue;
-    }
-    removed.add(key);
-    await removeRetainedRuntimeImage(docker, image);
+function getRetainedRuntimeImageReferences(
+  runtimeMetadata: RuntimeMetadata | null | undefined
+): string[] {
+  return [resolveCurrentRuntimeImage(runtimeMetadata), resolvePreviousRuntimeImage(runtimeMetadata)]
+    .map((image) => image?.reference ?? image?.imageId ?? null)
+    .filter((reference): reference is string => Boolean(reference))
+    .filter((reference, index, references) => references.indexOf(reference) === index);
+}
+
+async function verifyContainerAbsent(
+  docker: Pick<DockerApiClient, "inspectContainer">,
+  identifier: string | null
+): Promise<void> {
+  if (identifier && (await docker.inspectContainer(identifier))) {
+    throw new Error(`Docker container ${identifier} still exists after cleanup`);
+  }
+}
+
+async function verifyVolumeAbsent(
+  docker: Pick<DockerApiClient, "inspectVolume">,
+  volumeName: string
+): Promise<void> {
+  if (await docker.inspectVolume(volumeName)) {
+    throw new Error(`Docker volume ${volumeName} still exists after cleanup`);
   }
 }
 
@@ -1064,7 +1081,10 @@ export class ApiRequestError extends Error {
 }
 
 export function shouldStopRetryingAgentWorkMutation(error: unknown): boolean {
-  return error instanceof ApiRequestError && (error.status === 404 || error.status === 409);
+  return (
+    error instanceof ApiRequestError &&
+    (error.status === 404 || error.status === 409 || error.status === 422)
+  );
 }
 
 async function apiRequest<T>(
@@ -2406,36 +2426,78 @@ export async function handleApplyDatabaseVolume(
   return await handleDatabaseProvision(docker, config, payload);
 }
 
-async function handleDeleteVolume(docker: DockerApiClient, payload: DeleteVolumePayload) {
-  await docker.removeVolume(getManagedVolumeName(payload), true);
+export async function handleDeleteVolume(docker: DockerApiClient, payload: DeleteVolumePayload) {
+  const volumeName = getManagedVolumeName(payload);
+  await docker.removeVolume(volumeName, true);
+  await verifyVolumeAbsent(docker, volumeName);
   return {
     volumeName: payload.volumeName,
+    cleanupProof: {
+      version: 1,
+      kind: "delete_volume",
+      volume: { name: volumeName, absent: true },
+    } satisfies AgentCleanupProof,
   };
 }
 
-async function handleWipeVolume(
+export async function handleWipeVolume(
   docker: DockerApiClient,
   config: Pick<AgentRuntimeConfig, "privateRegistry">,
   payload:
     | DeleteVolumePayload
     | (DatabaseProvisionPayload & { runtimeMetadata?: RuntimeMetadata | null })
 ) {
+  const volumeName = getManagedVolumeName(payload);
+  const identifier = isAttachedDatabaseVolumePayload(payload)
+    ? (payload.runtimeMetadata?.containerId ?? payload.runtimeMetadata?.containerName ?? null)
+    : null;
+
   if (!isAttachedDatabaseVolumePayload(payload)) {
-    await docker.removeVolume(getManagedVolumeName(payload), true);
-    await docker.createVolume(payload.volumeName);
+    await docker.removeVolume(volumeName, true);
+    await verifyVolumeAbsent(docker, volumeName);
+    await docker.createVolume(volumeName);
+    if (!(await docker.inspectVolume(volumeName))) {
+      throw new Error(`Replacement Docker volume ${volumeName} was not created`);
+    }
     return {
       volumeName: payload.volumeName,
+      cleanupProof: {
+        version: 1,
+        kind: "wipe_volume",
+        previousContainer: { identifier: null, absent: true },
+        previousVolume: { name: volumeName, absent: true },
+        replacementVolume: { name: volumeName, present: true },
+      } satisfies AgentCleanupProof,
     };
   }
 
-  const identifier = payload.runtimeMetadata?.containerId ?? payload.runtimeMetadata?.containerName;
-  if (identifier) {
-    await docker.removeContainer(identifier, true);
+  const containerTargets = [identifier, getDatabaseContainerName(payload)]
+    .filter((target): target is string => Boolean(target))
+    .filter((target, index, targets) => targets.indexOf(target) === index);
+  for (const target of containerTargets) {
+    await docker.removeContainer(target, true);
+  }
+  for (const target of containerTargets) {
+    await verifyContainerAbsent(docker, target);
   }
 
-  await docker.removeVolume(getManagedVolumeName(payload), true);
+  await docker.removeVolume(volumeName, true);
+  await verifyVolumeAbsent(docker, volumeName);
 
-  return await handleDatabaseProvision(docker, config, payload);
+  const result = await handleDatabaseProvision(docker, config, payload);
+  if (!(await docker.inspectVolume(volumeName))) {
+    throw new Error(`Replacement Docker volume ${volumeName} was not created`);
+  }
+  return {
+    ...result,
+    cleanupProof: {
+      version: 1,
+      kind: "wipe_volume",
+      previousContainer: { identifier, absent: true },
+      previousVolume: { name: volumeName, absent: true },
+      replacementVolume: { name: volumeName, present: true },
+    } satisfies AgentCleanupProof,
+  };
 }
 
 async function handleCreateArchiveBackup(
@@ -2804,14 +2866,25 @@ async function handleRemove(
   };
 }
 
-async function handleDeleteService(docker: DockerApiClient, payload: RemoveServicePayload) {
+export async function handleDeleteService(docker: DockerApiClient, payload: RemoveServicePayload) {
   const identifier = resolveServiceContainerIdentifier(payload);
   if (identifier) {
     await docker.removeContainer(identifier, true);
   }
 
-  if (payload.serviceType === "app" && payload.runtimeMetadata?.imageStoreMode === "docker-local") {
+  const retainedImageReferences =
+    payload.serviceType === "app" && payload.runtimeMetadata?.imageStoreMode === "docker-local"
+      ? getRetainedRuntimeImageReferences(payload.runtimeMetadata)
+      : [];
+  if (retainedImageReferences.length > 0) {
     await removeRetainedRuntimeImages(docker, payload.runtimeMetadata);
+  }
+
+  await verifyContainerAbsent(docker, identifier);
+  for (const reference of retainedImageReferences) {
+    if (await docker.inspectImage(reference)) {
+      throw new Error(`Docker image ${reference} still exists after cleanup`);
+    }
   }
 
   await deleteLocalTraefikRoute(TRAEFIK_PATHS, payload.serviceId);
@@ -2822,6 +2895,15 @@ async function handleDeleteService(docker: DockerApiClient, payload: RemoveServi
       containerId: payload.runtimeMetadata?.containerId ?? null,
       containerName: identifier,
     },
+    cleanupProof: {
+      version: 1,
+      kind: "delete_service",
+      container: { identifier, absent: true },
+      retainedImages: retainedImageReferences.map((reference) => ({
+        reference,
+        absent: true as const,
+      })),
+    } satisfies AgentCleanupProof,
   };
 }
 

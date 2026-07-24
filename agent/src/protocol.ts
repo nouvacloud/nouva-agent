@@ -32,6 +32,26 @@ export const AGENT_WORK_KINDS = [
 ] as const;
 export type AgentWorkKind = (typeof AGENT_WORK_KINDS)[number];
 
+export type AgentCleanupProof =
+  | {
+      version: 1;
+      kind: "delete_service";
+      container: { identifier: string | null; absent: true };
+      retainedImages: Array<{ reference: string; absent: true }>;
+    }
+  | {
+      version: 1;
+      kind: "delete_volume";
+      volume: { name: string; absent: true };
+    }
+  | {
+      version: 1;
+      kind: "wipe_volume";
+      previousContainer: { identifier: string | null; absent: true };
+      previousVolume: { name: string; absent: true };
+      replacementVolume: { name: string; present: true };
+    };
+
 export type ServerValidationCheck = {
   key: string;
   label: string;
@@ -193,6 +213,7 @@ export type AgentCapabilities = {
   containerMetrics?: boolean;
   runtimeLogs?: boolean;
   postgresObservability?: boolean;
+  cleanupProofV1?: boolean;
   [key: string]: boolean | undefined;
 };
 
@@ -607,6 +628,7 @@ export function getDefaultAgentCapabilities(): AgentCapabilities {
     containerMetrics: true,
     runtimeLogs: true,
     postgresObservability: true,
+    cleanupProofV1: true,
   };
 }
 

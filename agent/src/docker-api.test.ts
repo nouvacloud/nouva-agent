@@ -1,5 +1,5 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import { DockerApiClient, parseDockerLogBuffer } from "./docker-api.js";
+import { DockerApiClient, DockerApiError, parseDockerLogBuffer } from "./docker-api.js";
 
 function encodeFrame(streamType: 1 | 2, payload: string): Buffer {
   const content = Buffer.from(payload, "utf8");
@@ -100,6 +100,97 @@ describe("DockerApiClient.createContainer", () => {
         Cmd: ["echo ok"],
       })
     );
+
+    requestSpy.mockRestore();
+  });
+});
+
+describe("DockerApiClient cleanup semantics", () => {
+  test("treats 404 as idempotent absence for every cleanup mutation", async () => {
+    const DockerApiClientCtor = DockerApiClient as unknown as {
+      new (apiVersion: string): DockerApiClient;
+    };
+    const client = new DockerApiClientCtor("v1.51");
+    const requestSpy = spyOn(client, "request");
+    const cleanupMutations = [
+      () => client.removeVolume("missing"),
+      () => client.removeContainer("missing"),
+      () => client.removeImage("missing"),
+      () => client.stopContainer("missing"),
+    ];
+
+    for (const cleanupMutation of cleanupMutations) {
+      requestSpy.mockRejectedValueOnce(
+        new DockerApiError(404, "DELETE", "/v1.51/resources/missing", "not found")
+      );
+      await expect(cleanupMutation()).resolves.toBeUndefined();
+    }
+
+    requestSpy.mockRestore();
+  });
+
+  test("propagates permission, conflict, daemon, and transport mutation failures", async () => {
+    const DockerApiClientCtor = DockerApiClient as unknown as {
+      new (apiVersion: string): DockerApiClient;
+    };
+    const client = new DockerApiClientCtor("v1.51");
+    const requestSpy = spyOn(client, "request");
+    const failures = [
+      {
+        error: new DockerApiError(403, "DELETE", "/v1.51/containers/blocked", "permission denied"),
+        mutation: () => client.removeContainer("blocked"),
+      },
+      {
+        error: new DockerApiError(409, "DELETE", "/v1.51/volumes/in-use", "volume is in use"),
+        mutation: () => client.removeVolume("in-use"),
+      },
+      {
+        error: new DockerApiError(500, "DELETE", "/v1.51/images/broken", "daemon unavailable"),
+        mutation: () => client.removeImage("broken"),
+      },
+      {
+        error: Object.assign(new Error("connect ECONNREFUSED /var/run/docker.sock"), {
+          code: "ECONNREFUSED",
+        }),
+        mutation: () => client.stopContainer("offline"),
+      },
+    ];
+
+    for (const { error, mutation } of failures) {
+      requestSpy.mockRejectedValueOnce(error);
+      await expect(mutation()).rejects.toBe(error);
+    }
+
+    requestSpy.mockRestore();
+  });
+
+  test("returns null only for 404 inspections and propagates other failures", async () => {
+    const DockerApiClientCtor = DockerApiClient as unknown as {
+      new (apiVersion: string): DockerApiClient;
+    };
+    const client = new DockerApiClientCtor("v1.51");
+    const requestSpy = spyOn(client, "request");
+    const inspections = [
+      () => client.inspectVolume("missing"),
+      () => client.inspectContainer("missing"),
+      () => client.inspectImage("missing"),
+    ];
+
+    for (const inspection of inspections) {
+      requestSpy.mockRejectedValueOnce(
+        new DockerApiError(404, "GET", "/v1.51/resources/missing", "not found")
+      );
+      await expect(inspection()).resolves.toBeNull();
+    }
+
+    const daemonError = new DockerApiError(
+      500,
+      "GET",
+      "/v1.51/volumes/broken",
+      "daemon unavailable"
+    );
+    requestSpy.mockRejectedValueOnce(daemonError);
+    await expect(client.inspectVolume("broken")).rejects.toBe(daemonError);
 
     requestSpy.mockRestore();
   });
