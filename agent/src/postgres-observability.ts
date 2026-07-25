@@ -176,48 +176,107 @@ export async function fetchPostgresObservabilitySnapshot(
   });
 
   try {
-    const extensionRows = await sql<{ extname: string }[]>`
+    const [walRow] = await sql<
+      {
+        archive_mode: string;
+        archive_command: string;
+        archived_count: number | string;
+        failed_count: number | string;
+        last_archived_wal: string | null;
+        last_archived_time: Date | string | null;
+        last_failed_wal: string | null;
+        last_failed_time: Date | string | null;
+      }[]
+    >`
+      SELECT current_setting('archive_mode') AS archive_mode,
+        current_setting('archive_command') AS archive_command,
+        archived_count, failed_count, last_archived_wal, last_archived_time,
+        last_failed_wal, last_failed_time
+      FROM pg_stat_archiver
+    `;
+    const collectedAt = new Date().toISOString();
+    const archiveCommandConfigured = Boolean(
+      walRow?.archive_command && walRow.archive_command !== "(disabled)"
+    );
+    const lastArchivedAt = walRow?.last_archived_time
+      ? new Date(walRow.last_archived_time).toISOString()
+      : null;
+    const lastFailedAt = walRow?.last_failed_time
+      ? new Date(walRow.last_failed_time).toISOString()
+      : null;
+    const archiveEnabled = walRow?.archive_mode === "on" || walRow?.archive_mode === "always";
+    const failureIsLatest =
+      lastFailedAt !== null &&
+      (lastArchivedAt === null || Date.parse(lastFailedAt) > Date.parse(lastArchivedAt));
+    const walArchiveHealth = {
+      status:
+        !archiveEnabled || !archiveCommandConfigured || failureIsLatest
+          ? ("degraded" as const)
+          : lastArchivedAt === null
+            ? ("pending" as const)
+            : ("healthy" as const),
+      archiveMode: walRow?.archive_mode ?? "unknown",
+      archiveCommandConfigured,
+      archivedCount: toNonNegativeInteger(walRow?.archived_count),
+      failedCount: toNonNegativeInteger(walRow?.failed_count),
+      lastArchivedWal: walRow?.last_archived_wal ?? null,
+      lastArchivedAt,
+      lastFailedWal: walRow?.last_failed_wal ?? null,
+      lastFailedAt,
+      reason: !archiveEnabled
+        ? "WAL archiving is disabled"
+        : !archiveCommandConfigured
+          ? "WAL archive command is not configured"
+          : failureIsLatest
+            ? "The latest WAL archive attempt failed"
+            : lastArchivedAt === null
+              ? "Waiting for the first archived WAL segment"
+              : null,
+    };
+
+    try {
+      const extensionRows = await sql<{ extname: string }[]>`
       SELECT extname
       FROM pg_extension
       WHERE extname IN ('pg_stat_monitor', 'pg_cron')
     `;
-    const extensionSet = new Set(extensionRows.map((row) => row.extname));
+      const extensionSet = new Set(extensionRows.map((row) => row.extname));
 
-    const columnRows = await sql<{ column_name: string }[]>`
+      const columnRows = await sql<{ column_name: string }[]>`
       SELECT column_name
       FROM information_schema.columns
       WHERE table_name = 'pg_stat_monitor'
       ORDER BY ordinal_position
     `;
 
-    if (columnRows.length === 0) {
-      throw new Error(
-        "pg_stat_monitor is not available for this service yet. Restart the service to apply extension bootstrap."
-      );
-    }
+      if (columnRows.length === 0) {
+        throw new Error(
+          "pg_stat_monitor is not available for this service yet. Restart the service to apply extension bootstrap."
+        );
+      }
 
-    const columns = new Set(columnRows.map((row) => row.column_name));
-    const totalTimeColumn = pickPgStatMonitorColumn(columns, ["total_time", "total_exec_time"]);
-    const meanTimeColumn = pickPgStatMonitorColumn(columns, ["mean_time", "mean_exec_time"]);
-    const minTimeColumn = pickPgStatMonitorColumn(columns, ["min_time", "min_exec_time"]);
-    const maxTimeColumn = pickPgStatMonitorColumn(columns, ["max_time", "max_exec_time"]);
+      const columns = new Set(columnRows.map((row) => row.column_name));
+      const totalTimeColumn = pickPgStatMonitorColumn(columns, ["total_time", "total_exec_time"]);
+      const meanTimeColumn = pickPgStatMonitorColumn(columns, ["mean_time", "mean_exec_time"]);
+      const minTimeColumn = pickPgStatMonitorColumn(columns, ["min_time", "min_exec_time"]);
+      const maxTimeColumn = pickPgStatMonitorColumn(columns, ["max_time", "max_exec_time"]);
 
-    if (
-      !columns.has("queryid") ||
-      !columns.has("calls") ||
-      !columns.has("rows") ||
-      !columns.has("query")
-    ) {
-      throw new Error("pg_stat_monitor does not expose the expected columns for query insights.");
-    }
+      if (
+        !columns.has("queryid") ||
+        !columns.has("calls") ||
+        !columns.has("rows") ||
+        !columns.has("query")
+      ) {
+        throw new Error("pg_stat_monitor does not expose the expected columns for query insights.");
+      }
 
-    if (!totalTimeColumn || !meanTimeColumn || !minTimeColumn || !maxTimeColumn) {
-      throw new Error(
-        "pg_stat_monitor timing columns are unavailable for this PostgreSQL version."
-      );
-    }
+      if (!totalTimeColumn || !meanTimeColumn || !minTimeColumn || !maxTimeColumn) {
+        throw new Error(
+          "pg_stat_monitor timing columns are unavailable for this PostgreSQL version."
+        );
+      }
 
-    const slowQueriesSql = `
+      const slowQueriesSql = `
       SELECT
         queryid::text AS query_id,
         calls::bigint::text AS calls,
@@ -234,8 +293,8 @@ export async function fetchPostgresObservabilitySnapshot(
       LIMIT ${MAX_SLOW_QUERY_COUNT}
     `;
 
-    const slowQueryRows = await sql.unsafe<SlowQueryRow[]>(slowQueriesSql);
-    const activeSessionRows = await sql<{ state: string; count: number }[]>`
+      const slowQueryRows = await sql.unsafe<SlowQueryRow[]>(slowQueriesSql);
+      const activeSessionRows = await sql<{ state: string; count: number }[]>`
       SELECT
         COALESCE(state, 'unknown') AS state,
         count(*)::int AS count
@@ -245,27 +304,39 @@ export async function fetchPostgresObservabilitySnapshot(
       ORDER BY count(*) DESC
     `;
 
-    return {
-      collectedAt: new Date().toISOString(),
-      extensionStatus: {
-        pgStatMonitor: extensionSet.has("pg_stat_monitor"),
-        pgCron: extensionSet.has("pg_cron"),
-      },
-      activeSessions: activeSessionRows.map((row) => ({
-        state: row.state,
-        count: toNonNegativeInteger(row.count),
-      })),
-      slowQueries: slowQueryRows.map((row) => ({
-        queryId: row.query_id ?? "unknown",
-        query: row.query_text ?? "",
-        calls: toNonNegativeInteger(row.calls),
-        rows: toNonNegativeInteger(row.rows),
-        totalTimeMs: toFiniteNumber(row.total_time_ms),
-        meanTimeMs: toFiniteNumber(row.mean_time_ms),
-        minTimeMs: toFiniteNumber(row.min_time_ms),
-        maxTimeMs: toFiniteNumber(row.max_time_ms),
-      })),
-    };
+      return {
+        collectedAt,
+        extensionStatus: {
+          pgStatMonitor: extensionSet.has("pg_stat_monitor"),
+          pgCron: extensionSet.has("pg_cron"),
+        },
+        activeSessions: activeSessionRows.map((row) => ({
+          state: row.state,
+          count: toNonNegativeInteger(row.count),
+        })),
+        slowQueries: slowQueryRows.map((row) => ({
+          queryId: row.query_id ?? "unknown",
+          query: row.query_text ?? "",
+          calls: toNonNegativeInteger(row.calls),
+          rows: toNonNegativeInteger(row.rows),
+          totalTimeMs: toFiniteNumber(row.total_time_ms),
+          meanTimeMs: toFiniteNumber(row.mean_time_ms),
+          minTimeMs: toFiniteNumber(row.min_time_ms),
+          maxTimeMs: toFiniteNumber(row.max_time_ms),
+        })),
+        walArchiveHealth,
+      };
+    } catch (error) {
+      return {
+        collectedAt,
+        extensionStatus: { pgStatMonitor: false, pgCron: false },
+        activeSessions: [],
+        slowQueries: [],
+        walArchiveHealth,
+        queryInsightsError:
+          error instanceof Error ? error.message : "Failed to collect PostgreSQL query insights",
+      };
+    }
   } finally {
     await sql.end({ timeout: 5 });
   }
@@ -330,10 +401,11 @@ export async function collectPostgresObservabilitySamplesWithDependencies(
         serviceId: target.serviceId,
         collectedAt: snapshot.collectedAt,
         status: "success",
-        errorMessage: null,
         extensionStatus: snapshot.extensionStatus,
         activeSessions: snapshot.activeSessions,
         slowQueries: snapshot.slowQueries,
+        walArchiveHealth: snapshot.walArchiveHealth,
+        errorMessage: snapshot.queryInsightsError ?? null,
       });
     } catch (error) {
       samples.push(

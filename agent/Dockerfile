@@ -20,6 +20,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     gzip \
     rclone \
+    redis-server \
+    redis-tools \
     tar \
     && rm -rf /var/lib/apt/lists/*
 

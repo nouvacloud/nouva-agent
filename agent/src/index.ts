@@ -1876,6 +1876,7 @@ async function runTaskContainer(
     entrypoint?: string[];
     cmd: string[];
     mounts?: Array<{ source: string; target: string; readOnly?: boolean }>;
+    networkMode?: string;
     timeoutMs?: number;
   }
 ): Promise<{ logs: string }> {
@@ -1892,6 +1893,7 @@ async function runTaskContainer(
     labels: buildLabels({ kind: "task" }),
     hostConfig: {
       AutoRemove: false,
+      NetworkMode: options.networkMode,
       Mounts: options.mounts?.map((mount) => ({
         Type: "volume",
         Source: mount.source,
@@ -2882,6 +2884,14 @@ async function handleCreateArchiveBackup(
   config: Pick<AgentRuntimeConfig, "privateRegistry">,
   payload: CreateVolumeBackupPayload
 ) {
+  if (payload.variant !== "redis") {
+    throw new Error(`Database-native snapshot backups do not support ${payload.variant}`);
+  }
+  const runtimeContainer =
+    payload.runtimeMetadata?.containerId ?? payload.runtimeMetadata?.containerName ?? null;
+  if (!runtimeContainer) {
+    throw new Error("Redis backup requires the authoritative live runtime container identity");
+  }
   const remoteExpression = buildArchiveRemoteExpression(payload.destination.verifyTls);
   const agentTaskImage = await resolveAgentTaskImage(docker);
   const { logs } = await runTaskContainer(docker, config, {
@@ -2893,8 +2903,10 @@ async function handleCreateArchiveBackup(
       `BACKUP_ENDPOINT=${payload.destination.endpoint}`,
       `BACKUP_REGION=${payload.destination.region}`,
       `BACKUP_BUCKET=${payload.destination.bucket}`,
-      `BACKUP_OBJECT_KEY=archives/v1/projects/${payload.projectId}/volumes/${payload.volumeId}/backups/${payload.backupId}.tar.gz`,
+      `BACKUP_OBJECT_KEY=${payload.expectedObjectKey}`,
       `BACKUP_FORCE_PATH_STYLE=${payload.destination.pathStyle ? "true" : "false"}`,
+      `NOUVA_BACKUP_ID=${payload.backupId}`,
+      `REDISCLI_AUTH=${payload.credentials?.password ?? ""}`,
     ],
     cmd: [
       "sh",
@@ -2902,20 +2914,75 @@ async function handleCreateArchiveBackup(
       [
         "set -eu",
         `remote="${remoteExpression}"`,
-        'archive="/tmp/nouva-volume-backup.tar.gz"',
-        'tar -C /source -czf "$archive" .',
+        "work_dir=$(mktemp -d)",
+        'archive="/tmp/nouva-redis-backup.tar.gz"',
+        'download="/tmp/nouva-redis-backup.download.tar.gz"',
+        "uploaded=0",
+        'cleanup() { rm -rf "$work_dir" "$archive" "$download"; if [ "$uploaded" = 1 ] && [ "$' +
+          '{NOUVA_BACKUP_OK:-0}" != 1 ]; then rclone deletefile "$remote" || true; fi; }',
+        "trap cleanup EXIT INT TERM",
+        "appendonly=$(redis-cli -h 127.0.0.1 --raw CONFIG GET appendonly | tail -n 1)",
+        "save=$(redis-cli -h 127.0.0.1 --raw CONFIG GET save | tail -n 1)",
+        'if [ "$appendonly" = yes ] && [ -n "$save" ]; then source_mode=mixed; elif [ "$appendonly" = yes ]; then source_mode=aof; elif [ -n "$save" ]; then source_mode=rdb; else source_mode=none; fi',
+        'redis-cli -h 127.0.0.1 --rdb "$work_dir/dump.rdb"',
+        'redis-check-rdb "$work_dir/dump.rdb"',
+        'printf \'{"version":1,"backupId":"%s","artifactFormat":"redis-rdb-tar-v1","sourceMode":"%s"}\\n\' "$NOUVA_BACKUP_ID" "$source_mode" > "$work_dir/manifest.json"',
+        'tar -C "$work_dir" -czf "$archive" manifest.json dump.rdb',
+        'sha256=$(sha256sum "$archive" | cut -d " " -f 1)',
         'size_bytes=$(wc -c < "$archive" | tr -d " ")',
         'rclone copyto "$archive" "$remote"',
+        "uploaded=1",
+        'rclone copyto "$remote" "$download"',
+        'download_sha256=$(sha256sum "$download" | cut -d " " -f 1)',
+        'test "$sha256" = "$download_sha256"',
+        'mkdir "$work_dir/restore"',
+        'tar -C "$work_dir/restore" -xzf "$download"',
+        'test "$(find "$work_dir/restore" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d " ")" = 2',
+        'redis-check-rdb "$work_dir/restore/dump.rdb"',
+        'redis-server --port 6380 --bind 127.0.0.1 --dir "$work_dir/restore" --dbfilename dump.rdb --appendonly no --daemonize yes',
+        'for i in $(seq 1 30); do redis-cli -h 127.0.0.1 -p 6380 PING | grep -q PONG && break; sleep 1; test "$i" -lt 30; done',
+        'if [ "$source_mode" = aof ] || [ "$source_mode" = mixed ]; then redis-cli -h 127.0.0.1 -p 6380 CONFIG SET appendonly yes >/dev/null; redis-cli -h 127.0.0.1 -p 6380 BGREWRITEAOF >/dev/null; for i in $(seq 1 60); do state=$(redis-cli -h 127.0.0.1 -p 6380 --raw INFO persistence | sed -n "s/^aof_rewrite_in_progress:\\([01]\\).*/\\1/p" | tr -d "\\r"); test "$state" = 0 && break; sleep 1; test "$i" -lt 60; done; fi',
+        "redis-cli -h 127.0.0.1 -p 6380 SHUTDOWN NOSAVE || true",
         'printf "NOUVA_SIZE_BYTES:%s\\n" "$size_bytes"',
+        'printf "NOUVA_SHA256:%s\\n" "$sha256"',
+        'printf "NOUVA_REDIS_SOURCE_MODE:%s\\n" "$source_mode"',
+        "NOUVA_BACKUP_OK=1",
       ].join("\n"),
     ],
-    mounts: [{ source: payload.volumeName, target: "/source" }],
+    networkMode: `container:${runtimeContainer}`,
     timeoutMs: 30 * 60_000,
   });
 
   const sizeBytes = Number.parseInt(extractPrefixedLogLine(logs, "NOUVA_SIZE_BYTES:") ?? "", 10);
+  const artifactSha256 = extractPrefixedLogLine(logs, "NOUVA_SHA256:");
+  const sourceMode = extractPrefixedLogLine(logs, "NOUVA_REDIS_SOURCE_MODE:") as
+    | "rdb"
+    | "aof"
+    | "mixed"
+    | "none"
+    | null;
+  if (!artifactSha256 || !sourceMode || !Number.isFinite(sizeBytes)) {
+    throw new Error("Redis backup did not return complete integrity evidence");
+  }
   return {
-    sizeBytes: Number.isFinite(sizeBytes) ? sizeBytes : null,
+    sizeBytes,
+    objectKey: payload.expectedObjectKey,
+    artifactFormat: payload.artifactFormat,
+    artifactSha256,
+    verifiedAt: new Date().toISOString(),
+    integrityProof: {
+      version: 1,
+      engine: "redis",
+      backupId: payload.backupId,
+      objectKey: payload.expectedObjectKey,
+      artifactFormat: "redis-rdb-tar-v1",
+      artifactSha256,
+      sizeBytes,
+      sourceMode,
+      redisCheckRdb: true,
+      uploadChecksumVerified: true,
+      isolatedRestoreVerified: true,
+    },
   };
 }
 
@@ -2954,6 +3021,9 @@ async function handleRestoreArchiveBackup(
   config: Pick<AgentRuntimeConfig, "privateRegistry">,
   payload: RestoreVolumeBackupPayload
 ) {
+  if (payload.variant !== "redis") {
+    throw new Error(`Database-native snapshot restore does not support ${payload.variant}`);
+  }
   const remoteExpression = buildArchiveRemoteExpression(payload.destination.verifyTls);
   const agentTaskImage = await resolveAgentTaskImage(docker);
   await docker.createVolume(payload.targetVolumeName);
@@ -2966,8 +3036,9 @@ async function handleRestoreArchiveBackup(
       `BACKUP_ENDPOINT=${payload.destination.endpoint}`,
       `BACKUP_REGION=${payload.destination.region}`,
       `BACKUP_BUCKET=${payload.destination.bucket}`,
-      `BACKUP_OBJECT_KEY=archives/v1/projects/${payload.projectId}/volumes/${payload.sourceVolumeId}/backups/${payload.backupId}.tar.gz`,
+      `BACKUP_OBJECT_KEY=${payload.expectedObjectKey}`,
       `BACKUP_FORCE_PATH_STYLE=${payload.destination.pathStyle ? "true" : "false"}`,
+      `EXPECTED_SHA256=${payload.artifactSha256 ?? ""}`,
     ],
     cmd: [
       "sh",
@@ -2978,7 +3049,18 @@ async function handleRestoreArchiveBackup(
         'archive="/tmp/nouva-volume-backup.tar.gz"',
         "mkdir -p /target",
         'rclone copyto "$remote" "$archive"',
-        'tar -C /target -xzf "$archive"',
+        'actual_sha256=$(sha256sum "$archive" | cut -d " " -f 1)',
+        'if [ -n "$EXPECTED_SHA256" ]; then test "$actual_sha256" = "$EXPECTED_SHA256"; fi',
+        'entries=$(tar -tzf "$archive")',
+        'test "$(printf "%s\\n" "$entries" | wc -l | tr -d " ")" = 2',
+        'printf "%s\\n" "$entries" | grep -qx "manifest.json"',
+        'printf "%s\\n" "$entries" | grep -qx "dump.rdb"',
+        'tar -C /target -xzf "$archive" dump.rdb',
+        "redis-check-rdb /target/dump.rdb",
+        "redis-server --port 6380 --bind 127.0.0.1 --dir /target --dbfilename dump.rdb --appendonly no --daemonize yes",
+        'for i in $(seq 1 30); do redis-cli -h 127.0.0.1 -p 6380 PING | grep -q PONG && break; sleep 1; test "$i" -lt 30; done',
+        "redis-cli -h 127.0.0.1 -p 6380 SHUTDOWN NOSAVE || true",
+        'printf "NOUVA_SHA256:%s\\n" "$actual_sha256"',
       ].join("\n"),
     ],
     mounts: [{ source: payload.targetVolumeName, target: "/target" }],
@@ -2987,6 +3069,16 @@ async function handleRestoreArchiveBackup(
 
   return {
     volumeName: payload.targetVolumeName,
+    verifiedAt: new Date().toISOString(),
+    restoreProof: {
+      version: 1,
+      backupId: payload.backupId,
+      targetVolumeId: payload.targetVolumeId,
+      targetVolumeName: payload.targetVolumeName,
+      validationMethod: "redis-load-ping",
+      isolatedDatabaseStarted: true,
+      validatedAt: new Date().toISOString(),
+    },
   };
 }
 
@@ -3019,6 +3111,7 @@ async function handleCreatePgBackrestBackup(
     "    exit 1",
     "  fi",
     "fi",
+    'pgbackrest --stanza="$PGBACKREST_STANZA" --log-level-console=info check',
     'pgbackrest --stanza="$PGBACKREST_STANZA" --type="$NOUVA_PGBACKREST_BACKUP_TYPE" --annotation="nouva-backup-id=$NOUVA_BACKUP_ID" --log-level-console=info backup',
     'if info_output=$(pgbackrest --stanza="$PGBACKREST_STANZA" --output=json info 2>/dev/null); then',
     `  printf 'NOUVA_PGBACKREST_INFO:%s\\n' "$(printf '%s' "$info_output" | tr -d '\\n')"`,
@@ -3046,6 +3139,25 @@ async function handleCreatePgBackrestBackup(
     payload.backupId,
     payload.pgbackrestType ?? "full"
   );
+  if (!selected?.label || !selected.stopAt) {
+    throw new Error("pgBackRest backup metadata did not contain the created backup set");
+  }
+  await runTaskContainer(docker, config, {
+    name: `nouva-pgbackrest-verify-${payload.backupId.slice(0, 12)}`,
+    image: spec.image,
+    env: Object.entries(spec.envVars).map(([key, value]) => `${key}=${value}`),
+    entrypoint: ["sh", "-c"],
+    cmd: [
+      [
+        "set -eu",
+        "if [ -x /nouva/generate_config.sh ]; then /nouva/generate_config.sh; fi",
+        `pgbackrest --stanza="$PGBACKREST_STANZA" --set="${selected.label}" --log-level-console=info verify`,
+      ].join("\n"),
+    ],
+    mounts: [{ source: payload.volumeName, target: spec.mountPath }],
+    timeoutMs: 30 * 60_000,
+  });
+  const verifiedAt = new Date().toISOString();
 
   return {
     completedAt: selected?.stopAt ?? null,
@@ -3055,6 +3167,23 @@ async function handleCreatePgBackrestBackup(
         : (payload.pgbackrestType ?? null),
     pgbackrestSet: selected?.label ?? null,
     activePgbackrestSets: entries.map((entry) => entry.label),
+    objectKey: payload.expectedObjectKey,
+    artifactFormat: payload.artifactFormat,
+    verifiedAt,
+    integrityProof: {
+      version: 1,
+      engine: "pgbackrest",
+      backupId: payload.backupId,
+      objectKey: payload.expectedObjectKey,
+      artifactFormat: "pgbackrest-v1",
+      pgbackrestSet: selected.label,
+      requiredWalStart: null,
+      requiredWalStop: null,
+      repositorySizeBytes: null,
+      databaseSizeBytes: null,
+      completedAt: selected.stopAt,
+      verifiedAt,
+    },
   };
 }
 
@@ -3096,6 +3225,16 @@ async function handleRestorePgBackrestBackup(
 
   return {
     volumeName: payload.targetVolumeName,
+    verifiedAt: new Date().toISOString(),
+    restoreProof: {
+      version: 1,
+      backupId: payload.backupId,
+      targetVolumeId: payload.targetVolumeId,
+      targetVolumeName: payload.targetVolumeName,
+      validationMethod: "postgres-startup-sql-read",
+      isolatedDatabaseStarted: true,
+      validatedAt: new Date().toISOString(),
+    },
   };
 }
 

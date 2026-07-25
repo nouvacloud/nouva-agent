@@ -145,6 +145,8 @@ const databasePayload: DatabaseProvisionPayload = {
   },
   containerArgs: [],
   dataPath: "/var/lib/postgresql/pgdata",
+  expectedObjectKey: "pgbackrest/proj_1/vol_1",
+  artifactFormat: "pgbackrest-v1",
   internalPort: 5432,
   storageSizeGb: 20,
   externalHost: null,
@@ -212,6 +214,11 @@ const snapshotBackupPayload: CreateVolumeBackupPayload = {
     pgbackrestSpoolPath: null,
     pgbackrestCipherPass: null,
   },
+  runtimeMetadata: { containerName: "nouva-redis-svc_redis_1" },
+  credentials: { password: "redis-secret" },
+  expectedObjectKey:
+    "archives/v1/projects/proj_1/volumes/vol_redis_1/backups/backup_redis_1.tar.gz",
+  artifactFormat: "redis-rdb-tar-v1",
 };
 
 const pgBackrestRestorePayload: RestoreVolumeBackupPayload = {
@@ -239,6 +246,8 @@ const pgBackrestRestorePayload: RestoreVolumeBackupPayload = {
   },
   containerArgs: [],
   dataPath: "/var/lib/postgresql/pgdata",
+  expectedObjectKey: "pgbackrest/proj_1/vol_1",
+  artifactFormat: "pgbackrest-v1",
 };
 
 const originalAgentImage = process.env.NOUVA_AGENT_IMAGE;
@@ -1468,10 +1477,13 @@ describe("database runtime recreate paths", () => {
 
   test("initializes a missing pgBackRest stanza before the first backup", async () => {
     const docker = createDockerMock();
+    docker.containerLogs.mockResolvedValueOnce(
+      'NOUVA_PGBACKREST_INFO:[{"backup":[{"label":"20260325-000000F","type":"full","timestamp":{"stop":1774396800},"annotation":{"nouva-backup-id":"backup_1"}}]}]'
+    );
 
     await handleCreateVolumeBackup(docker as never, runtimeConfig, pgBackrestBackupPayload);
 
-    expect(docker.createContainer).toHaveBeenCalledTimes(1);
+    expect(docker.createContainer).toHaveBeenCalledTimes(2);
     expect(docker.createContainer.mock.calls[0]?.[0]).toEqual(
       expect.objectContaining({
         image: "postgres:17",
@@ -1567,6 +1579,9 @@ describe("database runtime recreate paths", () => {
 
   test("uses the installed agent image for snapshot backup tasks", async () => {
     const docker = createDockerMock();
+    docker.containerLogs.mockResolvedValue(
+      "NOUVA_SIZE_BYTES:42\nNOUVA_SHA256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nNOUVA_REDIS_SOURCE_MODE:rdb"
+    );
     process.env.NOUVA_AGENT_IMAGE = "registry.nouva.sh/nouva/nouva-agent:v0.4.10";
 
     await handleCreateVolumeBackup(
@@ -1590,14 +1605,10 @@ describe("database runtime recreate paths", () => {
     expect(docker.createContainer.mock.calls[0]?.[0]).toEqual(
       expect.objectContaining({
         image: "registry.nouva.sh/nouva/nouva-agent:v0.4.10",
-        cmd: [expect.any(String), expect.any(String), expect.any(String)],
+        cmd: ["sh", "-c", expect.stringContaining("redis-cli -h 127.0.0.1 --rdb")],
         hostConfig: expect.objectContaining({
-          Mounts: [
-            expect.objectContaining({
-              Source: "nouva-vol-vol_redis_1",
-              Target: "/source",
-            }),
-          ],
+          Mounts: undefined,
+          NetworkMode: "container:nouva-redis-svc_redis_1",
         }),
       })
     );

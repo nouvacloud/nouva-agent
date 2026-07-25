@@ -231,6 +231,7 @@ export type AgentCapabilities = {
   projectNetworkIsolationV1?: boolean;
   appVolumeRolloutV1?: boolean;
   publicPortPreflightV1?: boolean;
+  backupIntegrityV1?: boolean;
   [key: string]: boolean | undefined;
 };
 
@@ -365,11 +366,26 @@ export type PostgresObservabilitySlowQuery = {
 
 export type PostgresObservabilitySampleStatus = "success" | "error";
 
+export type PostgresWalArchiveHealth = {
+  status: "healthy" | "degraded" | "pending" | "unknown";
+  archiveMode: string;
+  archiveCommandConfigured: boolean;
+  archivedCount: number;
+  failedCount: number;
+  lastArchivedWal: string | null;
+  lastArchivedAt: string | null;
+  lastFailedWal: string | null;
+  lastFailedAt: string | null;
+  reason: string | null;
+};
+
 export interface PostgresObservabilitySnapshot {
   collectedAt: string;
   extensionStatus: PostgresObservabilityExtensionStatus;
   activeSessions: PostgresObservabilityActiveSession[];
   slowQueries: PostgresObservabilitySlowQuery[];
+  walArchiveHealth: PostgresWalArchiveHealth;
+  queryInsightsError?: string | null;
 }
 
 export interface AgentPostgresObservabilitySample {
@@ -380,6 +396,7 @@ export interface AgentPostgresObservabilitySample {
   extensionStatus?: PostgresObservabilityExtensionStatus | null;
   activeSessions?: PostgresObservabilityActiveSession[] | null;
   slowQueries?: PostgresObservabilitySlowQuery[] | null;
+  walArchiveHealth?: PostgresWalArchiveHealth | null;
 }
 
 export interface AgentPostgresObservabilityRequest {
@@ -564,6 +581,8 @@ export interface CreateVolumeBackupPayload extends QueuedVolumeBackupPayloadBase
   containerArgs?: string[];
   dataPath?: string;
   credentials?: Record<string, string>;
+  expectedObjectKey: string;
+  artifactFormat: "redis-rdb-tar-v1" | "pgbackrest-v1";
 }
 
 export interface DeleteVolumeBackupPayload extends QueuedVolumeBackupPayloadBase {
@@ -595,6 +614,48 @@ export interface RestoreVolumeBackupPayload {
   containerArgs?: string[];
   dataPath?: string;
   credentials?: Record<string, string>;
+  expectedObjectKey: string;
+  artifactFormat: "redis-rdb-tar-v1" | "pgbackrest-v1";
+  artifactSha256?: string | null;
+}
+
+export type AgentBackupIntegrityProofV1 =
+  | {
+      version: 1;
+      engine: "redis";
+      backupId: string;
+      objectKey: string;
+      artifactFormat: "redis-rdb-tar-v1";
+      artifactSha256: string;
+      sizeBytes: number;
+      sourceMode: "rdb" | "aof" | "mixed" | "none";
+      redisCheckRdb: true;
+      uploadChecksumVerified: true;
+      isolatedRestoreVerified: true;
+    }
+  | {
+      version: 1;
+      engine: "pgbackrest";
+      backupId: string;
+      objectKey: string;
+      artifactFormat: "pgbackrest-v1";
+      pgbackrestSet: string;
+      requiredWalStart: string | null;
+      requiredWalStop: string | null;
+      repositorySizeBytes: number | null;
+      databaseSizeBytes: number | null;
+      completedAt: string;
+      verifiedAt: string;
+    };
+
+export interface AgentBackupRestoreProofV1 {
+  version: 1;
+  backupId: string;
+  targetVolumeId: string;
+  targetVolumeName: string;
+  validationMethod: "redis-load-ping" | "postgres-startup-sql-read";
+  isolatedDatabaseStarted: true;
+  validatedAt: string;
 }
 
 export interface RestorePostgresPitrPayload extends Omit<DatabaseProvisionPayload, "variant"> {
@@ -665,6 +726,7 @@ export function getDefaultAgentCapabilities(): AgentCapabilities {
     projectNetworkIsolationV1: true,
     appVolumeRolloutV1: true,
     publicPortPreflightV1: true,
+    backupIntegrityV1: true,
   };
 }
 
