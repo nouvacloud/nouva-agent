@@ -1,0 +1,35 @@
+services:
+  loki:
+    image: grafana/loki:3.5.0
+    command:
+      - -config.file=/etc/loki/loki.yaml
+    ports:
+      - "127.0.0.1:3100:3100"
+    volumes:
+      - ./loki.yaml:/etc/loki/loki.yaml:ro
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    ports:
+      - "127.0.0.1:8474:8474"
+
+  alloy:
+    image: grafana/alloy:v1.17.1
+    command:
+      - run
+      - --stability.level=experimental
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    depends_on:
+      - loki
+      - toxiproxy
+    ports:
+      - "127.0.0.1:12345:12345"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./alloy.config:/etc/alloy/config.alloy:ro
+      - alloy-data:/var/lib/alloy
+
+volumes:
+  alloy-data:

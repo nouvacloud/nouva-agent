@@ -41,7 +41,6 @@ const runtimeConfig: AgentRuntimeConfig = {
     localTraefik: true,
     hostMetrics: true,
     containerMetrics: true,
-    runtimeLogs: true,
     postgresObservability: true,
   },
   localRegistryHost: "127.0.0.1",
@@ -50,7 +49,7 @@ const runtimeConfig: AgentRuntimeConfig = {
   observability: {
     enabled: false,
     organizationId: null,
-    alloyImage: "grafana/alloy:latest",
+    alloyImage: "grafana/alloy:v1.17.1",
     scrapeIntervalSeconds: 30,
     collectorScope: "services_and_traefik",
     noneLabelValue: "__none__",

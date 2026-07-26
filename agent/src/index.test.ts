@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { readFile } from "node:fs/promises";
 import net from "node:net";
 import agentPackageJson from "../package.json" with { type: "json" };
 import type { DeployAppImageInput } from "./app-build-runtime.js";
@@ -18,7 +19,6 @@ import {
   handleRestorePostgresPitr,
   handleRestoreVolumeBackup,
   handleWipeVolume,
-  normalizeRuntimeLogEntries,
   preflightDatabasePublicPort,
   prepareAppBuildkitRuntime,
   resolveAgentTaskImage,
@@ -53,7 +53,6 @@ const runtimeConfig: AgentRuntimeConfig = {
     localTraefik: true,
     hostMetrics: true,
     containerMetrics: true,
-    runtimeLogs: true,
     postgresObservability: true,
     cleanupProofV1: true,
   },
@@ -63,7 +62,7 @@ const runtimeConfig: AgentRuntimeConfig = {
   observability: {
     enabled: false,
     organizationId: null,
-    alloyImage: "grafana/alloy:latest",
+    alloyImage: "grafana/alloy:v1.17.1",
     scrapeIntervalSeconds: 30,
     collectorScope: "services_and_traefik",
     noneLabelValue: "__none__",
@@ -1672,62 +1671,12 @@ describe("database runtime recreate paths", () => {
     expect(docker.pullImage).toHaveBeenCalledWith("postgres:17", undefined);
   });
 
-  test("deduplicates overlapping runtime log batches and preserves offsets", () => {
-    const firstPass = normalizeRuntimeLogEntries(
-      [
-        {
-          type: "stdout",
-          timestamp: "2026-03-26T12:00:00.000Z",
-          line: "starting postgres",
-        },
-        {
-          type: "stderr",
-          timestamp: "2026-03-26T12:00:01.000Z",
-          line: "database system is ready to accept connections",
-        },
-      ],
-      null
-    );
+  test("does not contain the removed custom runtime log collector loop", async () => {
+    const source = await readFile(new URL("./index.ts", import.meta.url), "utf8");
 
-    expect(firstPass.entries).toEqual([
-      {
-        type: "stdout",
-        line: "starting postgres",
-        timestamp: Date.parse("2026-03-26T12:00:00.000Z"),
-        offset: 0,
-      },
-      {
-        type: "stderr",
-        line: "database system is ready to accept connections",
-        timestamp: Date.parse("2026-03-26T12:00:01.000Z"),
-        offset: 1,
-      },
-    ]);
-
-    const secondPass = normalizeRuntimeLogEntries(
-      [
-        {
-          type: "stderr",
-          timestamp: "2026-03-26T12:00:01.000Z",
-          line: "database system is ready to accept connections",
-        },
-        {
-          type: "stdout",
-          timestamp: "2026-03-26T12:00:02.000Z",
-          line: "checkpoint complete",
-        },
-      ],
-      firstPass.cursor
-    );
-
-    expect(secondPass.entries).toEqual([
-      {
-        type: "stdout",
-        line: "checkpoint complete",
-        timestamp: Date.parse("2026-03-26T12:00:02.000Z"),
-        offset: 2,
-      },
-    ]);
+    expect(source).not.toContain("/api/agent/logs/runtime");
+    expect(source).not.toContain("syncRuntimeLogs");
+    expect(source).not.toContain("NOUVA_AGENT_RUNTIME_LOG_SYNC_INTERVAL_MS");
   });
 });
 

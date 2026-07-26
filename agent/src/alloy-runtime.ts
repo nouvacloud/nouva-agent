@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { access, mkdir, rename, writeFile } from "node:fs/promises";
+import { access, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import type {
@@ -15,10 +15,12 @@ export const ALLOY_HTTP_HOST = "127.0.0.1";
 export const ALLOY_HTTP_PORT = 12345;
 export const ALLOY_CONFIG_HASH_LABEL = "nouva.alloy.config-sha";
 export const ALLOY_ROLE_LABEL = "nouva.alloy.role";
+export const ALLOY_VALIDATION_CONTAINER_NAME = "nouva-alloy-config-validation";
 
 const AGENT_DATA_DIR_IN_CONTAINER = "/var/lib/nouva-agent";
 const ALLOY_ROOT_DIR_IN_CONTAINER = `${AGENT_DATA_DIR_IN_CONTAINER}/alloy`;
 const ALLOY_CONFIG_PATH_IN_CONTAINER = `${ALLOY_ROOT_DIR_IN_CONTAINER}/config.alloy`;
+const ALLOY_CANDIDATE_CONFIG_PATH_IN_CONTAINER = `${ALLOY_CONFIG_PATH_IN_CONTAINER}.candidate`;
 const ALLOY_DATA_DIR_IN_CONTAINER = `${ALLOY_ROOT_DIR_IN_CONTAINER}/data`;
 const DOCKER_SOCKET = "/var/run/docker.sock";
 const OBSERVABILITY_NONE_LABEL_VALUE = "__none__";
@@ -37,6 +39,7 @@ export interface AlloyRuntimePaths {
   rootDir: string;
   dataDir: string;
   configPath: string;
+  candidateConfigPath: string;
 }
 
 export interface AlloyRuntimeInput {
@@ -355,6 +358,7 @@ export function getAlloyRuntimePaths(dataDir: string): AlloyRuntimePaths {
     rootDir,
     dataDir: path.join(rootDir, "data"),
     configPath: path.join(rootDir, "config.alloy"),
+    candidateConfigPath: path.join(rootDir, "config.alloy.candidate"),
   };
 }
 
@@ -400,8 +404,25 @@ ${dockerRules.join("\n")}
 }`,
     `loki.write "nouva" {
   endpoint {
-    url          = ${quote(`${input.apiUrl}/api/agent/observability/logs`)}
-    bearer_token = ${quote(input.agentToken)}
+    url                 = ${quote(`${input.apiUrl}/api/agent/observability/logs`)}
+    bearer_token        = ${quote(input.agentToken)}
+    min_backoff_period  = "1s"
+    max_backoff_period  = "1m"
+    max_backoff_retries = 10080
+    retry_on_http_429   = true
+
+    queue_config {
+      capacity          = "64MiB"
+      min_shards        = 1
+      block_on_overflow = true
+      drain_timeout     = "1m"
+    }
+  }
+
+  wal {
+    enabled         = true
+    max_segment_age = "168h"
+    drain_timeout   = "1m"
   }
 }`,
     `prometheus.exporter.cadvisor "nouva" {
@@ -651,6 +672,7 @@ export function buildAlloyContainerSpec(
     image: input.config.observability.alloyImage,
     cmd: [
       "run",
+      "--stability.level=experimental",
       `--server.http.listen-addr=0.0.0.0:${ALLOY_HTTP_PORT}`,
       `--storage.path=${ALLOY_DATA_DIR_IN_CONTAINER}`,
       ALLOY_CONFIG_PATH_IN_CONTAINER,
@@ -691,10 +713,58 @@ export function buildAlloyContainerSpec(
   };
 }
 
+export function buildAlloyValidationContainerSpec(input: AlloyRuntimeInput): DockerContainerSpec {
+  return {
+    name: ALLOY_VALIDATION_CONTAINER_NAME,
+    image: input.config.observability.alloyImage,
+    cmd: ["validate", "--stability.level=experimental", ALLOY_CANDIDATE_CONFIG_PATH_IN_CONTAINER],
+    hostConfig: {
+      Binds: [`${input.dataVolume}:${AGENT_DATA_DIR_IN_CONTAINER}:ro`],
+      NetworkMode: "none",
+    },
+  };
+}
+
+async function validateAlloyConfig(
+  docker: Pick<
+    DockerApiClient,
+    | "containerLogs"
+    | "createContainer"
+    | "pullImage"
+    | "removeContainer"
+    | "startContainer"
+    | "waitContainer"
+  >,
+  input: AlloyRuntimeInput
+): Promise<void> {
+  await docker.pullImage(input.config.observability.alloyImage);
+  await docker.removeContainer(ALLOY_VALIDATION_CONTAINER_NAME, true);
+
+  const containerId = await docker.createContainer(buildAlloyValidationContainerSpec(input));
+  try {
+    await docker.startContainer(containerId);
+    const status = await docker.waitContainer(containerId, 60_000);
+    if (status !== 0) {
+      const logs = await docker.containerLogs(containerId);
+      throw new Error(`Alloy configuration validation failed${logs ? `: ${logs}` : ""}`);
+    }
+  } finally {
+    await docker.removeContainer(ALLOY_VALIDATION_CONTAINER_NAME, true);
+  }
+}
+
 export async function reconcileAlloyRuntime(
   docker: Pick<
     DockerApiClient,
-    "ensureContainer" | "inspectContainer" | "removeContainer" | "inspectImage"
+    | "containerLogs"
+    | "createContainer"
+    | "ensureContainer"
+    | "inspectContainer"
+    | "inspectImage"
+    | "pullImage"
+    | "removeContainer"
+    | "startContainer"
+    | "waitContainer"
   >,
   input: AlloyRuntimeInput,
   options: ReconcileAlloyRuntimeOptions = {}
@@ -711,20 +781,32 @@ export async function reconcileAlloyRuntime(
   await ensureAlloyState(paths);
 
   const configContents = renderAlloyConfig(input);
-  await writeManagedFile(paths.configPath, configContents);
-
   const stateHash = createAlloyStateHash(configContents);
   const inspection = await docker.inspectContainer(ALLOY_CONTAINER_NAME);
-  if (isAlloyContainerCurrent(inspection, input, stateHash)) {
+  const configPresent = await access(paths.configPath, fsConstants.R_OK)
+    .then(() => true)
+    .catch(() => false);
+  if (configPresent && isAlloyContainerCurrent(inspection, input, stateHash)) {
     lastAlloyRuntimeFailure = null;
     return;
+  }
+
+  await writeManagedFile(paths.candidateConfigPath, configContents);
+  try {
+    await validateAlloyConfig(docker, input);
+    await rename(paths.candidateConfigPath, paths.configPath);
+  } catch (error) {
+    await rm(paths.candidateConfigPath, { force: true });
+    throw error;
   }
 
   if (inspection) {
     await docker.removeContainer(ALLOY_CONTAINER_NAME, true);
   }
 
-  await docker.ensureContainer(buildAlloyContainerSpec(input, { stateHash }));
+  await docker.ensureContainer(buildAlloyContainerSpec(input, { stateHash }), false, {
+    pull: false,
+  });
   await waitForAlloyHealth(docker, input, paths, {
     fetchImpl: options.fetchImpl ?? fetch,
     timeoutMs: options.timeoutMs ?? 30_000,
@@ -736,7 +818,15 @@ export async function reconcileAlloyRuntime(
 export async function ensureAlloyRuntime(
   docker: Pick<
     DockerApiClient,
-    "ensureContainer" | "inspectContainer" | "removeContainer" | "inspectImage"
+    | "containerLogs"
+    | "createContainer"
+    | "ensureContainer"
+    | "inspectContainer"
+    | "inspectImage"
+    | "pullImage"
+    | "removeContainer"
+    | "startContainer"
+    | "waitContainer"
   >,
   input: AlloyRuntimeInput,
   deps: AlloyRuntimeDeps = {}

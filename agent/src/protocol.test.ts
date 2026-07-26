@@ -439,7 +439,6 @@ describe("agent protocol", () => {
         cleanupProofV1: true,
         localRegistry: true,
         postgresObservability: true,
-        runtimeLogs: false,
         alloyObservability: true,
       })
     );
@@ -459,20 +458,20 @@ describe("agent protocol", () => {
     expect(config.observability.organizationId).toBe("org_123");
   });
 
-  test("flips runtime log capability off when observability is enabled", () => {
+  test("advertises Alloy observability without the removed runtime log capability", () => {
     const capabilities = resolveAgentCapabilities({
       ...getAgentRuntimeConfig(),
       observability: {
         enabled: true,
         organizationId: "org_123",
-        alloyImage: "grafana/alloy:latest",
+        alloyImage: "grafana/alloy:v1.17.1",
         scrapeIntervalSeconds: 30,
         collectorScope: "services_and_traefik",
         noneLabelValue: "__none__",
       },
     });
 
-    expect(capabilities.runtimeLogs).toBe(false);
+    expect("runtimeLogs" in capabilities).toBe(false);
     expect(capabilities.alloyObservability).toBe(true);
   });
 

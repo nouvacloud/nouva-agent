@@ -224,7 +224,6 @@ export type AgentCapabilities = {
   alloyObservability?: boolean;
   hostMetrics?: boolean;
   containerMetrics?: boolean;
-  runtimeLogs?: boolean;
   postgresObservability?: boolean;
   cleanupProofV1?: boolean;
   resourceIsolationV1?: boolean;
@@ -407,22 +406,6 @@ export interface AgentPostgresObservabilityRequest {
 export interface AgentPostgresObservabilityResponse {
   ok: true;
   accepted: number;
-}
-
-export interface RuntimeLogMessage {
-  type: "stdout" | "stderr";
-  line: string;
-  offset: number;
-  timestamp: number;
-}
-
-export interface AgentRuntimeLogBatch {
-  serviceId: string;
-  deploymentId?: string | null;
-  runtimeInstanceId?: string | null;
-  containerId?: string | null;
-  containerName?: string | null;
-  entries: RuntimeLogMessage[];
 }
 
 export interface AgentWorkLeaseResult {
@@ -719,7 +702,6 @@ export function getDefaultAgentCapabilities(): AgentCapabilities {
     localTraefik: true,
     hostMetrics: true,
     containerMetrics: true,
-    runtimeLogs: true,
     postgresObservability: true,
     cleanupProofV1: true,
     resourceIsolationV1: true,
@@ -740,7 +722,6 @@ export function resolveAgentCapabilities(config: AgentRuntimeConfig): AgentCapab
   return {
     ...capabilities,
     alloyObservability: true,
-    runtimeLogs: false,
   };
 }
 
@@ -806,7 +787,7 @@ export function getAgentRuntimeConfig(): AgentRuntimeConfig {
     observability: {
       enabled: process.env.NOUVA_OBSERVABILITY_ENABLED === "true",
       organizationId: null,
-      alloyImage: process.env.NOUVA_OBSERVABILITY_ALLOY_IMAGE ?? "grafana/alloy:latest",
+      alloyImage: process.env.NOUVA_OBSERVABILITY_ALLOY_IMAGE ?? "grafana/alloy:v1.17.1",
       scrapeIntervalSeconds: Number.parseInt(
         process.env.NOUVA_OBSERVABILITY_SCRAPE_INTERVAL_SECONDS ?? "30",
         10
@@ -891,16 +872,6 @@ export interface AgentMetricsRequest extends AgentMetricsEnvelope {
 
 export interface AgentMetricsResponse {
   ok: true;
-}
-
-export interface AgentRuntimeLogsRequest {
-  serverId: string;
-  logs: AgentRuntimeLogBatch[];
-}
-
-export interface AgentRuntimeLogsResponse {
-  ok: true;
-  accepted: number;
 }
 
 export interface AgentErrorResponse {

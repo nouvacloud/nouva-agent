@@ -21,7 +21,6 @@ import {
   DockerApiClient,
   type DockerContainerInspection,
   type DockerContainerSpec,
-  type DockerLogEntry,
   type RegistryAuth,
 } from "./docker-api.js";
 import { toDockerResourceSettings } from "./docker-resource-limits.js";
@@ -40,9 +39,6 @@ import {
   type AgentPostgresObservabilityResponse,
   type AgentRegistrationResponse,
   type AgentRuntimeConfig,
-  type AgentRuntimeLogBatch,
-  type AgentRuntimeLogsRequest,
-  type AgentRuntimeLogsResponse,
   type AgentWorkRecord,
   type AppDeployPayload,
   type AppRolloutConfig,
@@ -62,7 +58,6 @@ import {
   type RestartServicePayload,
   type RestorePostgresPitrPayload,
   type RestoreVolumeBackupPayload,
-  type RuntimeLogMessage,
   type RuntimeMetadata,
   type RuntimeRetainedImage,
   resolveAgentCapabilities,
@@ -109,11 +104,6 @@ const DEFAULT_BUILDKIT_PORT = 1234;
 const DEFAULT_AGENT_CONTAINER_NAME = "nouva-agent";
 const DEFAULT_AGENT_IMAGE = "ghcr.io/nouvacloud/nouva-agent:latest";
 const APP_VOLUME_SNAPSHOT_IMAGE = "alpine:3.21";
-const RUNTIME_LOG_SYNC_INTERVAL_MS = Number.parseInt(
-  process.env.NOUVA_AGENT_RUNTIME_LOG_SYNC_INTERVAL_MS || "2000",
-  10
-);
-
 export function resolveReportedAgentVersion(packageVersion: string): string {
   const trimmedPackageVersion = packageVersion.trim();
   if (!trimmedPackageVersion) {
@@ -1599,111 +1589,6 @@ export async function prepareAppBuildkitRuntime(
     address,
     cleanup: async () => {
       await docker.removeContainer(containerName, true);
-    },
-  };
-}
-
-type ManagedContainerRecord = Awaited<ReturnType<DockerApiClient["listManagedContainers"]>>[number];
-
-export interface RuntimeLogCursor {
-  lastTimestampMs: number;
-  recentSignatures: string[];
-  nextOffset: number;
-}
-
-interface ManagedRuntimeContainer {
-  id: string;
-  serviceId: string;
-  deploymentId: string | null;
-  containerName: string | null;
-}
-
-function createRuntimeLogCursor(): RuntimeLogCursor {
-  return {
-    lastTimestampMs: 0,
-    recentSignatures: [],
-    nextOffset: 0,
-  };
-}
-
-function toManagedRuntimeContainer(
-  container: ManagedContainerRecord
-): ManagedRuntimeContainer | null {
-  const labels = container.Labels ?? {};
-  const kind = labels["nouva.kind"];
-  if (kind !== "app" && kind !== "database") {
-    return null;
-  }
-
-  const serviceId = labels["nouva.service.id"];
-  if (!serviceId) {
-    return null;
-  }
-
-  return {
-    id: container.Id,
-    serviceId,
-    deploymentId: labels["nouva.deployment.id"] ?? null,
-    containerName: container.Names?.[0]?.replace(/^\//, "") ?? null,
-  };
-}
-
-export function normalizeRuntimeLogEntries(
-  entries: DockerLogEntry[],
-  cursor: RuntimeLogCursor | null
-): { entries: RuntimeLogMessage[]; cursor: RuntimeLogCursor } {
-  const nextCursor = cursor ?? createRuntimeLogCursor();
-  const recentSignatures = [...nextCursor.recentSignatures];
-  const recentSignatureSet = new Set(recentSignatures);
-  let lastTimestampMs = nextCursor.lastTimestampMs;
-  let nextOffset = nextCursor.nextOffset;
-  const normalized: RuntimeLogMessage[] = [];
-
-  for (const entry of entries) {
-    const parsedTimestamp = entry.timestamp ? Date.parse(entry.timestamp) : Number.NaN;
-    const timestamp = Number.isFinite(parsedTimestamp)
-      ? parsedTimestamp
-      : lastTimestampMs || Date.now();
-    const signature = `${timestamp}:${entry.type}:${entry.line}`;
-
-    if (timestamp < lastTimestampMs) {
-      continue;
-    }
-
-    if (timestamp > lastTimestampMs) {
-      lastTimestampMs = timestamp;
-      recentSignatures.length = 0;
-      recentSignatureSet.clear();
-    }
-
-    if (recentSignatureSet.has(signature)) {
-      continue;
-    }
-
-    recentSignatures.push(signature);
-    recentSignatureSet.add(signature);
-    if (recentSignatures.length > 200) {
-      const removed = recentSignatures.shift();
-      if (removed) {
-        recentSignatureSet.delete(removed);
-      }
-    }
-
-    normalized.push({
-      type: entry.type,
-      line: entry.line,
-      timestamp,
-      offset: nextOffset,
-    });
-    nextOffset += 1;
-  }
-
-  return {
-    entries: normalized,
-    cursor: {
-      lastTimestampMs,
-      recentSignatures,
-      nextOffset,
     },
   };
 }
@@ -3811,74 +3696,6 @@ async function collectMetrics(docker: DockerApiClient): Promise<AgentMetricsEnve
   };
 }
 
-async function syncRuntimeLogs(
-  docker: DockerApiClient,
-  credentials: StoredCredentials,
-  cursors: Map<string, RuntimeLogCursor>
-): Promise<number> {
-  const containers = (await docker.listManagedContainers())
-    .map((container) => toManagedRuntimeContainer(container))
-    .filter((container): container is ManagedRuntimeContainer => container !== null);
-
-  const activeContainerIds = new Set(containers.map((container) => container.id));
-  for (const containerId of cursors.keys()) {
-    if (!activeContainerIds.has(containerId)) {
-      cursors.delete(containerId);
-    }
-  }
-
-  const batches: AgentRuntimeLogBatch[] = [];
-
-  for (const container of containers) {
-    try {
-      const cursor = cursors.get(container.id) ?? createRuntimeLogCursor();
-      const entries = await docker.containerLogEntries(container.id, {
-        stdout: true,
-        stderr: true,
-        timestamps: true,
-        tail: cursor.nextOffset === 0 ? 200 : 500,
-        since:
-          cursor.lastTimestampMs > 0 ? new Date(Math.max(0, cursor.lastTimestampMs - 1000)) : null,
-      });
-
-      const normalized = normalizeRuntimeLogEntries(entries, cursor);
-      cursors.set(container.id, normalized.cursor);
-
-      if (normalized.entries.length === 0) {
-        continue;
-      }
-
-      batches.push({
-        serviceId: container.serviceId,
-        deploymentId: container.deploymentId,
-        containerId: container.id,
-        containerName: container.containerName,
-        entries: normalized.entries,
-      });
-    } catch (error) {
-      console.error(
-        `[nouva-agent] runtime log sync failed for ${container.id} (${container.serviceId})`,
-        error
-      );
-    }
-  }
-
-  if (batches.length === 0) {
-    return 0;
-  }
-
-  const response = await apiRequest<AgentRuntimeLogsResponse>("/api/agent/logs/runtime", {
-    method: "POST",
-    token: credentials.agentToken,
-    body: {
-      serverId: SERVER_ID!,
-      logs: batches,
-    } satisfies AgentRuntimeLogsRequest,
-  });
-
-  return response.accepted;
-}
-
 async function syncPostgresObservability(
   docker: DockerApiClient,
   credentials: StoredCredentials
@@ -3918,20 +3735,15 @@ async function main() {
 
   config = await sendHeartbeat(docker, credentials, config);
   let workLoopActive = false;
-  let runtimeLogLoopActive = false;
   let postgresObservabilityLoopActive = false;
   let isShuttingDown = false;
-  const runtimeLogCursors = new Map<string, RuntimeLogCursor>();
 
   const shutdown = async () => {
     if (isShuttingDown) return;
     isShuttingDown = true;
     console.log("[nouva-agent] shutting down, draining work and log loops...");
     const deadline = Date.now() + 9_000;
-    while (
-      (workLoopActive || runtimeLogLoopActive || postgresObservabilityLoopActive) &&
-      Date.now() < deadline
-    ) {
+    while ((workLoopActive || postgresObservabilityLoopActive) && Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 100));
     }
     process.exit(0);
@@ -4002,23 +3814,6 @@ async function main() {
           postgresObservabilityLoopActive = false;
         });
     }, config.postgresObservabilityIntervalSeconds * 1000);
-  }
-
-  if (RUNTIME_LOG_SYNC_INTERVAL_MS > 0) {
-    setInterval(() => {
-      if (config.observability.enabled || runtimeLogLoopActive || isShuttingDown) {
-        return;
-      }
-
-      runtimeLogLoopActive = true;
-      syncRuntimeLogs(docker, credentials!, runtimeLogCursors)
-        .catch((error) => {
-          console.error("[nouva-agent] runtime log sync failed", error);
-        })
-        .finally(() => {
-          runtimeLogLoopActive = false;
-        });
-    }, RUNTIME_LOG_SYNC_INTERVAL_MS);
   }
 
   setInterval(async () => {
