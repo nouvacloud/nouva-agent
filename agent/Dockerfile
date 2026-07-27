@@ -4,9 +4,11 @@ WORKDIR /app
 
 COPY bun.lock package.json ./
 COPY agent/package.json ./agent/
+COPY packages/runtime/package.json ./packages/runtime/
 RUN bun install --frozen-lockfile
 
 COPY agent ./agent
+COPY packages/runtime ./packages/runtime
 
 WORKDIR /app/agent
 RUN bun run check-types
@@ -45,9 +47,11 @@ WORKDIR /app
 
 COPY bun.lock package.json ./
 COPY agent/package.json ./agent/
+COPY packages/runtime/package.json ./packages/runtime/
 RUN bun install --frozen-lockfile --production
 
 COPY agent ./agent
+COPY packages/runtime ./packages/runtime
 
 ARG VCS_REF=local
 LABEL org.opencontainers.image.source="https://github.com/nouvacloud/nouva-agent"

@@ -1,3 +1,14 @@
+import type { AgentServerMetricPayload } from "@repo/runtime/agent-metrics";
+
+export type {
+  AgentMetricsEnvelope,
+  AgentMetricsRequest,
+  AgentMetricsResponse,
+  AgentServerMetricPayload,
+  AgentServiceMetricPayload,
+  AgentVolumeMetricPayload,
+} from "@repo/runtime/agent-metrics";
+
 export const SERVER_CHECK_STATUSES = ["pass", "warn", "fail"] as const;
 export type ServerCheckStatus = (typeof SERVER_CHECK_STATUSES)[number];
 
@@ -307,53 +318,6 @@ export interface AgentWorkRecord {
   maxAttempts: number;
   createdAt: Date;
   updatedAt: Date;
-}
-
-export interface AgentServerMetricPayload {
-  cpuUsageBasisPoints?: number | null;
-  memoryUsedBytes?: number | null;
-  memoryTotalBytes?: number | null;
-  diskUsedBytes?: number | null;
-  diskAvailableBytes?: number | null;
-  diskTotalBytes?: number | null;
-  loadAvg1mMilli?: number | null;
-  loadAvg5mMilli?: number | null;
-  loadAvg15mMilli?: number | null;
-  raw?: Record<string, unknown> | null;
-  collectedAt: string;
-}
-
-export interface AgentServiceMetricPayload {
-  serviceId: string;
-  deploymentId?: string | null;
-  runtimeInstanceId?: string | null;
-  cpuUsageBasisPoints?: number | null;
-  memoryUsageBytes?: number | null;
-  memoryLimitBytes?: number | null;
-  networkRxBytes?: number | null;
-  networkTxBytes?: number | null;
-  blockReadBytes?: number | null;
-  blockWriteBytes?: number | null;
-  pidsCurrent?: number | null;
-  raw?: Record<string, unknown> | null;
-  collectedAt: string;
-}
-
-export interface AgentVolumeMetricPayload {
-  volumeName: string;
-  usedBytes: number;
-  raw?: Record<string, unknown> | null;
-  collectedAt: string;
-}
-
-/**
- * Every section is optional so the agent can report volume usage on its own cadence without
- * also pushing host and per-container samples, which Alloy owns when observability is enabled.
- */
-export interface AgentMetricsEnvelope {
-  server?: AgentServerMetricPayload | null;
-  services?: AgentServiceMetricPayload[];
-  volumes?: AgentVolumeMetricPayload[];
 }
 
 export type PostgresObservabilityExtensionStatus = {
@@ -877,14 +841,6 @@ export interface AgentWorkMutationRequest {
 }
 
 export interface AgentWorkMutationResponse {
-  ok: true;
-}
-
-export interface AgentMetricsRequest extends AgentMetricsEnvelope {
-  serverId: string;
-}
-
-export interface AgentMetricsResponse {
   ok: true;
 }
 

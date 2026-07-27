@@ -2,7 +2,8 @@
   "name": "nouva-agent-workspace",
   "private": true,
   "workspaces": [
-    "agent"
+    "agent",
+    "packages/runtime"
   ],
   "scripts": {
     "check-types": "bun run --filter nouva-agent check-types",

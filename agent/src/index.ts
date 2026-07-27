@@ -4,6 +4,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { AGENT_VOLUME_METRICS_INTERVAL_MS } from "@repo/runtime/agent-metrics";
 import agentPackageJson from "../package.json" with { type: "json" };
 import {
   type AlloyRuntimeInput,
@@ -71,7 +72,6 @@ import {
   calculateDiskSafetyReserveBytes,
   formatStorageBytes,
   resolveDockerRootHostPath,
-  VOLUME_USAGE_INTERVAL_MS,
 } from "./storage-metrics.js";
 import {
   buildTraefikRuntimePaths,
@@ -84,6 +84,7 @@ import {
   writeLocalTraefikRoute,
 } from "./traefik-runtime.js";
 import { resolveUpdateAgentImageRef, toUpdateAgentPayload } from "./update-agent.js";
+import { createVolumeMetricsCollector } from "./volume-metrics-loop.js";
 
 const execFile = promisify(execFileCallback);
 
@@ -3839,15 +3840,28 @@ async function main() {
   config = await sendHeartbeat(docker, credentials, config);
   let workLoopActive = false;
   let postgresObservabilityLoopActive = false;
-  let volumeUsageLoopActive = false;
   let isShuttingDown = false;
+  const volumeMetricsCollector = createVolumeMetricsCollector(async () => {
+    const metrics = await collectVolumeUsage(docker);
+    await apiRequest("/api/agent/metrics", {
+      method: "POST",
+      token: credentials!.agentToken,
+      body: {
+        serverId: SERVER_ID!,
+        ...metrics,
+      } satisfies AgentMetricsRequest,
+    });
+  });
 
   const shutdown = async () => {
     if (isShuttingDown) return;
     isShuttingDown = true;
     console.log("[nouva-agent] shutting down, draining work and log loops...");
     const deadline = Date.now() + 9_000;
-    while ((workLoopActive || postgresObservabilityLoopActive) && Date.now() < deadline) {
+    while (
+      (workLoopActive || postgresObservabilityLoopActive || volumeMetricsCollector.isActive()) &&
+      Date.now() < deadline
+    ) {
       await new Promise((r) => setTimeout(r, 100));
     }
     process.exit(0);
@@ -3905,30 +3919,19 @@ async function main() {
 
   // Volume usage backs reservation admission, so it is reported even when Alloy owns the rest
   // of the telemetry pipeline.
+  void volumeMetricsCollector.trigger().catch((error) => {
+    console.error("[nouva-agent] volume usage failed", error);
+  });
+
   setInterval(() => {
-    if (volumeUsageLoopActive || isShuttingDown) {
+    if (isShuttingDown) {
       return;
     }
 
-    volumeUsageLoopActive = true;
-    collectVolumeUsage(docker)
-      .then((metrics) =>
-        apiRequest("/api/agent/metrics", {
-          method: "POST",
-          token: credentials!.agentToken,
-          body: {
-            serverId: SERVER_ID!,
-            ...metrics,
-          } satisfies AgentMetricsRequest,
-        })
-      )
-      .catch((error) => {
-        console.error("[nouva-agent] volume usage failed", error);
-      })
-      .finally(() => {
-        volumeUsageLoopActive = false;
-      });
-  }, VOLUME_USAGE_INTERVAL_MS);
+    void volumeMetricsCollector.trigger().catch((error) => {
+      console.error("[nouva-agent] volume usage failed", error);
+    });
+  }, AGENT_VOLUME_METRICS_INTERVAL_MS);
 
   if (config.postgresObservabilityIntervalSeconds > 0) {
     setInterval(() => {

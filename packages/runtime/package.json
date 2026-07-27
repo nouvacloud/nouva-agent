@@ -1,0 +1,9 @@
+{
+  "name": "@repo/runtime",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "exports": {
+    "./agent-metrics": "./src/agent-metrics.ts"
+  }
+}
