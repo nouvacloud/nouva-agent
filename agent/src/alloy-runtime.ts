@@ -32,6 +32,9 @@ const OBSERVABILITY_DOCKER_LABELS = {
   deploymentId: "__meta_docker_container_label_nouva_deployment_id",
   serviceVariant: "__meta_docker_container_label_nouva_service_variant",
   environmentId: "__meta_docker_container_label_nouva_environment_id",
+  replicaIndex: "__meta_docker_container_label_nouva_replica_index",
+  scheduleId: "__meta_docker_container_label_nouva_schedule_id",
+  scheduleRunId: "__meta_docker_container_label_nouva_schedule_run_id",
   containerName: "__meta_docker_container_name",
 } as const;
 
@@ -241,7 +244,7 @@ function buildRelabelRules(input: AlloyRuntimeInput): string[] {
     `  rule {
     source_labels = [${quote(OBSERVABILITY_DOCKER_LABELS.kind)}]
     action        = "keep"
-    regex         = "app|database|traefik"
+    regex         = "app|database|traefik|worker|worker_job"
   }`,
     `  rule {
     target_label = "organization_id"
@@ -292,6 +295,36 @@ function buildRelabelRules(input: AlloyRuntimeInput): string[] {
     replacement   = "$1"
   }`,
     `  rule {
+    target_label = "replica_index"
+    replacement  = ${noneValue}
+  }`,
+    `  rule {
+    source_labels = [${quote(OBSERVABILITY_DOCKER_LABELS.replicaIndex)}]
+    target_label  = "replica_index"
+    regex         = "(.+)"
+    replacement   = "$1"
+  }`,
+    `  rule {
+    target_label = "schedule_id"
+    replacement  = ${noneValue}
+  }`,
+    `  rule {
+    source_labels = [${quote(OBSERVABILITY_DOCKER_LABELS.scheduleId)}]
+    target_label  = "schedule_id"
+    regex         = "(.+)"
+    replacement   = "$1"
+  }`,
+    `  rule {
+    target_label = "schedule_run_id"
+    replacement  = ${noneValue}
+  }`,
+    `  rule {
+    source_labels = [${quote(OBSERVABILITY_DOCKER_LABELS.scheduleRunId)}]
+    target_label  = "schedule_run_id"
+    regex         = "(.+)"
+    replacement   = "$1"
+  }`,
+    `  rule {
     target_label = "service_type"
     replacement  = "system"
   }`,
@@ -306,6 +339,12 @@ function buildRelabelRules(input: AlloyRuntimeInput): string[] {
     target_label  = "service_type"
     regex         = "database"
     replacement   = "database"
+  }`,
+    `  rule {
+    source_labels = [${quote(OBSERVABILITY_DOCKER_LABELS.kind)}]
+    target_label  = "service_type"
+    regex         = "worker|worker_job"
+    replacement   = "worker"
   }`,
     `  rule {
     target_label = "service_variant"
@@ -373,7 +412,10 @@ export function renderAlloyConfig(input: AlloyRuntimeInput): string {
   }
 
   const scrapeIntervalSeconds = Math.max(5, input.config.observability.scrapeIntervalSeconds || 30);
+  // Keep schedule run IDs in Mimir as well as Loki so run-scoped metrics match
+  // run-scoped logs. This deliberately trades additional cardinality for that view.
   const allowlistedLabels = list([
+    "nouva.managed",
     "nouva.server.id",
     "nouva.project.id",
     "nouva.service.id",
@@ -381,6 +423,9 @@ export function renderAlloyConfig(input: AlloyRuntimeInput): string {
     "nouva.service.variant",
     "nouva.environment.id",
     "nouva.kind",
+    "nouva.replica.index",
+    "nouva.schedule.id",
+    "nouva.schedule.run.id",
   ]);
   const dockerRules = buildRelabelRules(input);
   const noneValue = quote(
@@ -441,9 +486,15 @@ ${dockerRules.join("\n")}
   forward_to = [prometheus.remote_write.nouva.receiver]
 
   rule {
+    source_labels = ["container_label_nouva_managed"]
+    action        = "keep"
+    regex         = "true"
+  }
+
+  rule {
     source_labels = ["container_label_nouva_kind"]
     action        = "keep"
-    regex         = "app|database|traefik"
+    regex         = "app|database|traefik|worker|worker_job"
   }
 
   rule {
@@ -505,6 +556,42 @@ ${dockerRules.join("\n")}
   }
 
   rule {
+    target_label = "replica_index"
+    replacement  = ${noneValue}
+  }
+
+  rule {
+    source_labels = ["container_label_nouva_replica_index"]
+    target_label  = "replica_index"
+    regex         = "(.+)"
+    replacement   = "$1"
+  }
+
+  rule {
+    target_label = "schedule_id"
+    replacement  = ${noneValue}
+  }
+
+  rule {
+    source_labels = ["container_label_nouva_schedule_id"]
+    target_label  = "schedule_id"
+    regex         = "(.+)"
+    replacement   = "$1"
+  }
+
+  rule {
+    target_label = "schedule_run_id"
+    replacement  = ${noneValue}
+  }
+
+  rule {
+    source_labels = ["container_label_nouva_schedule_run_id"]
+    target_label  = "schedule_run_id"
+    regex         = "(.+)"
+    replacement   = "$1"
+  }
+
+  rule {
     target_label = "service_type"
     replacement  = "system"
   }
@@ -521,6 +608,13 @@ ${dockerRules.join("\n")}
     target_label  = "service_type"
     regex         = "database"
     replacement   = "database"
+  }
+
+  rule {
+    source_labels = ["container_label_nouva_kind"]
+    target_label  = "service_type"
+    regex         = "worker|worker_job"
+    replacement   = "worker"
   }
 
   rule {

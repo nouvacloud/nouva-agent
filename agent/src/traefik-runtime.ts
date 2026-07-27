@@ -195,7 +195,7 @@ function buildTraefikRuntimeConfig(networkName: string): AgentRuntimeConfig {
       organizationId: null,
       alloyImage: "grafana/alloy:v1.17.1",
       scrapeIntervalSeconds: 30,
-      collectorScope: "services_and_traefik",
+      collectorScope: "services_traefik_and_workers",
       noneLabelValue: "__none__",
     },
   };

@@ -171,6 +171,20 @@ describe("DockerApiClient cleanup semantics", () => {
     requestSpy.mockRestore();
   });
 
+  test("treats an already-stopped container as an idempotent stop", async () => {
+    const DockerApiClientCtor = DockerApiClient as unknown as {
+      new (apiVersion: string): DockerApiClient;
+    };
+    const client = new DockerApiClientCtor("v1.51");
+    const requestSpy = spyOn(client, "request").mockRejectedValue(
+      new DockerApiError(304, "POST", "/v1.51/containers/already-stopped/stop", "already stopped")
+    );
+
+    await expect(client.stopContainer("already-stopped")).resolves.toBeUndefined();
+
+    requestSpy.mockRestore();
+  });
+
   test("propagates permission, conflict, daemon, and transport mutation failures", async () => {
     const DockerApiClientCtor = DockerApiClient as unknown as {
       new (apiVersion: string): DockerApiClient;

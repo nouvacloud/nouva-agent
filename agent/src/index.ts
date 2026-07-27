@@ -65,6 +65,10 @@ import {
   resolveAppRolloutConfig,
   type ServerValidationReport,
   type SyncRoutingPayload,
+  type WorkerDeployOnlyPayload,
+  type WorkerDeployPayload,
+  type WorkerJobLifecyclePayload,
+  type WorkerJobPayload,
 } from "./protocol.js";
 import { redactSensitiveText } from "./security.js";
 import { resolveDatabaseProvisionSpec } from "./service-runtime.js";
@@ -85,6 +89,16 @@ import {
 } from "./traefik-runtime.js";
 import { resolveUpdateAgentImageRef, toUpdateAgentPayload } from "./update-agent.js";
 import { createVolumeMetricsCollector } from "./volume-metrics-loop.js";
+import {
+  cleanupWorkerJob,
+  deployWorkerRuntime,
+  inspectWorkerJob,
+  removeWorkerServiceRuntime,
+  restartWorkerServiceRuntime,
+  startWorkerJob,
+  stopWorkerJob,
+  WorkerRolloutError,
+} from "./worker-runtime.js";
 
 const execFile = promisify(execFileCallback);
 
@@ -2470,6 +2484,68 @@ async function handleDeployOnlyApp(
   });
 }
 
+function getWorkerRuntimeEnvironment(config: AgentRuntimeConfig) {
+  return {
+    serverId: SERVER_ID!,
+    imageStoreMode: config.imageStoreMode,
+    dataDir: DATA_DIR,
+    dataVolume: DATA_VOLUME,
+  };
+}
+
+async function handleBuildAndDeployWorker(
+  docker: DockerApiClient,
+  config: AgentRuntimeConfig,
+  payload: WorkerDeployPayload
+) {
+  const requestedBuildType = payload.appBuildType as string | null | undefined;
+  if (requestedBuildType === "static") {
+    throw new Error("Worker services do not support Static builds");
+  }
+  if (config.imageStoreMode === "local-registry") {
+    await ensureLocalRegistryRuntime(docker, config);
+  }
+
+  const buildkitRuntime = await prepareAppBuildkitRuntime(docker, payload);
+  try {
+    const buildResult = await buildApp({
+      docker,
+      repoUrl: payload.repoUrl,
+      commitHash: payload.commitHash,
+      deploymentId: payload.deploymentId,
+      envVars: payload.envVars,
+      resourceLimits: payload.resourceLimits,
+      imageStoreMode: config.imageStoreMode,
+      localRegistryHost: config.localRegistryHost,
+      localRegistryPort: config.localRegistryPort,
+      buildkitAddress: buildkitRuntime.address,
+      appBuildType: payload.appBuildType ?? null,
+      appBuildConfig: payload.appBuildConfig ?? null,
+    });
+    const result = await deployWorkerRuntime(docker, getWorkerRuntimeEnvironment(config), {
+      ...payload,
+      imageUrl: buildResult.imageUrl,
+    });
+    return {
+      ...result,
+      buildDuration: buildResult.buildDuration,
+      detectedLanguage: buildResult.detectedLanguage,
+      detectedFramework: buildResult.detectedFramework,
+      languageVersion: buildResult.languageVersion,
+    };
+  } finally {
+    await buildkitRuntime.cleanup();
+  }
+}
+
+async function handleDeployOnlyWorker(
+  docker: DockerApiClient,
+  config: AgentRuntimeConfig,
+  payload: WorkerDeployOnlyPayload
+) {
+  return await deployWorkerRuntime(docker, getWorkerRuntimeEnvironment(config), payload);
+}
+
 function getManagedVolumeName(payload: DatabaseProvisionPayload | DeleteVolumePayload): string {
   return payload.volumeName;
 }
@@ -3354,6 +3430,13 @@ async function handleRemove(
 }
 
 export async function handleDeleteService(docker: DockerApiClient, payload: RemoveServicePayload) {
+  if (payload.serviceType === "worker") {
+    return await removeWorkerServiceRuntime(docker, {
+      serviceId: payload.serviceId,
+      runtimeMetadata: payload.runtimeMetadata,
+    });
+  }
+
   const identifier = resolveServiceContainerIdentifier(payload);
   if (identifier) {
     await docker.removeContainer(identifier, true);
@@ -3539,6 +3622,21 @@ async function processWorkItem(
       case "rollback_app":
         result = await handleDeployOnlyApp(docker, config, payload as unknown as DeployOnlyPayload);
         break;
+      case "deploy_worker":
+      case "redeploy_worker":
+        result = await handleBuildAndDeployWorker(
+          docker,
+          config,
+          payload as unknown as WorkerDeployPayload
+        );
+        break;
+      case "rollback_worker":
+      case "scale_worker":
+        result = await handleDeployOnlyWorker(docker, config, {
+          ...(payload as unknown as WorkerDeployOnlyPayload),
+          runtimeMetadata: toRuntimeMetadata(payload.runtimeMetadata),
+        });
+        break;
       case "restart_app":
       case "restart_database":
         result = await handleRestart(docker, {
@@ -3546,11 +3644,48 @@ async function processWorkItem(
           runtimeMetadata: toRuntimeMetadata(payload.runtimeMetadata),
         });
         break;
+      case "restart_worker":
+        result = await restartWorkerServiceRuntime(docker, String(payload.serviceId));
+        break;
       case "remove_app":
         result = await handleRemove(
           docker,
           String(payload.serviceId),
           toRuntimeMetadata(payload.runtimeMetadata)
+        );
+        break;
+      case "remove_worker":
+        result = await removeWorkerServiceRuntime(docker, {
+          serviceId: String(payload.serviceId),
+          runtimeMetadata: toRuntimeMetadata(payload.runtimeMetadata),
+        });
+        break;
+      case "start_worker_job":
+        result = await startWorkerJob(
+          docker,
+          getWorkerRuntimeEnvironment(config),
+          payload as unknown as WorkerJobPayload
+        );
+        break;
+      case "inspect_worker_job":
+        result = await inspectWorkerJob(
+          docker,
+          getWorkerRuntimeEnvironment(config),
+          payload as unknown as WorkerJobLifecyclePayload
+        );
+        break;
+      case "stop_worker_job":
+        result = await stopWorkerJob(
+          docker,
+          getWorkerRuntimeEnvironment(config),
+          payload as unknown as WorkerJobLifecyclePayload
+        );
+        break;
+      case "cleanup_worker_job":
+        result = await cleanupWorkerJob(
+          docker,
+          getWorkerRuntimeEnvironment(config),
+          payload as unknown as WorkerJobLifecyclePayload
         );
         break;
       case "provision_database":
@@ -3667,7 +3802,7 @@ async function processWorkItem(
         throw new Error(`Unsupported work kind: ${workItem.kind}`);
     }
   } catch (err) {
-    if (err instanceof AppRolloutError) {
+    if (err instanceof AppRolloutError || err instanceof WorkerRolloutError) {
       failureResult = err.result;
     }
     workError = err instanceof Error ? err : new Error("Unknown agent work failure");

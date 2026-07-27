@@ -46,7 +46,7 @@ const runtimeConfig: AgentRuntimeConfig = {
     organizationId: "org_123",
     alloyImage: "grafana/alloy:v1.17.1",
     scrapeIntervalSeconds: 45,
-    collectorScope: "services_and_traefik",
+    collectorScope: "services_traefik_and_workers",
     noneLabelValue: "__none__",
   },
 };
@@ -134,11 +134,34 @@ describe("alloy-runtime", () => {
     expect(config).toContain('drain_timeout     = "1m"');
     expect(config).toContain("enabled         = true");
     expect(config).toContain('max_segment_age = "168h"');
-    expect(config).toContain('regex         = "app|database|traefik"');
+    expect(config).toContain('regex         = "app|database|traefik|worker|worker_job"');
     expect(config).toContain('target_label = "organization_id"');
     expect(config).toContain('target_label = "environment_id"');
     expect(config).toContain('replacement  = "__none__"');
     expect(config).toContain("allowlisted_container_labels = [");
+  });
+
+  test("preserves worker identity in Loki and Mimir", async () => {
+    tempDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-alloy-"));
+
+    const config = renderAlloyConfig(createAlloyInput(tempDir));
+    const cadvisorOffset = config.indexOf('prometheus.exporter.cadvisor "nouva"');
+    const lokiConfig = config.slice(0, cadvisorOffset);
+    const metricConfig = config.slice(cadvisorOffset);
+
+    expect(lokiConfig).toContain("__meta_docker_container_label_nouva_replica_index");
+    expect(lokiConfig).toContain("__meta_docker_container_label_nouva_schedule_id");
+    expect(lokiConfig).toContain("__meta_docker_container_label_nouva_schedule_run_id");
+    expect(lokiConfig).toContain('target_label = "schedule_run_id"');
+    expect(lokiConfig).toContain('target_label  = "container_name"');
+    expect(metricConfig).toContain('"nouva.replica.index"');
+    expect(metricConfig).toContain('"nouva.schedule.id"');
+    expect(metricConfig).toContain('"nouva.schedule.run.id"');
+    expect(metricConfig).toContain('target_label = "replica_index"');
+    expect(metricConfig).toContain('target_label = "schedule_id"');
+    expect(metricConfig).toContain('target_label = "schedule_run_id"');
+    expect(metricConfig).toContain('"container_label_nouva_schedule_run_id"');
+    expect(metricConfig).toContain('target_label  = "container_name"');
   });
 
   test("builds the managed Alloy container spec with required mounts and localhost health port", async () => {

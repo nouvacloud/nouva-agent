@@ -34,9 +34,15 @@ export interface RegistryAuth {
 export interface DockerContainerInspection {
   Id: string;
   Name: string;
+  RestartCount?: number;
   State?: {
     Running?: boolean;
     Status?: string;
+    ExitCode?: number;
+    Error?: string;
+    OOMKilled?: boolean;
+    StartedAt?: string;
+    FinishedAt?: string;
     Health?: {
       Status?: string;
     };
@@ -62,6 +68,7 @@ export interface DockerContainerInspection {
   };
   Config?: {
     Image?: string;
+    Entrypoint?: string[] | null;
     Cmd?: string[];
     Env?: string[];
     Labels?: Record<string, string>;
@@ -87,6 +94,17 @@ export interface DockerImageInspection {
   Id: string;
   RepoTags?: string[];
   RepoDigests?: string[];
+  Config?: {
+    Entrypoint?: string[] | null;
+    Cmd?: string[] | null;
+    Healthcheck?: {
+      Test?: string[] | null;
+      Interval?: number;
+      Timeout?: number;
+      Retries?: number;
+      StartPeriod?: number;
+    } | null;
+  };
 }
 
 export interface DockerSystemInfo {
@@ -118,6 +136,13 @@ export interface DockerContainerSpec {
   cmd?: string[];
   tty?: boolean;
   labels?: Record<string, string>;
+  healthcheck?: {
+    Test: string[];
+    Interval?: number;
+    Timeout?: number;
+    Retries?: number;
+    StartPeriod?: number;
+  };
   exposedPorts?: Record<string, Record<string, never>>;
   hostConfig?: Record<string, unknown>;
   networkingConfig?: Record<string, unknown>;
@@ -515,6 +540,23 @@ export class DockerApiClient {
     );
   }
 
+  async listContainersByLabels(
+    labels: Record<string, string>
+  ): Promise<DockerContainerInspection[]> {
+    const labelFilters = Object.entries(labels).map(([key, value]) => `${key}=${value}`);
+    const filters = encodeURIComponent(JSON.stringify({ label: labelFilters }));
+    const containers = await this.request<Array<{ Id?: string }>>(
+      "GET",
+      `/containers/json?all=true&filters=${filters}`
+    );
+    const inspections = await Promise.all(
+      containers.flatMap((container) => (container.Id ? [this.inspectContainer(container.Id)] : []))
+    );
+    return inspections.filter(
+      (inspection): inspection is DockerContainerInspection => inspection !== null
+    );
+  }
+
   async updateContainer(
     nameOrId: string,
     resources: {
@@ -565,7 +607,7 @@ export class DockerApiClient {
     try {
       await this.request("POST", `/containers/${encodeURIComponent(nameOrId)}/stop`);
     } catch (error) {
-      if (!(error instanceof DockerApiError && error.status === 404)) {
+      if (!(error instanceof DockerApiError && (error.status === 404 || error.status === 304))) {
         throw error;
       }
     }
@@ -586,6 +628,7 @@ export class DockerApiClient {
         Cmd: spec.cmd,
         Tty: spec.tty ?? false,
         Labels: spec.labels,
+        Healthcheck: spec.healthcheck,
         ExposedPorts: spec.exposedPorts,
         HostConfig: spec.hostConfig,
         NetworkingConfig: spec.networkingConfig,

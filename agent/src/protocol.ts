@@ -27,6 +27,16 @@ export const AGENT_WORK_KINDS = [
   "rollback_app",
   "restart_app",
   "remove_app",
+  "deploy_worker",
+  "redeploy_worker",
+  "rollback_worker",
+  "scale_worker",
+  "restart_worker",
+  "remove_worker",
+  "start_worker_job",
+  "inspect_worker_job",
+  "stop_worker_job",
+  "cleanup_worker_job",
   "provision_database",
   "apply_database_volume",
   "restart_database",
@@ -62,6 +72,17 @@ export type AgentCleanupProof =
       previousContainer: { identifier: string | null; absent: true };
       previousVolume: { name: string; absent: true };
       replacementVolume: { name: string; present: true };
+    }
+  | {
+      version: 1;
+      kind: "delete_worker";
+      containers: Array<{ identifier: string; absent: true }>;
+      retainedImages: Array<{ reference: string; absent: true }>;
+    }
+  | {
+      version: 1;
+      kind: "cleanup_worker_job";
+      container: { identifier: string; absent: true };
     };
 
 export type ServerValidationCheck = {
@@ -106,6 +127,14 @@ export type RuntimeMetadata = {
   networkName?: string | null;
   runtimeInstanceId?: string | null;
   clientIngressConfigHash?: string | null;
+  replicaCount?: number | null;
+  replicas?: Array<{
+    replicaIndex: number;
+    containerId: string | null;
+    containerName: string;
+  }>;
+  detectedEntrypoint?: string[] | null;
+  detectedCommand?: string[] | null;
   [key: string]: unknown;
 };
 
@@ -243,6 +272,8 @@ export type AgentCapabilities = {
   publicPortPreflightV1?: boolean;
   backupIntegrityV1?: boolean;
   managedVolumeCapacityV1?: boolean;
+  workerServicesV1?: boolean;
+  workerVolumeRolloutV1?: boolean;
   [key: string]: boolean | undefined;
 };
 
@@ -260,7 +291,7 @@ export interface AgentObservabilityConfig {
   organizationId: string | null;
   alloyImage: string;
   scrapeIntervalSeconds: number;
-  collectorScope: "services_and_traefik";
+  collectorScope: "services_traefik_and_workers";
   noneLabelValue: "__none__";
 }
 
@@ -440,6 +471,82 @@ export interface DeployOnlyPayload {
   providedHostname?: string;
   customHostnames?: string[];
   clientIngressConfigHash?: string;
+}
+
+/**
+ * Workers share app build inputs, but are intentionally not ingress services.
+ * A non-blank start command is executed by the agent through `/bin/sh -lc`.
+ */
+export interface WorkerDeployPayload {
+  repoUrl: string;
+  commitHash: string;
+  commitMessage: string;
+  branch: string;
+  serviceName: string;
+  projectId: string;
+  environmentId?: string | null;
+  serviceId: string;
+  deploymentId: string;
+  envVars: Record<string, string>;
+  appBuildType?: Exclude<AppBuildType, "static"> | null;
+  appBuildConfig?: AppBuildConfig | null;
+  startCommand: string | null;
+  healthCheckCommand: string | null;
+  replicaCount: number;
+  volume?: AppVolumeIdentity | null;
+  resourceLimits: EffectiveServiceResourceLimits;
+  runtimeMetadata?: RuntimeMetadata | null;
+}
+
+export interface WorkerDeployOnlyPayload {
+  imageUrl: string;
+  commitHash: string;
+  commitMessage: string;
+  serviceName: string;
+  projectId: string;
+  environmentId?: string | null;
+  serviceId: string;
+  deploymentId: string;
+  envVars: Record<string, string>;
+  startCommand: string | null;
+  healthCheckCommand: string | null;
+  replicaCount: number;
+  volume?: AppVolumeIdentity | null;
+  resourceLimits: EffectiveServiceResourceLimits;
+  runtimeMetadata?: RuntimeMetadata | null;
+}
+
+export interface WorkerJobPayload {
+  projectId: string;
+  environmentId?: string | null;
+  serviceId: string;
+  deploymentId: string;
+  scheduleId: string;
+  scheduleRunId: string;
+  occurrenceKey: string;
+  jobName: string;
+  imageUrl: string;
+  envVars: Record<string, string>;
+  command: string;
+  timeoutSeconds: number;
+  volume?: AppVolumeIdentity | null;
+  resourceLimits: EffectiveServiceResourceLimits;
+  runtimeMetadata?: RuntimeMetadata | null;
+}
+
+/**
+ * Inspection, timeout, and cleanup work intentionally carry only the durable
+ * run identity. The agent derives image and occurrence details from its receipt.
+ */
+export interface WorkerJobLifecyclePayload {
+  projectId?: string;
+  serviceId: string;
+  deploymentId?: string;
+  scheduleId?: string | null;
+  scheduleRunId: string;
+  jobName?: string;
+  timeoutSeconds?: number;
+  reason?: string;
 }
 
 export interface AppVolumeIdentity {
@@ -653,7 +760,7 @@ export interface RemoveServicePayload {
   projectId: string;
   serviceId: string;
   serviceName: string;
-  serviceType: "app" | "database";
+  serviceType: "app" | "database" | "worker";
   variant?: DatabaseServiceVariant | null;
   containerName?: string | null;
   deploymentId?: string | null;
@@ -687,6 +794,8 @@ export function getDefaultAgentCapabilities(): AgentCapabilities {
     publicPortPreflightV1: true,
     backupIntegrityV1: true,
     managedVolumeCapacityV1: true,
+    workerServicesV1: true,
+    workerVolumeRolloutV1: true,
   };
 }
 
@@ -770,7 +879,7 @@ export function getAgentRuntimeConfig(): AgentRuntimeConfig {
         process.env.NOUVA_OBSERVABILITY_SCRAPE_INTERVAL_SECONDS ?? "30",
         10
       ),
-      collectorScope: "services_and_traefik",
+      collectorScope: "services_traefik_and_workers",
       noneLabelValue: "__none__",
     },
   } satisfies AgentRuntimeConfig;

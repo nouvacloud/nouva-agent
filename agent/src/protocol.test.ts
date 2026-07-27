@@ -447,7 +447,7 @@ describe("agent protocol", () => {
       organizationId: null,
       alloyImage: "grafana/alloy:v1.0.0",
       scrapeIntervalSeconds: 45,
-      collectorScope: "services_and_traefik",
+      collectorScope: "services_traefik_and_workers",
       noneLabelValue: "__none__",
     });
   });
@@ -466,7 +466,7 @@ describe("agent protocol", () => {
         organizationId: "org_123",
         alloyImage: "grafana/alloy:v1.17.1",
         scrapeIntervalSeconds: 30,
-        collectorScope: "services_and_traefik",
+        collectorScope: "services_traefik_and_workers",
         noneLabelValue: "__none__",
       },
     });
