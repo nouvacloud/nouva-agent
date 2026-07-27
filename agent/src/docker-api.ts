@@ -89,6 +89,27 @@ export interface DockerImageInspection {
   RepoDigests?: string[];
 }
 
+export interface DockerSystemInfo {
+  DockerRootDir?: string;
+}
+
+export interface DockerVolumeDiskUsage {
+  volumeName: string;
+  usedBytes: number;
+  raw: Record<string, unknown>;
+}
+
+interface DockerSystemDiskUsage {
+  Volumes?: Array<{
+    Name?: string;
+    Labels?: Record<string, string> | null;
+    UsageData?: {
+      Size?: number;
+      RefCount?: number;
+    };
+  }>;
+}
+
 export interface DockerContainerSpec {
   name: string;
   image: string;
@@ -189,6 +210,40 @@ export function parseDockerLogBuffer(buffer: Buffer, timestamps = false): Docker
       } satisfies DockerLogEntry;
     })
   );
+}
+
+export function parseManagedVolumeDiskUsage(input: unknown): DockerVolumeDiskUsage[] {
+  const report =
+    typeof input === "object" && input !== null ? (input as DockerSystemDiskUsage) : {};
+  return (report.Volumes ?? []).flatMap((volume) => {
+    const volumeName = volume.Name?.trim();
+    const managed =
+      volume.Labels?.["nouva.managed"] === "true" &&
+      typeof volume.Labels["nouva.volume.id"] === "string";
+    const legacy = Boolean(volumeName?.startsWith("nouva-vol-"));
+    const usedBytes = volume.UsageData?.Size;
+    if (
+      !volumeName ||
+      (!managed && !legacy) ||
+      typeof usedBytes !== "number" ||
+      !Number.isFinite(usedBytes) ||
+      usedBytes < 0
+    ) {
+      return [];
+    }
+
+    return [
+      {
+        volumeName,
+        usedBytes: Math.trunc(usedBytes),
+        raw: {
+          refCount: volume.UsageData?.RefCount ?? null,
+          managedByLabel: managed,
+          legacyName: legacy && !managed,
+        },
+      },
+    ];
+  });
 }
 
 export class DockerApiClient {
@@ -396,10 +451,19 @@ export class DockerApiClient {
     });
   }
 
-  async createVolume(name: string): Promise<void> {
+  async info(): Promise<DockerSystemInfo> {
+    return (await this.request<DockerSystemInfo>("GET", "/info")) ?? {};
+  }
+
+  async createVolume(name: string, labels: Record<string, string> = {}): Promise<void> {
     await this.request("POST", "/volumes/create", {
       Name: name,
+      Labels: labels,
     });
+  }
+
+  async listManagedVolumeDiskUsage(): Promise<DockerVolumeDiskUsage[]> {
+    return parseManagedVolumeDiskUsage(await this.request("GET", "/system/df?type=volume"));
   }
 
   async removeVolume(name: string, force = false): Promise<void> {

@@ -473,6 +473,7 @@ describe("agent protocol", () => {
 
     expect("runtimeLogs" in capabilities).toBe(false);
     expect(capabilities.alloyObservability).toBe(true);
+    expect(capabilities.managedVolumeCapacityV1).toBe(true);
   });
 
   test("parses host metrics snapshots with cpu, memory, disk, and load data", () => {

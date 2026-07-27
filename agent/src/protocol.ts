@@ -231,6 +231,7 @@ export type AgentCapabilities = {
   appVolumeRolloutV1?: boolean;
   publicPortPreflightV1?: boolean;
   backupIntegrityV1?: boolean;
+  managedVolumeCapacityV1?: boolean;
   [key: string]: boolean | undefined;
 };
 
@@ -285,6 +286,7 @@ export interface AgentRegistrationSnapshot {
   cpuCores: number | null;
   memoryBytes: number | null;
   diskBytesAvailable: number | null;
+  diskTotalBytes: number | null;
   latestValidationReport: ServerValidationReport | null;
   capabilities?: AgentCapabilities | null;
 }
@@ -337,9 +339,21 @@ export interface AgentServiceMetricPayload {
   collectedAt: string;
 }
 
+export interface AgentVolumeMetricPayload {
+  volumeName: string;
+  usedBytes: number;
+  raw?: Record<string, unknown> | null;
+  collectedAt: string;
+}
+
+/**
+ * Every section is optional so the agent can report volume usage on its own cadence without
+ * also pushing host and per-container samples, which Alloy owns when observability is enabled.
+ */
 export interface AgentMetricsEnvelope {
-  server: AgentServerMetricPayload;
-  services: AgentServiceMetricPayload[];
+  server?: AgentServerMetricPayload | null;
+  services?: AgentServiceMetricPayload[];
+  volumes?: AgentVolumeMetricPayload[];
 }
 
 export type PostgresObservabilityExtensionStatus = {
@@ -487,7 +501,6 @@ export interface DatabaseProvisionPayload {
   containerArgs?: string[];
   dataPath?: string;
   internalPort: number;
-  storageSizeGb: number;
   externalHost: string | null;
   externalPort: number | null;
   publicAccessEnabled: boolean;
@@ -709,6 +722,7 @@ export function getDefaultAgentCapabilities(): AgentCapabilities {
     appVolumeRolloutV1: true,
     publicPortPreflightV1: true,
     backupIntegrityV1: true,
+    managedVolumeCapacityV1: true,
   };
 }
 

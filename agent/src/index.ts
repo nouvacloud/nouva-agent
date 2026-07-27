@@ -68,6 +68,12 @@ import {
 import { redactSensitiveText } from "./security.js";
 import { resolveDatabaseProvisionSpec } from "./service-runtime.js";
 import {
+  calculateDiskSafetyReserveBytes,
+  formatStorageBytes,
+  resolveDockerRootHostPath,
+  VOLUME_USAGE_INTERVAL_MS,
+} from "./storage-metrics.js";
+import {
   buildTraefikRuntimePaths,
   buildUnavailableTraefikChecks,
   collectTraefikValidationChecks,
@@ -202,8 +208,41 @@ interface ValidationSnapshot {
   cpuCores: number | null;
   memoryBytes: number | null;
   diskBytesAvailable: number | null;
+  diskTotalBytes: number | null;
   latestValidationReport: ServerValidationReport;
   capabilities: AgentCapabilities;
+}
+
+async function inspectDockerStorageFilesystem(docker: DockerApiClient): Promise<{
+  dockerRootDir: string;
+  hostPath: string;
+  diskAvailableBytes: number;
+  diskTotalBytes: number;
+}> {
+  const info = await docker.info();
+  const dockerRootDir = info.DockerRootDir;
+  const hostPath = resolveDockerRootHostPath(dockerRootDir);
+  const stats = await statfs(hostPath);
+  return {
+    dockerRootDir: dockerRootDir!,
+    hostPath,
+    diskAvailableBytes: Number(stats.bavail) * Number(stats.bsize),
+    diskTotalBytes: Number(stats.blocks) * Number(stats.bsize),
+  };
+}
+
+function buildManagedVolumeLabels(input: {
+  volumeId: string;
+  projectId?: string | null;
+  serviceId?: string | null;
+}): Record<string, string> {
+  return {
+    "nouva.managed": "true",
+    "nouva.resource": "volume",
+    "nouva.volume.id": input.volumeId,
+    ...(input.projectId ? { "nouva.project.id": input.projectId } : {}),
+    ...(input.serviceId ? { "nouva.service.id": input.serviceId } : {}),
+  };
 }
 
 function toObject(value: unknown): Record<string, unknown> {
@@ -828,17 +867,28 @@ async function collectValidationSnapshot(
   }
 
   let diskBytesAvailable: number | null = null;
+  let diskTotalBytes: number | null = null;
   try {
-    const stats = await statfs("/hostfs");
-    diskBytesAvailable = Number(stats.bavail) * Number(stats.bsize);
+    const disk = await inspectDockerStorageFilesystem(docker);
+    diskBytesAvailable = disk.diskAvailableBytes;
+    diskTotalBytes = disk.diskTotalBytes;
+    const safetyReserveBytes = calculateDiskSafetyReserveBytes(diskTotalBytes);
+    const status =
+      diskBytesAvailable <= safetyReserveBytes
+        ? "fail"
+        : diskBytesAvailable < safetyReserveBytes * 2
+          ? "warn"
+          : "pass";
+    const action =
+      "Add disk capacity or remove unused data, images, or volumes before Docker storage is exhausted.";
     checks.push(
       buildCheck(
         "disk",
-        "Disk headroom",
-        diskBytesAvailable >= 20 * 1024 * 1024 * 1024 ? "pass" : "warn",
-        diskBytesAvailable >= 20 * 1024 * 1024 * 1024
-          ? "At least 20GB free"
-          : "Less than 20GB free on the server",
+        "Docker storage headroom",
+        status,
+        status === "pass"
+          ? `${formatStorageBytes(diskBytesAvailable)} free on Docker storage at ${disk.dockerRootDir}.`
+          : `${formatStorageBytes(diskBytesAvailable)} free on Docker storage at ${disk.dockerRootDir}. Safety reserve: ${formatStorageBytes(safetyReserveBytes)}. ${action}`,
         String(diskBytesAvailable)
       )
     );
@@ -846,9 +896,9 @@ async function collectValidationSnapshot(
     checks.push(
       buildCheck(
         "disk",
-        "Disk headroom",
+        "Docker storage headroom",
         "warn",
-        error instanceof Error ? error.message : "Unable to inspect disk"
+        error instanceof Error ? error.message : "Unable to inspect Docker storage"
       )
     );
   }
@@ -1045,6 +1095,7 @@ async function collectValidationSnapshot(
     cpuCores: os.cpus().length,
     memoryBytes: os.totalmem(),
     diskBytesAvailable,
+    diskTotalBytes,
     latestValidationReport: {
       checkedAt: new Date().toISOString(),
       summary,
@@ -2053,7 +2104,14 @@ export async function deployAppImageWithDependencies(
   }
 
   if (payload.volume) {
-    await docker.createVolume(payload.volume.volumeName);
+    await docker.createVolume(
+      payload.volume.volumeName,
+      buildManagedVolumeLabels({
+        volumeId: payload.volume.volumeId,
+        projectId: payload.projectId,
+        serviceId: payload.serviceId,
+      })
+    );
     try {
       await assertSingleRunningVolumeConsumer(docker, payload.volume.volumeName, previousContainer);
       if (previousContainer) {
@@ -2619,7 +2677,14 @@ async function deployDatabaseContainer(
     "nouva.project.id": payload.projectId,
   });
   await docker.connectNetwork(projectNetwork, TRAEFIK_CONTAINER_NAME);
-  await docker.createVolume(volumeName);
+  await docker.createVolume(
+    volumeName,
+    buildManagedVolumeLabels({
+      volumeId: payload.volumeId,
+      projectId: payload.projectId,
+      serviceId: payload.serviceId,
+    })
+  );
   const containerId = await docker.ensureContainer(spec, true, {
     auth: resolveRegistryAuthForImage(config, resolved.image),
   });
@@ -2717,7 +2782,13 @@ export async function handleWipeVolume(
   if (!isAttachedDatabaseVolumePayload(payload)) {
     await docker.removeVolume(volumeName, true);
     await verifyVolumeAbsent(docker, volumeName);
-    await docker.createVolume(volumeName);
+    await docker.createVolume(
+      volumeName,
+      buildManagedVolumeLabels({
+        volumeId: payload.volumeId,
+        projectId: payload.projectId,
+      })
+    );
     if (!(await docker.inspectVolume(volumeName))) {
       throw new Error(`Replacement Docker volume ${volumeName} was not created`);
     }
@@ -2911,7 +2982,14 @@ async function handleRestoreArchiveBackup(
   }
   const remoteExpression = buildArchiveRemoteExpression(payload.destination.verifyTls);
   const agentTaskImage = await resolveAgentTaskImage(docker);
-  await docker.createVolume(payload.targetVolumeName);
+  await docker.createVolume(
+    payload.targetVolumeName,
+    buildManagedVolumeLabels({
+      volumeId: payload.targetVolumeId,
+      projectId: payload.projectId,
+      serviceId: payload.serviceId,
+    })
+  );
   await runTaskContainer(docker, config, {
     name: `nouva-restore-backup-${payload.backupId.slice(0, 12)}`,
     image: agentTaskImage,
@@ -3090,7 +3168,14 @@ async function handleRestorePgBackrestBackup(
   });
   const script = buildPgBackrestRestoreAndPromoteScript();
 
-  await docker.createVolume(payload.targetVolumeName);
+  await docker.createVolume(
+    payload.targetVolumeName,
+    buildManagedVolumeLabels({
+      volumeId: payload.targetVolumeId,
+      projectId: payload.projectId,
+      serviceId: payload.serviceId,
+    })
+  );
   await runTaskContainer(docker, config, {
     name: `nouva-pgbackrest-restore-${payload.targetVolumeId.slice(0, 12)}`,
     image: spec.image,
@@ -3648,21 +3733,21 @@ async function processWorkItem(
 }
 
 async function collectMetrics(docker: DockerApiClient): Promise<AgentMetricsEnvelope> {
-  const [currentCpuStat, previousCpuStat, meminfo, loadavg] = await Promise.all([
+  const [currentCpuStat, previousCpuStat, meminfo, loadavg, disk] = await Promise.all([
     readFile("/hostfs/proc/stat", "utf8"),
     readFile(path.join(DATA_DIR, "last-cpu-stat"), "utf8").catch(() => ""),
     readFile("/hostfs/proc/meminfo", "utf8"),
     readFile("/hostfs/proc/loadavg", "utf8").catch(() => ""),
+    inspectDockerStorageFilesystem(docker),
   ]);
 
-  const stats = await statfs("/hostfs");
   const serverMetrics = parseHostMetricsSnapshot({
     currentCpuStat,
     previousCpuStat,
     meminfo,
     loadavg,
-    diskAvailableBytes: Number(stats.bavail) * Number(stats.bsize),
-    diskTotalBytes: Number(stats.blocks) * Number(stats.bsize),
+    diskAvailableBytes: disk.diskAvailableBytes,
+    diskTotalBytes: disk.diskTotalBytes,
   });
   await writeFile(path.join(DATA_DIR, "last-cpu-stat"), currentCpuStat);
 
@@ -3693,6 +3778,24 @@ async function collectMetrics(docker: DockerApiClient): Promise<AgentMetricsEnve
   return {
     server: serverMetrics,
     services,
+  };
+}
+
+/**
+ * Docker computes local volume sizes by walking each volume directory on every /system/df call,
+ * so this is sampled far less often than host and container metrics. Reservation admission
+ * tolerates the lower resolution: stale usage is simply not credited back as reservable capacity.
+ */
+async function collectVolumeUsage(docker: DockerApiClient): Promise<AgentMetricsEnvelope> {
+  const volumeUsage = await docker.listManagedVolumeDiskUsage();
+
+  return {
+    volumes: volumeUsage.map((volume) => ({
+      volumeName: volume.volumeName,
+      usedBytes: volume.usedBytes,
+      raw: volume.raw,
+      collectedAt: new Date().toISOString(),
+    })),
   };
 }
 
@@ -3736,6 +3839,7 @@ async function main() {
   config = await sendHeartbeat(docker, credentials, config);
   let workLoopActive = false;
   let postgresObservabilityLoopActive = false;
+  let volumeUsageLoopActive = false;
   let isShuttingDown = false;
 
   const shutdown = async () => {
@@ -3798,6 +3902,33 @@ async function main() {
         console.error("[nouva-agent] metrics failed", error);
       });
   }, config.metricsIntervalSeconds * 1000);
+
+  // Volume usage backs reservation admission, so it is reported even when Alloy owns the rest
+  // of the telemetry pipeline.
+  setInterval(() => {
+    if (volumeUsageLoopActive || isShuttingDown) {
+      return;
+    }
+
+    volumeUsageLoopActive = true;
+    collectVolumeUsage(docker)
+      .then((metrics) =>
+        apiRequest("/api/agent/metrics", {
+          method: "POST",
+          token: credentials!.agentToken,
+          body: {
+            serverId: SERVER_ID!,
+            ...metrics,
+          } satisfies AgentMetricsRequest,
+        })
+      )
+      .catch((error) => {
+        console.error("[nouva-agent] volume usage failed", error);
+      })
+      .finally(() => {
+        volumeUsageLoopActive = false;
+      });
+  }, VOLUME_USAGE_INTERVAL_MS);
 
   if (config.postgresObservabilityIntervalSeconds > 0) {
     setInterval(() => {

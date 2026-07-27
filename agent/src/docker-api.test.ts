@@ -1,5 +1,10 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import { DockerApiClient, DockerApiError, parseDockerLogBuffer } from "./docker-api.js";
+import {
+  DockerApiClient,
+  DockerApiError,
+  parseDockerLogBuffer,
+  parseManagedVolumeDiskUsage,
+} from "./docker-api.js";
 
 function encodeFrame(streamType: 1 | 2, payload: string): Buffer {
   const content = Buffer.from(payload, "utf8");
@@ -43,6 +48,43 @@ describe("parseDockerLogBuffer", () => {
         type: "stdout",
         timestamp: null,
         line: "second line",
+      },
+    ]);
+  });
+});
+
+describe("parseManagedVolumeDiskUsage", () => {
+  test("includes labeled volumes and legacy nouva volume names", () => {
+    expect(
+      parseManagedVolumeDiskUsage({
+        Volumes: [
+          {
+            Name: "custom-volume",
+            Labels: { "nouva.managed": "true", "nouva.volume.id": "vol_1" },
+            UsageData: { Size: 4096, RefCount: 1 },
+          },
+          {
+            Name: "nouva-vol-legacy",
+            Labels: null,
+            UsageData: { Size: 1024, RefCount: 0 },
+          },
+          {
+            Name: "unmanaged",
+            Labels: null,
+            UsageData: { Size: 2048, RefCount: 0 },
+          },
+        ],
+      })
+    ).toEqual([
+      {
+        volumeName: "custom-volume",
+        usedBytes: 4096,
+        raw: { refCount: 1, managedByLabel: true, legacyName: false },
+      },
+      {
+        volumeName: "nouva-vol-legacy",
+        usedBytes: 1024,
+        raw: { refCount: 0, managedByLabel: false, legacyName: true },
       },
     ]);
   });
