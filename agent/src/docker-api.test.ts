@@ -2,6 +2,8 @@ import { describe, expect, spyOn, test } from "bun:test";
 import {
   DockerApiClient,
   DockerApiError,
+  hasManagedContainerLogConfig,
+  MANAGED_CONTAINER_LOG_CONFIG,
   parseDockerLogBuffer,
   parseManagedVolumeDiskUsage,
 } from "./docker-api.js";
@@ -144,6 +146,173 @@ describe("DockerApiClient.createContainer", () => {
     );
 
     requestSpy.mockRestore();
+  });
+
+  test.each([
+    "app",
+    "database",
+    "worker",
+    "worker_job",
+    "traefik",
+    "observability",
+  ])("enforces bounded json-file logging for managed %s containers", async (kind) => {
+    const DockerApiClientCtor = DockerApiClient as unknown as {
+      new (apiVersion: string): DockerApiClient;
+    };
+    const client = new DockerApiClientCtor("v1.51");
+    const requestSpy = spyOn(client, "request").mockResolvedValue({ Id: `ctr_${kind}` });
+
+    await client.createContainer({
+      name: `nouva-${kind}`,
+      image: "example/runtime:latest",
+      labels: {
+        "nouva.managed": "true",
+        "nouva.kind": kind,
+      },
+      hostConfig: {
+        Mounts: [{ Type: "volume", Source: "customer-data", Target: "/data" }],
+        LogConfig: {
+          Type: "local",
+          Config: { "max-size": "1g" },
+        },
+      },
+    });
+
+    expect(requestSpy).toHaveBeenCalledWith(
+      "POST",
+      `/containers/create?name=nouva-${kind}`,
+      expect.objectContaining({
+        HostConfig: expect.objectContaining({
+          Mounts: [{ Type: "volume", Source: "customer-data", Target: "/data" }],
+          LogConfig: MANAGED_CONTAINER_LOG_CONFIG,
+        }),
+      })
+    );
+
+    requestSpy.mockRestore();
+  });
+
+  test("does not rewrite logging for an unmanaged helper container", async () => {
+    const DockerApiClientCtor = DockerApiClient as unknown as {
+      new (apiVersion: string): DockerApiClient;
+    };
+    const client = new DockerApiClientCtor("v1.51");
+    const requestSpy = spyOn(client, "request").mockResolvedValue({ Id: "ctr_helper" });
+
+    await client.createContainer({
+      name: "nouva-helper",
+      image: "example/helper:latest",
+      hostConfig: {
+        LogConfig: { Type: "local", Config: { "max-size": "1m" } },
+      },
+    });
+
+    expect(requestSpy).toHaveBeenCalledWith(
+      "POST",
+      "/containers/create?name=nouva-helper",
+      expect.objectContaining({
+        HostConfig: {
+          LogConfig: { Type: "local", Config: { "max-size": "1m" } },
+        },
+      })
+    );
+
+    requestSpy.mockRestore();
+  });
+});
+
+describe("DockerApiClient managed logging adoption", () => {
+  test("inventories effective drift sequentially and keeps phase two fail closed", async () => {
+    const DockerApiClientCtor = DockerApiClient as unknown as {
+      new (apiVersion: string): DockerApiClient;
+    };
+    const client = new DockerApiClientCtor("v1.51");
+    const inspectionOrder: string[] = [];
+    const listSpy = spyOn(client, "listManagedContainers").mockResolvedValue([
+      {
+        Id: "ctr_app",
+        Names: ["/nouva-app"],
+        Labels: { "nouva.kind": "app" },
+      },
+      {
+        Id: "ctr_database",
+        Names: ["/nouva-postgres"],
+        Labels: { "nouva.kind": "database" },
+      },
+      {
+        Id: "ctr_missing",
+        Names: ["/nouva-missing"],
+        Labels: { "nouva.kind": "worker" },
+      },
+    ]);
+    const inspectSpy = spyOn(client, "inspectContainer").mockImplementation(async (id) => {
+      inspectionOrder.push(id);
+      if (id === "ctr_missing") {
+        return null;
+      }
+      return {
+        Id: id,
+        Name: id === "ctr_app" ? "/nouva-app" : "/nouva-postgres",
+        HostConfig:
+          id === "ctr_app"
+            ? { LogConfig: MANAGED_CONTAINER_LOG_CONFIG }
+            : { LogConfig: { Type: "json-file", Config: {} } },
+        Config: {
+          Labels: {
+            "nouva.managed": "true",
+            "nouva.kind": id === "ctr_app" ? "app" : "database",
+          },
+        },
+        Mounts:
+          id === "ctr_database"
+            ? [
+                {
+                  Type: "volume",
+                  Name: "nouva-vol-db",
+                  Source: "/var/lib/docker/volumes/nouva-vol-db/_data",
+                  Destination: "/var/lib/postgresql/data",
+                },
+              ]
+            : [],
+      };
+    });
+
+    const result = await client.inspectManagedContainerLogConfigAdoption();
+
+    expect(inspectionOrder).toEqual(["ctr_app", "ctr_database", "ctr_missing"]);
+    expect(result).toEqual({
+      phase2Ready: false,
+      containers: [
+        {
+          containerId: "ctr_app",
+          containerName: "nouva-app",
+          kind: "app",
+          status: "compliant",
+          stateful: false,
+          preservedVolumeNames: [],
+        },
+        {
+          containerId: "ctr_database",
+          containerName: "nouva-postgres",
+          kind: "database",
+          status: "recreation_required",
+          stateful: true,
+          preservedVolumeNames: ["nouva-vol-db"],
+        },
+        {
+          containerId: "ctr_missing",
+          containerName: "nouva-missing",
+          kind: "worker",
+          status: "inspection_failed",
+          stateful: false,
+          preservedVolumeNames: [],
+        },
+      ],
+    });
+    expect(hasManagedContainerLogConfig(null)).toBe(false);
+
+    listSpy.mockRestore();
+    inspectSpy.mockRestore();
   });
 });
 

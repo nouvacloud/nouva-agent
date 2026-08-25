@@ -7,6 +7,7 @@ export interface DeployAppImageInput {
   environmentId?: string | null;
   serviceId: string;
   deploymentId: string;
+  redactionContextVersion?: AppDeployPayload["redactionContextVersion"];
   commitHash: string;
   serviceName: string;
   subdomain: string;

@@ -18,10 +18,12 @@ import {
   type DeployAppImageInput,
 } from "./app-build-runtime.js";
 import { buildApp, hashProjectNetwork } from "./build.js";
+import { collectManagedContainerLogConfigValidationCheck } from "./container-log-reconciliation.js";
 import {
   DockerApiClient,
   type DockerContainerInspection,
   type DockerContainerSpec,
+  REDACTION_CONTEXT_VERSION_DOCKER_LABEL,
   type RegistryAuth,
 } from "./docker-api.js";
 import { toDockerResourceSettings } from "./docker-resource-limits.js";
@@ -70,7 +72,12 @@ import {
   type WorkerJobLifecyclePayload,
   type WorkerJobPayload,
 } from "./protocol.js";
-import { redactSensitiveText } from "./security.js";
+import {
+  type EnvironmentVariableMap,
+  redactSensitiveText,
+  sanitizeSensitiveProtocolValue,
+  sanitizeSensitiveValue,
+} from "./security.js";
 import { resolveDatabaseProvisionSpec } from "./service-runtime.js";
 import {
   calculateDiskSafetyReserveBytes,
@@ -758,6 +765,8 @@ async function collectValidationSnapshot(
   );
 
   if (dockerVersion) {
+    checks.push(await collectManagedContainerLogConfigValidationCheck(docker));
+
     let traefikBootstrapError: Error | null = null;
     try {
       await ensureTraefikRuntime(docker, getTraefikRuntimeInput(config));
@@ -1146,6 +1155,139 @@ export function shouldStopRetryingAgentWorkMutation(error: unknown): boolean {
   );
 }
 
+export interface AgentWorkFailureReport {
+  errorMessage: string;
+  result: Record<string, unknown> | null;
+}
+
+const AGENT_WORK_RESULT_PROTOCOL_KEYS = [
+  "activePgbackrestSets",
+  "artifactFormat",
+  "artifactSha256",
+  "buildDuration",
+  "cleanupProof",
+  "completedAt",
+  "containerId",
+  "containerName",
+  "detectedFramework",
+  "detectedLanguage",
+  "exitCode",
+  "externalHost",
+  "externalPort",
+  "imageUrl",
+  "integrityProof",
+  "internalHost",
+  "internalPort",
+  "job",
+  "languageVersion",
+  "objectKey",
+  "pgbackrestSet",
+  "pgbackrestType",
+  "restoreProof",
+  "rollout",
+  "runtimeInstance",
+  "runtimeInstances",
+  "runtimeMetadata",
+  "scheduleRunId",
+  "sizeBytes",
+  "startedAt",
+  "status",
+  "statusMessage",
+  "verifiedAt",
+] as const;
+
+export class AgentWorkResultRedactionConflictError extends Error {
+  constructor() {
+    super("Agent work result conflicts with protected environment material");
+    this.name = "AgentWorkResultRedactionConflictError";
+  }
+}
+
+function normalizeAgentProtocolValueForConflictCheck(
+  key: (typeof AGENT_WORK_RESULT_PROTOCOL_KEYS)[number],
+  value: unknown
+): unknown {
+  if (key === "statusMessage") {
+    return "[DIAGNOSTIC]";
+  }
+  if (key !== "job" || typeof value !== "object" || value === null || Array.isArray(value)) {
+    return value;
+  }
+
+  const job = { ...(value as Record<string, unknown>) };
+  if (Object.hasOwn(job, "statusMessage")) {
+    job.statusMessage = "[DIAGNOSTIC]";
+  }
+  return job;
+}
+
+function agentProtocolValueHasRedactionConflict(
+  key: (typeof AGENT_WORK_RESULT_PROTOCOL_KEYS)[number],
+  value: unknown,
+  sanitizedValue: unknown
+): boolean {
+  try {
+    return (
+      JSON.stringify(normalizeAgentProtocolValueForConflictCheck(key, value)) !==
+      JSON.stringify(normalizeAgentProtocolValueForConflictCheck(key, sanitizedValue))
+    );
+  } catch {
+    return true;
+  }
+}
+
+export function sanitizeAgentWorkResult(
+  result: Record<string, unknown> | null | undefined,
+  environmentVariables: EnvironmentVariableMap
+): Record<string, unknown> | null {
+  if (!result) {
+    return null;
+  }
+
+  const sanitizedResult = sanitizeSensitiveValue(result, environmentVariables);
+  if (!sanitizedResult || typeof sanitizedResult !== "object" || Array.isArray(sanitizedResult)) {
+    return null;
+  }
+
+  const safeResult = sanitizedResult as Record<string, unknown>;
+  for (const key of AGENT_WORK_RESULT_PROTOCOL_KEYS) {
+    if (Object.hasOwn(result, key)) {
+      const sanitizedProtocolValue = sanitizeSensitiveProtocolValue(
+        result[key],
+        environmentVariables
+      );
+      if (agentProtocolValueHasRedactionConflict(key, result[key], sanitizedProtocolValue)) {
+        throw new AgentWorkResultRedactionConflictError();
+      }
+      safeResult[key] = sanitizedProtocolValue;
+    }
+    if (Object.hasOwn(result, key) && Object.hasOwn(environmentVariables, key)) {
+      delete safeResult["[REDACTED]"];
+    }
+  }
+  return safeResult;
+}
+
+export function buildAgentWorkFailureReport(input: {
+  environmentVariables: EnvironmentVariableMap;
+  errorMessage: string;
+  result?: Record<string, unknown> | null;
+}): AgentWorkFailureReport {
+  let result: Record<string, unknown> | null;
+  try {
+    result = sanitizeAgentWorkResult(input.result, input.environmentVariables);
+  } catch (error) {
+    if (!(error instanceof AgentWorkResultRedactionConflictError)) {
+      throw error;
+    }
+    result = null;
+  }
+  return {
+    errorMessage: redactSensitiveText(input.errorMessage, input.environmentVariables),
+    result,
+  };
+}
+
 async function apiRequest<T>(
   pathName: string,
   options: {
@@ -1362,6 +1504,19 @@ async function sendHeartbeat(
   }
 
   const body = (await response.json()) as AgentHeartbeatResponse;
+  if (
+    body.config.observability.enabled &&
+    body.config.observability.redactionContextVersion !==
+      config.observability.redactionContextVersion
+  ) {
+    try {
+      await ensureAlloyRuntime(docker, getAlloyRuntimeInput(credentials, body.config), {
+        paths: ALLOY_PATHS,
+      });
+    } catch {
+      console.error("[nouva-agent] Alloy redaction context reload failed; validation will retry");
+    }
+  }
   return body.config;
 }
 
@@ -1400,6 +1555,7 @@ function buildLabels(input: {
   deploymentId?: string | null;
   serviceVariant?: string | null;
   environmentId?: string | null;
+  redactionContextVersion?: string | null;
 }): Record<string, string> {
   return {
     "nouva.managed": "true",
@@ -1410,6 +1566,9 @@ function buildLabels(input: {
     ...(input.deploymentId ? { "nouva.deployment.id": input.deploymentId } : {}),
     ...(input.serviceVariant ? { "nouva.service.variant": input.serviceVariant } : {}),
     ...(input.environmentId ? { "nouva.environment.id": input.environmentId } : {}),
+    ...(input.redactionContextVersion
+      ? { [REDACTION_CONTEXT_VERSION_DOCKER_LABEL]: input.redactionContextVersion }
+      : {}),
   };
 }
 
@@ -1435,6 +1594,9 @@ function getAlloyRuntimeInput(
     serverId: SERVER_ID!,
     apiUrl: API_URL!,
     agentToken: credentials.agentToken,
+    ...(config.observability.redactionContextVersion
+      ? { redactionContextVersion: config.observability.redactionContextVersion }
+      : {}),
     config,
   };
 }
@@ -1939,6 +2101,7 @@ export function buildAppContainerSpec(
         environmentId: payload.environmentId ?? null,
         serviceId: payload.serviceId,
         deploymentId: payload.deploymentId,
+        redactionContextVersion: payload.redactionContextVersion,
       }),
       hostConfig: {
         ...(payload.volume
@@ -2716,6 +2879,7 @@ export function buildDatabaseContainerSpec(payload: DatabaseProvisionPayload): {
         environmentId: payload.environmentId ?? null,
         serviceId: payload.serviceId,
         serviceVariant: payload.variant,
+        redactionContextVersion: payload.redactionContextVersion,
       }),
       exposedPorts: {
         [`${resolved.internalPort}/tcp`]: {},
@@ -3819,7 +3983,11 @@ async function processWorkItem(
   }
 
   if (workError) {
-    const errorMessage = redactSensitiveText(workError.message);
+    const failureReport = buildAgentWorkFailureReport({
+      environmentVariables: toRecord(payload.envVars),
+      errorMessage: workError.message,
+      result: failureResult ?? null,
+    });
     try {
       await apiRequest(`/api/agent/work/${workItem.id}/fail`, {
         method: "POST",
@@ -3827,8 +3995,8 @@ async function processWorkItem(
         body: {
           serverId: SERVER_ID!,
           leaseId: workItem.leaseId,
-          result: failureResult ?? null,
-          errorMessage,
+          result: failureReport.result,
+          errorMessage: failureReport.errorMessage,
         },
       });
     } catch (reportErr) {
@@ -3844,6 +4012,35 @@ async function processWorkItem(
     return;
   }
 
+  let sanitizedResult: Record<string, unknown> | null;
+  try {
+    sanitizedResult = sanitizeAgentWorkResult(result, toRecord(payload.envVars));
+  } catch (error) {
+    if (!(error instanceof AgentWorkResultRedactionConflictError)) {
+      throw error;
+    }
+    try {
+      await apiRequest(`/api/agent/work/${workItem.id}/fail`, {
+        method: "POST",
+        token: credentials.agentToken,
+        body: {
+          serverId: SERVER_ID!,
+          leaseId: workItem.leaseId,
+          result: null,
+          errorMessage: error.message,
+        },
+      });
+    } catch (reportError) {
+      if (!shouldStopRetryingAgentWorkMutation(reportError)) {
+        console.error(
+          `[nouva-agent] failed to report unsafe result for work ${workItem.id}:`,
+          reportError
+        );
+      }
+    }
+    return;
+  }
+
   try {
     await apiRequest(`/api/agent/work/${workItem.id}/complete`, {
       method: "POST",
@@ -3851,7 +4048,7 @@ async function processWorkItem(
       body: {
         serverId: SERVER_ID!,
         leaseId: workItem.leaseId,
-        result: result!,
+        result: sanitizedResult,
       },
     });
     console.log(`[nouva-agent] work ${workItem.id} (${workItem.kind}) completed`);
@@ -4011,25 +4208,34 @@ async function main() {
 
   let heartbeatFailures = 0;
   const MAX_HEARTBEAT_FAILURES = 5;
-
-  setInterval(() => {
-    sendHeartbeat(docker, credentials!, config)
-      .then((nextConfig) => {
-        config = nextConfig;
-        heartbeatFailures = 0;
-      })
-      .catch((error) => {
-        heartbeatFailures++;
-        console.error(
-          `[nouva-agent] heartbeat failed (${heartbeatFailures}/${MAX_HEARTBEAT_FAILURES})`,
-          error
-        );
-        if (heartbeatFailures >= MAX_HEARTBEAT_FAILURES) {
-          console.error("[nouva-agent] too many heartbeat failures, exiting");
-          process.exit(1);
-        }
-      });
-  }, config.heartbeatIntervalSeconds * 1000);
+  const scheduleHeartbeat = () => {
+    const intervalSeconds = config.observability.enabled
+      ? Math.min(config.heartbeatIntervalSeconds, 30)
+      : config.heartbeatIntervalSeconds;
+    setTimeout(() => {
+      if (isShuttingDown) {
+        return;
+      }
+      void sendHeartbeat(docker, credentials!, config)
+        .then((nextConfig) => {
+          config = nextConfig;
+          heartbeatFailures = 0;
+        })
+        .catch((error) => {
+          heartbeatFailures++;
+          console.error(
+            `[nouva-agent] heartbeat failed (${heartbeatFailures}/${MAX_HEARTBEAT_FAILURES})`,
+            error
+          );
+          if (heartbeatFailures >= MAX_HEARTBEAT_FAILURES) {
+            console.error("[nouva-agent] too many heartbeat failures, exiting");
+            process.exit(1);
+          }
+        })
+        .finally(scheduleHeartbeat);
+    }, intervalSeconds * 1000);
+  };
+  scheduleHeartbeat();
 
   setInterval(() => {
     if (config.observability.enabled || isShuttingDown) {

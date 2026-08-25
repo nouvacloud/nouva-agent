@@ -453,9 +453,16 @@ describe("agent protocol", () => {
   });
 
   test("resolves server-scoped observability config for authenticated agents", () => {
-    const config = resolveAgentRuntimeConfigForServer(getAgentRuntimeConfig(), "org_123");
+    const config = resolveAgentRuntimeConfigForServer(
+      getAgentRuntimeConfig(),
+      "org_123",
+      "hmac-sha256:redaction-context:v1:test"
+    );
 
     expect(config.observability.organizationId).toBe("org_123");
+    expect(config.observability.redactionContextVersion).toBe(
+      "hmac-sha256:redaction-context:v1:test"
+    );
   });
 
   test("advertises Alloy observability without the removed runtime log capability", () => {

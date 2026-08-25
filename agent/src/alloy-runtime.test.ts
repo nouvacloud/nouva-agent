@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   ALLOY_CONFIG_HASH_LABEL,
+  ALLOY_CONFIG_LAYOUT_LABEL,
+  ALLOY_CONFIG_LAYOUT_VERSION,
   ALLOY_CONTAINER_NAME,
   ALLOY_HTTP_HOST,
   ALLOY_HTTP_PORT,
@@ -13,10 +15,11 @@ import {
   createAlloyStateHash,
   ensureAlloyRuntime,
   getAlloyRuntimePaths,
-  renderAlloyConfig,
+  renderAlloyDynamicConfig,
+  renderAlloyStaticConfig,
   resetAlloyRuntimeState,
 } from "./alloy-runtime.js";
-import type { DockerContainerInspection } from "./docker-api.js";
+import type { DockerContainerInspection, DockerContainerSpec } from "./docker-api.js";
 import type { AgentRuntimeConfig } from "./protocol.js";
 
 const runtimeConfig: AgentRuntimeConfig = {
@@ -51,13 +54,14 @@ const runtimeConfig: AgentRuntimeConfig = {
   },
 };
 
-function createAlloyInput(dataDir: string) {
+function createAlloyInput(dataDir: string, redactionContextVersion = "context-v1") {
   return {
     dataDir,
     dataVolume: "nouva-agent-data",
     serverId: "srv_1",
     apiUrl: "https://api.nouva.sh",
     agentToken: "agent-token",
+    redactionContextVersion,
     config: runtimeConfig,
   };
 }
@@ -67,6 +71,8 @@ function createAlloyInspection(input: {
   running?: boolean;
   stateHash?: string;
   binds?: string[];
+  dataVolume?: string;
+  logConfigCurrent?: boolean;
 }): DockerContainerInspection {
   return {
     Id: ALLOY_CONTAINER_NAME,
@@ -81,11 +87,15 @@ function createAlloyInspection(input: {
         "/sys:/sys:ro",
         "/var/run:/var/run:ro",
         "/var/lib/docker:/var/lib/docker:ro",
-        "nouva-agent-data:/var/lib/nouva-agent",
+        `${input.dataVolume ?? "nouva-agent-data"}:/var/lib/nouva-agent`,
       ],
       RestartPolicy: {
         Name: "unless-stopped",
       },
+      LogConfig:
+        input.logConfigCurrent === false
+          ? { Type: "json-file", Config: {} }
+          : { Type: "json-file", Config: { "max-size": "10m", "max-file": "3" } },
       PortBindings: {
         [`${ALLOY_HTTP_PORT}/tcp`]: [
           {
@@ -98,8 +108,16 @@ function createAlloyInspection(input: {
     },
     Config: {
       Image: input.image ?? runtimeConfig.observability.alloyImage,
+      Cmd: [
+        "run",
+        "--stability.level=experimental",
+        "--server.http.listen-addr=0.0.0.0:12345",
+        "--storage.path=/var/lib/nouva-agent/alloy/data",
+        "/var/lib/nouva-agent/alloy/config",
+      ],
       Labels: {
         [ALLOY_CONFIG_HASH_LABEL]: input.stateHash ?? "state-hash",
+        [ALLOY_CONFIG_LAYOUT_LABEL]: ALLOY_CONFIG_LAYOUT_VERSION,
       },
     },
   };
@@ -116,35 +134,88 @@ describe("alloy-runtime", () => {
     }
   });
 
-  test("renders an Alloy config with filters, reserved labels, and bearer-auth writes", async () => {
+  test("renders bounded WAL delivery and v1 metadata-free remote write", async () => {
     tempDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-alloy-"));
 
-    const config = renderAlloyConfig(createAlloyInput(tempDir));
+    const config = renderAlloyStaticConfig(createAlloyInput(tempDir));
 
     expect(config).toContain('"https://api.nouva.sh/api/agent/observability/logs"');
     expect(config).toContain('"https://api.nouva.sh/api/agent/observability/metrics"');
     expect(config).toContain('"agent-token"');
     expect(config).toContain('min_backoff_period  = "1s"');
+    expect(config).toContain('remote_timeout      = "10s"');
     expect(config).toContain('max_backoff_period  = "1m"');
-    expect(config).toContain("max_backoff_retries = 10080");
+    expect(config).toContain("max_backoff_retries = 1200");
     expect(config).toContain("retry_on_http_429   = true");
     expect(config).toContain('capacity          = "64MiB"');
     expect(config).toContain("min_shards        = 1");
     expect(config).toContain("block_on_overflow = true");
     expect(config).toContain('drain_timeout     = "1m"');
     expect(config).toContain("enabled         = true");
-    expect(config).toContain('max_segment_age = "168h"');
+    expect(config).toContain('max_segment_age = "24h"');
     expect(config).toContain('regex         = "app|database|traefik|worker|worker_job"');
     expect(config).toContain('target_label = "organization_id"');
     expect(config).toContain('target_label = "environment_id"');
     expect(config).toContain('replacement  = "__none__"');
     expect(config).toContain("allowlisted_container_labels = [");
+    expect(config).toContain('"nouva.redaction.context.version"');
+    expect(config).toContain(`endpoint {
+    url          = "https://api.nouva.sh/api/agent/observability/metrics"
+    bearer_token = "agent-token"
+
+    metadata_config {
+      send = false
+    }
+  }`);
+    expect(config).not.toContain("protobuf_message");
+    expect(config).not.toContain("remote_write_version");
+    expect(config).not.toContain("X-Redaction-Context-Version");
+  });
+
+  test("keeps the runtime-log integration collector on the bounded WAL policy", async () => {
+    const config = await readFile(
+      new URL("../integration/runtime-logs/alloy.config", import.meta.url),
+      "utf8"
+    );
+
+    expect(config).toContain('remote_timeout        = "10s"');
+    expect(config).toContain('max_backoff_period    = "1m"');
+    expect(config).toContain("max_backoff_retries   = 1200");
+    expect(config).toContain("enabled         = true");
+    expect(config).toContain('max_segment_age = "24h"');
+  });
+
+  test("stamps system context dynamically before both delivery WALs", async () => {
+    tempDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-alloy-"));
+    const v1Input = createAlloyInput(tempDir, "context-v1");
+    const v2Input = createAlloyInput(tempDir, "context-v2");
+
+    const staticV1 = renderAlloyStaticConfig(v1Input);
+    const staticV2 = renderAlloyStaticConfig(v2Input);
+    const dynamicV1 = renderAlloyDynamicConfig(v1Input);
+    const dynamicV2 = renderAlloyDynamicConfig(v2Input);
+
+    expect(staticV2).toBe(staticV1);
+    expect(dynamicV1).toContain('replacement   = "context-v1"');
+    expect(dynamicV2).toContain('replacement   = "context-v2"');
+    expect(dynamicV2).toContain('source_labels = ["service_type", "redaction_context_version"]');
+    expect(dynamicV2).toContain('regex         = "system;$"');
+    expect(staticV1).toContain("forward_to = [loki.relabel.nouva_redaction_context.receiver]");
+    expect(dynamicV1.indexOf('loki.relabel "nouva_redaction_context"')).toBeLessThan(
+      dynamicV1.indexOf("forward_to = [loki.write.nouva.receiver]")
+    );
+    expect(staticV1).toContain(
+      "forward_to = [prometheus.relabel.nouva_redaction_context.receiver]"
+    );
+    expect(dynamicV1.indexOf('prometheus.relabel "nouva_redaction_context"')).toBeLessThan(
+      dynamicV1.indexOf("forward_to = [prometheus.remote_write.nouva.receiver]")
+    );
   });
 
   test("preserves worker identity in Loki and Mimir", async () => {
     tempDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-alloy-"));
 
-    const config = renderAlloyConfig(createAlloyInput(tempDir));
+    const config = renderAlloyStaticConfig(createAlloyInput(tempDir));
     const cadvisorOffset = config.indexOf('prometheus.exporter.cadvisor "nouva"');
     const lokiConfig = config.slice(0, cadvisorOffset);
     const metricConfig = config.slice(cadvisorOffset);
@@ -162,18 +233,28 @@ describe("alloy-runtime", () => {
     expect(metricConfig).toContain('target_label = "schedule_run_id"');
     expect(metricConfig).toContain('"container_label_nouva_schedule_run_id"');
     expect(metricConfig).toContain('target_label  = "container_name"');
+    const contextRuleIndex = metricConfig.indexOf(
+      'source_labels = ["container_label_nouva_redaction_context_version"]'
+    );
+    const terminalLabelDropIndex = metricConfig.indexOf(
+      'regex  = "container_label_.*|instance|job|id|name|image|container"'
+    );
+    expect(contextRuleIndex).toBeGreaterThan(-1);
+    expect(contextRuleIndex).toBeLessThan(terminalLabelDropIndex);
   });
 
   test("builds the managed Alloy container spec with required mounts and localhost health port", async () => {
     tempDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-alloy-"));
 
-    const config = renderAlloyConfig(createAlloyInput(tempDir));
+    const config = renderAlloyStaticConfig(createAlloyInput(tempDir));
     const spec = buildAlloyContainerSpec(createAlloyInput(tempDir), {
       stateHash: createAlloyStateHash(config),
     });
 
     expect(spec.image).toBe("grafana/alloy:v1.17.1");
     expect(spec.cmd).toContain("--stability.level=experimental");
+    expect(spec.cmd?.at(-1)).toBe("/var/lib/nouva-agent/alloy/config");
+    expect(spec.labels?.[ALLOY_CONFIG_LAYOUT_LABEL]).toBe(ALLOY_CONFIG_LAYOUT_VERSION);
     expect(spec.hostConfig).toEqual(
       expect.objectContaining({
         Binds: expect.arrayContaining([
@@ -186,6 +267,10 @@ describe("alloy-runtime", () => {
         ]),
         RestartPolicy: {
           Name: "unless-stopped",
+        },
+        LogConfig: {
+          Type: "json-file",
+          Config: { "max-size": "10m", "max-file": "3" },
         },
         Privileged: true,
         PortBindings: {
@@ -205,7 +290,7 @@ describe("alloy-runtime", () => {
         cmd: [
           "validate",
           "--stability.level=experimental",
-          "/var/lib/nouva-agent/alloy/config.alloy.candidate",
+          "/var/lib/nouva-agent/alloy/config.candidate",
         ],
         hostConfig: {
           Binds: ["nouva-agent-data:/var/lib/nouva-agent:ro"],
@@ -219,8 +304,9 @@ describe("alloy-runtime", () => {
     tempDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-alloy-"));
     const paths = getAlloyRuntimePaths(tempDir);
     const input = createAlloyInput(tempDir);
-    const config = renderAlloyConfig(input);
-    const stateHash = createAlloyStateHash(config);
+    const staticConfig = renderAlloyStaticConfig(input);
+    const dynamicConfig = renderAlloyDynamicConfig(input);
+    const stateHash = createAlloyStateHash(staticConfig);
     const dockerState: { inspection: DockerContainerInspection | null } = {
       inspection: null,
     };
@@ -238,15 +324,13 @@ describe("alloy-runtime", () => {
           dockerState.inspection = null;
         }
       }),
-      ensureContainer: mock(
-        async (spec: { image: string; labels?: Record<string, string>; hostConfig?: unknown }) => {
-          dockerState.inspection = createAlloyInspection({
-            image: spec.image,
-            stateHash: spec.labels?.[ALLOY_CONFIG_HASH_LABEL] ?? stateHash,
-          });
-          return ALLOY_CONTAINER_NAME;
-        }
-      ),
+      ensureContainer: mock(async (spec: DockerContainerSpec) => {
+        dockerState.inspection = createAlloyInspection({
+          image: spec.image,
+          stateHash: spec.labels?.[ALLOY_CONFIG_HASH_LABEL] ?? stateHash,
+        });
+        return ALLOY_CONTAINER_NAME;
+      }),
     };
 
     const fetchImpl: typeof fetch = mock(
@@ -263,8 +347,11 @@ describe("alloy-runtime", () => {
       intervalMs: 1,
     });
 
-    const persistedConfig = await readFile(paths.configPath, "utf8");
-    expect(persistedConfig).toContain("/api/agent/observability/logs");
+    const persistedStaticConfig = await readFile(paths.staticConfigPath, "utf8");
+    const persistedDynamicConfig = await readFile(paths.dynamicConfigPath, "utf8");
+    expect(persistedStaticConfig).toBe(staticConfig);
+    expect(persistedStaticConfig).toContain("/api/agent/observability/logs");
+    expect(persistedDynamicConfig).toBe(dynamicConfig);
     expect(docker.pullImage).toHaveBeenCalledWith("grafana/alloy:v1.17.1");
     expect(docker.createContainer).toHaveBeenCalledWith(buildAlloyValidationContainerSpec(input));
     expect(docker.ensureContainer).toHaveBeenCalledTimes(1);
@@ -281,6 +368,11 @@ describe("alloy-runtime", () => {
       {
         paths,
         fetchImpl,
+        statfsImpl: async () => ({
+          bavail: 20 * 1024 * 1024 * 1024,
+          blocks: 100 * 1024 * 1024 * 1024,
+          bsize: 1,
+        }),
       }
     );
 
@@ -290,7 +382,323 @@ describe("alloy-runtime", () => {
       expect.objectContaining({ key: "alloy-config", status: "pass" }),
       expect.objectContaining({ key: "alloy-health", status: "pass" }),
       expect.objectContaining({ key: "alloy-mounts", status: "pass" }),
+      expect.objectContaining({ key: "alloy-wal-disk", status: "pass" }),
     ]);
+
+    const pressureChecks = await collectAlloyValidationChecks(
+      {
+        inspectContainer: docker.inspectContainer,
+        inspectImage: docker.inspectImage,
+      },
+      input,
+      {
+        paths,
+        fetchImpl,
+        statfsImpl: async () => ({
+          bavail: 4 * 1024 * 1024 * 1024,
+          blocks: 100 * 1024 * 1024 * 1024,
+          bsize: 1,
+        }),
+      }
+    );
+    expect(pressureChecks.find((check) => check.key === "alloy-wal-disk")).toEqual(
+      expect.objectContaining({ status: "fail" })
+    );
+  });
+
+  test("keeps buffered V1 records and state while V2 is applied by reload", async () => {
+    tempDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-alloy-"));
+    const paths = getAlloyRuntimePaths(tempDir);
+    const v1Input = createAlloyInput(tempDir, "context-v1");
+    const v2Input = createAlloyInput(tempDir, "context-v2");
+    const staticConfig = renderAlloyStaticConfig(v1Input);
+    const stateHash = createAlloyStateHash(staticConfig);
+    const dockerState: { inspection: DockerContainerInspection | null } = {
+      inspection: null,
+    };
+    const ensuredSpecs: DockerContainerSpec[] = [];
+    const removedNames: string[] = [];
+    const docker = {
+      inspectContainer: mock(async () => dockerState.inspection),
+      inspectImage: mock(async () => ({ Id: "img_1" })),
+      pullImage: mock(async () => undefined),
+      createContainer: mock(async () => "alloy-validation"),
+      startContainer: mock(async () => undefined),
+      waitContainer: mock(async () => 0),
+      containerLogs: mock(async () => ""),
+      removeContainer: mock(async (name: string) => {
+        removedNames.push(name);
+        if (name === ALLOY_CONTAINER_NAME) {
+          dockerState.inspection = null;
+        }
+      }),
+      ensureContainer: mock(async (spec: DockerContainerSpec) => {
+        ensuredSpecs.push(spec);
+        dockerState.inspection = createAlloyInspection({
+          image: spec.image,
+          stateHash: spec.labels?.[ALLOY_CONFIG_HASH_LABEL] ?? stateHash,
+        });
+        return ALLOY_CONTAINER_NAME;
+      }),
+    };
+    const fetchImpl: typeof fetch = mock(
+      async () => new Response("ok", { status: 200 })
+    ) as typeof fetch;
+
+    await ensureAlloyRuntime(docker, v1Input, {
+      paths,
+      fetchImpl,
+      timeoutMs: 100,
+      intervalMs: 1,
+    });
+
+    const v1Fragment = await readFile(paths.dynamicConfigPath, "utf8");
+    const bufferedRecordPath = path.join(paths.dataDir, "loki", "wal", "buffered-v1");
+    const positionsPath = path.join(paths.dataDir, "loki", "positions", "positions.yml");
+    await mkdir(path.dirname(bufferedRecordPath), { recursive: true });
+    await mkdir(path.dirname(positionsPath), { recursive: true });
+    await writeFile(bufferedRecordPath, "redaction_context_version=context-v1\n", "utf8");
+    await writeFile(positionsPath, "cursor: 42\n", "utf8");
+
+    const argsBeforeReload = dockerState.inspection?.Config?.Cmd;
+    await ensureAlloyRuntime(docker, v2Input, {
+      paths,
+      fetchImpl,
+      reloadTimeoutMs: 100,
+      timeoutMs: 100,
+      intervalMs: 1,
+    });
+
+    expect(v1Fragment).toContain('replacement   = "context-v1"');
+    expect(await readFile(paths.dynamicConfigPath, "utf8")).toContain(
+      'replacement   = "context-v2"'
+    );
+    expect(await readFile(paths.staticConfigPath, "utf8")).toBe(staticConfig);
+    expect(await readFile(bufferedRecordPath, "utf8")).toBe(
+      "redaction_context_version=context-v1\n"
+    );
+    expect(await readFile(positionsPath, "utf8")).toBe("cursor: 42\n");
+    expect(dockerState.inspection?.Config?.Cmd).toEqual(argsBeforeReload);
+    expect(ensuredSpecs).toHaveLength(1);
+    expect(docker.pullImage).toHaveBeenCalledTimes(1);
+    expect(removedNames.filter((name) => name === ALLOY_CONTAINER_NAME)).toHaveLength(0);
+    expect(fetchImpl).toHaveBeenCalledWith(
+      `http://${ALLOY_HTTP_HOST}:${ALLOY_HTTP_PORT}/-/reload`,
+      expect.objectContaining({ method: "POST" })
+    );
+  });
+
+  test("coalesces concurrent context updates to the latest fragment", async () => {
+    tempDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-alloy-"));
+    const paths = getAlloyRuntimePaths(tempDir);
+    const v1Input = createAlloyInput(tempDir, "context-v1");
+    const v2Input = createAlloyInput(tempDir, "context-v2");
+    const v3Input = createAlloyInput(tempDir, "context-v3");
+    const stateHash = createAlloyStateHash(renderAlloyStaticConfig(v1Input));
+    const dockerState: { inspection: DockerContainerInspection | null } = {
+      inspection: null,
+    };
+    let validationCount = 0;
+    let releaseFirstValidation = () => {};
+    let announceFirstValidation = () => {};
+    const firstValidationStarted = new Promise<void>((resolve) => {
+      announceFirstValidation = resolve;
+    });
+    const firstValidationGate = new Promise<void>((resolve) => {
+      releaseFirstValidation = resolve;
+    });
+    const docker = {
+      inspectContainer: mock(async () => dockerState.inspection),
+      inspectImage: mock(async () => ({ Id: "img_1" })),
+      pullImage: mock(async () => undefined),
+      createContainer: mock(async () => "alloy-validation"),
+      startContainer: mock(async () => undefined),
+      waitContainer: mock(async () => {
+        validationCount += 1;
+        if (validationCount === 1) {
+          announceFirstValidation();
+          await firstValidationGate;
+        }
+        return 0;
+      }),
+      containerLogs: mock(async () => ""),
+      removeContainer: mock(async (name: string) => {
+        if (name === ALLOY_CONTAINER_NAME) {
+          dockerState.inspection = null;
+        }
+      }),
+      ensureContainer: mock(async (spec: DockerContainerSpec) => {
+        dockerState.inspection = createAlloyInspection({
+          image: spec.image,
+          stateHash: spec.labels?.[ALLOY_CONFIG_HASH_LABEL] ?? stateHash,
+        });
+        return ALLOY_CONTAINER_NAME;
+      }),
+    };
+    const fetchImpl: typeof fetch = mock(
+      async () => new Response("ok", { status: 200 })
+    ) as typeof fetch;
+    const deps = {
+      paths,
+      fetchImpl,
+      reloadTimeoutMs: 100,
+      timeoutMs: 100,
+      intervalMs: 1,
+    };
+
+    const first = ensureAlloyRuntime(docker, v1Input, deps);
+    await firstValidationStarted;
+    const second = ensureAlloyRuntime(docker, v2Input, deps);
+    const third = ensureAlloyRuntime(docker, v3Input, deps);
+    releaseFirstValidation();
+    await Promise.all([first, second, third]);
+
+    const fragment = await readFile(paths.dynamicConfigPath, "utf8");
+    expect(fragment).toContain('replacement   = "context-v3"');
+    expect(fragment).not.toContain("context-v2");
+    expect(validationCount).toBe(2);
+    expect(docker.ensureContainer).toHaveBeenCalledTimes(1);
+    expect(
+      fetchImpl.mock.calls.filter((call) => String(call[0]).endsWith("/-/reload"))
+    ).toHaveLength(1);
+  });
+
+  test("restores the previous dynamic fragment when reload fails", async () => {
+    tempDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-alloy-"));
+    const paths = getAlloyRuntimePaths(tempDir);
+    const v1Input = createAlloyInput(tempDir, "context-v1");
+    const v2Input = createAlloyInput(tempDir, "context-v2");
+    const stateHash = createAlloyStateHash(renderAlloyStaticConfig(v1Input));
+    const dockerState: { inspection: DockerContainerInspection | null } = {
+      inspection: null,
+    };
+    const mainRemovals: string[] = [];
+    const docker = {
+      inspectContainer: mock(async () => dockerState.inspection),
+      inspectImage: mock(async () => ({ Id: "img_1" })),
+      pullImage: mock(async () => undefined),
+      createContainer: mock(async () => "alloy-validation"),
+      startContainer: mock(async () => undefined),
+      waitContainer: mock(async () => 0),
+      containerLogs: mock(async () => ""),
+      removeContainer: mock(async (name: string) => {
+        if (name === ALLOY_CONTAINER_NAME) {
+          mainRemovals.push(name);
+          dockerState.inspection = null;
+        }
+      }),
+      ensureContainer: mock(async (spec: DockerContainerSpec) => {
+        dockerState.inspection = createAlloyInspection({
+          image: spec.image,
+          stateHash: spec.labels?.[ALLOY_CONFIG_HASH_LABEL] ?? stateHash,
+        });
+        return ALLOY_CONTAINER_NAME;
+      }),
+    };
+    let failNextReload = false;
+    const fetchImpl: typeof fetch = mock(async (request: RequestInfo | URL) => {
+      if (String(request).endsWith("/-/reload") && failNextReload) {
+        failNextReload = false;
+        return new Response("invalid", { status: 500 });
+      }
+      return new Response("ok", { status: 200 });
+    }) as typeof fetch;
+
+    await ensureAlloyRuntime(docker, v1Input, {
+      paths,
+      fetchImpl,
+      timeoutMs: 100,
+      intervalMs: 1,
+    });
+    const v1Fragment = await readFile(paths.dynamicConfigPath, "utf8");
+    failNextReload = true;
+
+    await expect(
+      ensureAlloyRuntime(docker, v2Input, {
+        paths,
+        fetchImpl,
+        reloadTimeoutMs: 100,
+        timeoutMs: 100,
+        intervalMs: 1,
+      })
+    ).rejects.toThrow("the previous fragment was restored");
+
+    expect(await readFile(paths.dynamicConfigPath, "utf8")).toBe(v1Fragment);
+    expect(mainRemovals).toHaveLength(0);
+    expect(
+      fetchImpl.mock.calls.filter((call) => String(call[0]).endsWith("/-/reload"))
+    ).toHaveLength(2);
+  });
+
+  test("adopts Alloy logging drift once while preserving its data volume", async () => {
+    tempDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-alloy-"));
+    const paths = getAlloyRuntimePaths(tempDir);
+    const input = createAlloyInput(tempDir);
+    const staticConfig = renderAlloyStaticConfig(input);
+    const stateHash = createAlloyStateHash(staticConfig);
+    const dockerState: { inspection: DockerContainerInspection | null } = {
+      inspection: createAlloyInspection({
+        dataVolume: "legacy-alloy-data",
+        logConfigCurrent: false,
+        stateHash,
+      }),
+    };
+    const ensuredSpecs: DockerContainerSpec[] = [];
+    const removedNames: string[] = [];
+    const docker = {
+      inspectContainer: mock(async () => dockerState.inspection),
+      inspectImage: mock(async () => ({ Id: "img_1" })),
+      pullImage: mock(async () => undefined),
+      createContainer: mock(async () => "alloy-validation"),
+      startContainer: mock(async () => undefined),
+      waitContainer: mock(async () => 0),
+      containerLogs: mock(async () => ""),
+      removeContainer: mock(async (name: string) => {
+        removedNames.push(name);
+        if (name === ALLOY_CONTAINER_NAME) {
+          dockerState.inspection = null;
+        }
+      }),
+      ensureContainer: mock(async (spec: DockerContainerSpec) => {
+        ensuredSpecs.push(spec);
+        dockerState.inspection = createAlloyInspection({
+          dataVolume: "legacy-alloy-data",
+          image: spec.image,
+          stateHash: spec.labels?.[ALLOY_CONFIG_HASH_LABEL] ?? stateHash,
+        });
+        return ALLOY_CONTAINER_NAME;
+      }),
+    };
+    const fetchImpl: typeof fetch = mock(
+      async () => new Response("ok", { status: 200 })
+    ) as typeof fetch;
+
+    await ensureAlloyRuntime(docker, input, {
+      paths,
+      fetchImpl,
+      timeoutMs: 100,
+      intervalMs: 1,
+    });
+    await ensureAlloyRuntime(docker, input, {
+      paths,
+      fetchImpl,
+      timeoutMs: 100,
+      intervalMs: 1,
+    });
+
+    expect(removedNames.filter((name) => name === ALLOY_CONTAINER_NAME)).toEqual([
+      ALLOY_CONTAINER_NAME,
+    ]);
+    expect(ensuredSpecs).toHaveLength(1);
+    expect(ensuredSpecs[0]?.hostConfig).toEqual(
+      expect.objectContaining({
+        Binds: expect.arrayContaining(["legacy-alloy-data:/var/lib/nouva-agent"]),
+        LogConfig: {
+          Type: "json-file",
+          Config: { "max-size": "10m", "max-file": "3" },
+        },
+      })
+    );
   });
 
   test("keeps the running collector when candidate config validation fails", async () => {
@@ -308,18 +716,27 @@ describe("alloy-runtime", () => {
       createContainer: mock(async () => "alloy-validation"),
       startContainer: mock(async () => undefined),
       waitContainer: mock(async () => 1),
-      containerLogs: mock(async () => "invalid queue_config"),
+      containerLogs: mock(async () => "invalid queue_config token=agent-token context=context-v1"),
       removeContainer,
       ensureContainer: mock(async () => ALLOY_CONTAINER_NAME),
     };
 
-    await expect(
-      ensureAlloyRuntime(docker, input, {
+    let failure: Error | null = null;
+    try {
+      await ensureAlloyRuntime(docker, input, {
         paths: getAlloyRuntimePaths(tempDir),
         timeoutMs: 100,
         intervalMs: 1,
-      })
-    ).rejects.toThrow("Alloy configuration validation failed: invalid queue_config");
+      });
+    } catch (error) {
+      failure = error instanceof Error ? error : new Error("unknown failure");
+    }
+
+    expect(failure?.message).toContain(
+      "Alloy configuration validation failed: invalid queue_config"
+    );
+    expect(failure?.message).not.toContain("agent-token");
+    expect(failure?.message).not.toContain("context-v1");
 
     expect(removeContainer).not.toHaveBeenCalledWith(ALLOY_CONTAINER_NAME, true);
     expect(docker.ensureContainer).not.toHaveBeenCalled();

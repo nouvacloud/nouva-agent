@@ -289,6 +289,7 @@ export type AgentBuildkitMode = "docker-container";
 export interface AgentObservabilityConfig {
   enabled: boolean;
   organizationId: string | null;
+  redactionContextVersion?: string | null;
   alloyImage: string;
   scrapeIntervalSeconds: number;
   collectorScope: "services_traefik_and_workers";
@@ -440,6 +441,8 @@ export interface AppDeployPayload {
   environmentId?: string | null;
   serviceId: string;
   deploymentId: string;
+  redactionContextVersion?: string;
+  // Added by the control plane during lease hydration, never stored in queued work.
   envVars: Record<string, string>;
   appBuildType?: AppBuildType | null;
   appBuildConfig?: AppBuildConfig | null;
@@ -463,6 +466,8 @@ export interface DeployOnlyPayload {
   environmentId?: string | null;
   serviceId: string;
   deploymentId: string;
+  redactionContextVersion?: string;
+  // Added by the control plane during lease hydration, never stored in queued work.
   envVars: Record<string, string>;
   volume?: AppVolumeIdentity | null;
   resourceLimits: EffectiveServiceResourceLimits;
@@ -487,6 +492,8 @@ export interface WorkerDeployPayload {
   environmentId?: string | null;
   serviceId: string;
   deploymentId: string;
+  redactionContextVersion?: string;
+  // Added by the control plane during lease hydration, never stored in queued work.
   envVars: Record<string, string>;
   appBuildType?: Exclude<AppBuildType, "static"> | null;
   appBuildConfig?: AppBuildConfig | null;
@@ -507,6 +514,8 @@ export interface WorkerDeployOnlyPayload {
   environmentId?: string | null;
   serviceId: string;
   deploymentId: string;
+  redactionContextVersion?: string;
+  // Added by the control plane during lease hydration, never stored in queued work.
   envVars: Record<string, string>;
   startCommand: string | null;
   healthCheckCommand: string | null;
@@ -521,11 +530,13 @@ export interface WorkerJobPayload {
   environmentId?: string | null;
   serviceId: string;
   deploymentId: string;
+  redactionContextVersion?: string;
   scheduleId: string;
   scheduleRunId: string;
   occurrenceKey: string;
   jobName: string;
   imageUrl: string;
+  // Added by the control plane during lease hydration, never stored in queued work.
   envVars: Record<string, string>;
   command: string;
   timeoutSeconds: number;
@@ -562,6 +573,7 @@ export interface DatabaseProvisionPayload {
   projectId: string;
   environmentId?: string | null;
   serviceId: string;
+  redactionContextVersion?: string;
   serviceName: string;
   variant: DatabaseServiceVariant;
   volumeId: string;
@@ -814,19 +826,22 @@ export function resolveAgentCapabilities(config: AgentRuntimeConfig): AgentCapab
 
 export function resolveAgentRuntimeConfigForServer(
   baseConfig: AgentRuntimeConfig,
-  organizationId: string
+  organizationId: string,
+  redactionContextVersion?: string | null
 ): AgentRuntimeConfig {
   return {
     ...baseConfig,
     observability: {
       ...baseConfig.observability,
       organizationId,
+      ...(redactionContextVersion !== undefined ? { redactionContextVersion } : {}),
     },
     capabilities: resolveAgentCapabilities({
       ...baseConfig,
       observability: {
         ...baseConfig.observability,
         organizationId,
+        ...(redactionContextVersion !== undefined ? { redactionContextVersion } : {}),
       },
     }),
   };

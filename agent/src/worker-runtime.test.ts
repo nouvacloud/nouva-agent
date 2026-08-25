@@ -39,6 +39,7 @@ const workerPayload: WorkerDeployOnlyPayload = {
   environmentId: "env_1",
   serviceId: "svc_1",
   deploymentId: "dep_1",
+  redactionContextVersion: "hmac-sha256:redaction-context:v1:deployment",
   envVars: { NODE_ENV: "production" },
   startCommand: null,
   healthCheckCommand: null,
@@ -177,6 +178,7 @@ describe("worker container specs", () => {
         "nouva.service.type": "worker",
         "nouva.replica.index": "2",
         "nouva.service.id": "svc_1",
+        "nouva.redaction.context.version": "hmac-sha256:redaction-context:v1:deployment",
       })
     );
     expect(result.imageCommand).toEqual({
@@ -418,12 +420,13 @@ describe("scheduled worker job receipts", () => {
   test("returns the receipt on retry without starting the user command twice", async () => {
     const dataDir = await mkdtemp(path.join(os.tmpdir(), "nouva-worker-job-"));
     tempDirs.push(dataDir);
-    const { docker } = createRuntimeDocker();
+    const { containers, docker } = createRuntimeDocker();
     const payload: WorkerJobPayload = {
       projectId: "proj_1",
       environmentId: "env_1",
       serviceId: "svc_1",
       deploymentId: "dep_1",
+      redactionContextVersion: "hmac-sha256:redaction-context:v1:job",
       scheduleId: "schedule_1",
       scheduleRunId: "run_1",
       occurrenceKey: "2026-07-27T12:00:00.000Z",
@@ -458,6 +461,14 @@ describe("scheduled worker job receipts", () => {
     );
     expect(docker.createContainer).toHaveBeenCalledTimes(1);
     expect(docker.startContainer).toHaveBeenCalledTimes(1);
+    expect(
+      containers.get(buildWorkerJobContainerName(payload.serviceId, payload.scheduleRunId))?.Config
+        ?.Labels
+    ).toEqual(
+      expect.objectContaining({
+        "nouva.redaction.context.version": "hmac-sha256:redaction-context:v1:job",
+      })
+    );
   });
 
   test("recovers a labeled container when the agent lost its local receipt", async () => {

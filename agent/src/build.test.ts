@@ -1,11 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import {
+  BuildctlExecutionError,
   buildDockerfileBuildctlArgs,
   buildRailpackBuildctlArgs,
   buildStaticNginxConfig,
   buildStaticRuntimeDockerfile,
   detectDockerfileExposedPort,
   normalizeAppBuildSettings,
+  toSafeBuildctlExecutionError,
 } from "./build.js";
 
 describe("build helpers", () => {
@@ -70,6 +72,21 @@ describe("build helpers", () => {
         "target=runner",
       ])
     );
+  });
+
+  test("replaces buildctl command failures without retaining argv or build arguments", () => {
+    const unsafeError = new Error(
+      "Command failed: buildctl --opt build-arg:Q=x --opt build-arg:UV=yz"
+    );
+
+    const safeError = toSafeBuildctlExecutionError(unsafeError);
+
+    expect(safeError).toBeInstanceOf(BuildctlExecutionError);
+    expect(safeError.message).toBe("BuildKit build failed");
+    expect(safeError.message).not.toContain("buildctl");
+    expect(safeError.message).not.toContain("build-arg");
+    expect(safeError.message).not.toContain("Q=x");
+    expect(safeError.cause).toBeUndefined();
   });
 
   test("generates static runtime artifacts with SPA fallback", () => {

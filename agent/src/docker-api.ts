@@ -31,6 +31,16 @@ export interface RegistryAuth {
   password: string;
 }
 
+export const MANAGED_CONTAINER_LOG_CONFIG = {
+  Type: "json-file",
+  Config: {
+    "max-size": "10m",
+    "max-file": "3",
+  },
+} as const;
+
+export const REDACTION_CONTEXT_VERSION_DOCKER_LABEL = "nouva.redaction.context.version";
+
 export interface DockerContainerInspection {
   Id: string;
   Name: string;
@@ -57,6 +67,10 @@ export interface DockerContainerInspection {
     Privileged?: boolean;
     RestartPolicy?: {
       Name?: string;
+    };
+    LogConfig?: {
+      Type?: string;
+      Config?: Record<string, string>;
     };
     PortBindings?: Record<
       string,
@@ -146,6 +160,52 @@ export interface DockerContainerSpec {
   exposedPorts?: Record<string, Record<string, never>>;
   hostConfig?: Record<string, unknown>;
   networkingConfig?: Record<string, unknown>;
+}
+
+export type ManagedContainerLogConfigAdoptionStatus =
+  | "compliant"
+  | "recreation_required"
+  | "inspection_failed";
+
+export interface ManagedContainerLogConfigAdoptionEntry {
+  containerId: string;
+  containerName: string;
+  kind: string | null;
+  status: ManagedContainerLogConfigAdoptionStatus;
+  stateful: boolean;
+  preservedVolumeNames: string[];
+}
+
+export interface ManagedContainerLogConfigAdoptionResult {
+  phase2Ready: boolean;
+  containers: ManagedContainerLogConfigAdoptionEntry[];
+}
+
+export function hasManagedContainerLogConfig(
+  inspection: DockerContainerInspection | null
+): boolean {
+  const logConfig = inspection?.HostConfig?.LogConfig;
+  return (
+    logConfig?.Type === MANAGED_CONTAINER_LOG_CONFIG.Type &&
+    logConfig.Config?.["max-size"] === MANAGED_CONTAINER_LOG_CONFIG.Config["max-size"] &&
+    logConfig.Config?.["max-file"] === MANAGED_CONTAINER_LOG_CONFIG.Config["max-file"]
+  );
+}
+
+function withManagedContainerLogConfig(
+  spec: DockerContainerSpec
+): Record<string, unknown> | undefined {
+  if (spec.labels?.["nouva.managed"] !== "true") {
+    return spec.hostConfig;
+  }
+
+  return {
+    ...(spec.hostConfig ?? {}),
+    LogConfig: {
+      Type: MANAGED_CONTAINER_LOG_CONFIG.Type,
+      Config: { ...MANAGED_CONTAINER_LOG_CONFIG.Config },
+    },
+  };
 }
 
 export interface DockerLogEntry {
@@ -417,6 +477,57 @@ export class DockerApiClient {
     return await this.request("GET", `/containers/json?all=true&filters=${filters}`);
   }
 
+  async inspectManagedContainerLogConfigAdoption(): Promise<ManagedContainerLogConfigAdoptionResult> {
+    const containers = await this.listManagedContainers();
+    const results: ManagedContainerLogConfigAdoptionEntry[] = [];
+
+    for (const container of containers) {
+      const inspection = await this.inspectContainer(container.Id);
+      if (!inspection) {
+        const kind = container.Labels?.["nouva.kind"] ?? null;
+        results.push({
+          containerId: container.Id,
+          containerName: container.Names?.[0]?.replace(/^\//, "") ?? container.Id,
+          kind,
+          status: "inspection_failed",
+          stateful: kind === "database",
+          preservedVolumeNames: [],
+        });
+        continue;
+      }
+
+      const preservedVolumeNames = [
+        ...new Set(
+          (inspection.Mounts ?? []).flatMap((mount) => {
+            if (mount.Type !== "volume") {
+              return [];
+            }
+            const volumeName = mount.Name?.trim() || mount.Source?.trim();
+            return volumeName ? [volumeName] : [];
+          })
+        ),
+      ].sort();
+      const kind =
+        inspection.Config?.Labels?.["nouva.kind"] ?? container.Labels?.["nouva.kind"] ?? null;
+      results.push({
+        containerId: inspection.Id || container.Id,
+        containerName:
+          inspection.Name?.replace(/^\//, "") ??
+          container.Names?.[0]?.replace(/^\//, "") ??
+          container.Id,
+        kind,
+        status: hasManagedContainerLogConfig(inspection) ? "compliant" : "recreation_required",
+        stateful: kind === "database" || preservedVolumeNames.length > 0,
+        preservedVolumeNames,
+      });
+    }
+
+    return {
+      phase2Ready: results.every((result) => result.status === "compliant"),
+      containers: results,
+    };
+  }
+
   async pullImage(image: string, auth?: RegistryAuth): Promise<void> {
     const headers = auth
       ? {
@@ -630,7 +741,7 @@ export class DockerApiClient {
         Labels: spec.labels,
         Healthcheck: spec.healthcheck,
         ExposedPorts: spec.exposedPorts,
-        HostConfig: spec.hostConfig,
+        HostConfig: withManagedContainerLogConfig(spec),
         NetworkingConfig: spec.networkingConfig,
       }
     );

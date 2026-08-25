@@ -1,8 +1,35 @@
-const GITHUB_TOKEN_PATTERN = /\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b/g;
-const URL_CREDENTIALS_PATTERN = /\b(https?:\/\/)[^/\s:@]+:[^@\s/]+@/gi;
+import {
+  collectConfiguredSecretValues,
+  collectEnvironmentMapSecretValues,
+  redactLogText,
+  sanitizeLogValue,
+} from "@repo/runtime/logging";
 
-export function redactSensitiveText(value: string): string {
-  return value
-    .replace(URL_CREDENTIALS_PATTERN, "$1[REDACTED]@")
-    .replace(GITHUB_TOKEN_PATTERN, "[REDACTED]");
+export type EnvironmentVariableMap = Readonly<Record<string, string | undefined>>;
+
+export function redactSensitiveText(
+  value: string,
+  environmentVariables?: EnvironmentVariableMap
+): string {
+  return redactLogText(value, environmentVariables ? { environmentVariables } : {});
+}
+
+export function sanitizeSensitiveValue(
+  value: unknown,
+  environmentVariables?: EnvironmentVariableMap
+): unknown {
+  return sanitizeLogValue(value, environmentVariables ? { environmentVariables } : {});
+}
+
+export function sanitizeSensitiveProtocolValue(
+  value: unknown,
+  environmentVariables: EnvironmentVariableMap
+): unknown {
+  return sanitizeLogValue(value, {
+    environmentVariables,
+    secretValues: [
+      ...collectConfiguredSecretValues(),
+      ...collectEnvironmentMapSecretValues(environmentVariables),
+    ],
+  });
 }

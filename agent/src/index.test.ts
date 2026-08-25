@@ -7,6 +7,7 @@ import { buildAndDeployAppWithDependencies } from "./app-build-runtime.js";
 import { DockerApiError } from "./docker-api.js";
 import {
   ApiRequestError,
+  buildAgentWorkFailureReport,
   buildAppContainerSpec,
   buildDatabaseContainerSpec,
   buildUpdateAgentRuntimeEnv,
@@ -25,6 +26,7 @@ import {
   resolveAgentWorkLeaseRenewalIntervalMs,
   resolveReportedAgentVersion,
   resolveServiceContainerIdentifier,
+  sanitizeAgentWorkResult,
   shouldStopRetryingAgentWorkMutation,
   startAgentWorkLeaseRenewal,
 } from "./index.js";
@@ -106,6 +108,7 @@ const appRuntimePayload: DeployAppImageInput = {
   projectId: "proj_1",
   serviceId: "svc_1",
   deploymentId: "dep_1",
+  redactionContextVersion: "hmac-sha256:redaction-context:v1:deployment",
   environmentId: "env_1",
   commitHash: "abc123",
   serviceName: "app",
@@ -131,6 +134,7 @@ const appRuntimePayload: DeployAppImageInput = {
 const databasePayload: DatabaseProvisionPayload = {
   projectId: "proj_1",
   serviceId: "svc_1",
+  redactionContextVersion: "hmac-sha256:redaction-context:v1:database",
   serviceName: "main-db",
   variant: "postgres",
   environmentId: "env_1",
@@ -379,6 +383,155 @@ describe("resolveAgentTaskImage", () => {
 });
 
 describe("agent work mutation errors", () => {
+  test("sanitizes nested failure reports with the leased environment map", () => {
+    const report = buildAgentWorkFailureReport({
+      environmentVariables: {
+        Q: "x",
+        UV: "yz",
+      },
+      errorMessage: "Command failed: buildctl --opt build-arg:Q=x --opt build-arg:UV=yz",
+      result: {
+        Q: "x",
+        preservedRuntime: {
+          statusMessage: "UV=yz",
+        },
+      },
+    });
+    const serialized = JSON.stringify(report);
+
+    for (const secret of ["Q", "x", "UV", "yz"]) {
+      expect(serialized).not.toContain(secret);
+    }
+    expect(serialized).toContain("[REDACTED]");
+    expect(report.result).toBeDefined();
+  });
+
+  test("sanitizes successful completion results with the leased environment map", () => {
+    const result = sanitizeAgentWorkResult(
+      {
+        status: "completed",
+        Q: "x",
+        nested: {
+          UV: "yz",
+          summary: "Q=x UV=yz",
+        },
+      },
+      {
+        Q: "x",
+        UV: "yz",
+      }
+    );
+    const serialized = JSON.stringify(result);
+
+    for (const secret of ["Q", "x", "UV", "yz"]) {
+      expect(serialized).not.toContain(secret);
+    }
+    expect(result).toMatchObject({ status: "completed" });
+    expect(serialized).toContain("[REDACTED]");
+  });
+
+  test("preserves runtime metadata and job protocol keys that collide with environment names", () => {
+    const result = sanitizeAgentWorkResult(
+      {
+        runtimeMetadata: {
+          containerId: "ctr_runtime-secret",
+        },
+        job: {
+          status: "failed",
+          statusMessage: "job=job-secret",
+        },
+      },
+      {
+        runtimeMetadata: "unrelated-runtime-secret",
+        job: "job-secret",
+      }
+    );
+
+    expect(result).toEqual({
+      runtimeMetadata: {
+        containerId: "ctr_runtime-secret",
+      },
+      job: {
+        status: "failed",
+        statusMessage: "[REDACTED]=[REDACTED]",
+      },
+    });
+  });
+
+  test("rejects operational identifiers that contain protected environment material", () => {
+    const secret = "sentinel-private-value";
+
+    expect(() =>
+      sanitizeAgentWorkResult(
+        {
+          containerName: `nouva-${secret}`,
+          imageUrl: secret,
+          objectKey: secret,
+          runtimeMetadata: { image: secret },
+        },
+        { SENTINEL_PRIVATE_NAME: secret }
+      )
+    ).toThrow("Agent work result conflicts with protected environment material");
+  });
+
+  test("drops an ambiguous failure result instead of leaking or corrupting identifiers", () => {
+    const secret = "sentinel-private-value";
+
+    expect(
+      buildAgentWorkFailureReport({
+        environmentVariables: { SENTINEL_PRIVATE_NAME: secret },
+        errorMessage: `rollout failed for ${secret}`,
+        result: { runtimeMetadata: { containerId: `nouva-${secret}` } },
+      })
+    ).toEqual({
+      errorMessage: "rollout failed for [REDACTED]",
+      result: null,
+    });
+  });
+
+  test("preserves backup and timestamp protocol keys that collide with environment names", () => {
+    const result = sanitizeAgentWorkResult(
+      {
+        activePgbackrestSets: ["20260825-120000F"],
+        artifactFormat: "pgbackrest-v1",
+        artifactSha256: "sha256-safe-artifact",
+        completedAt: "2026-08-25T12:01:00.000Z",
+        objectKey: "backups/service-1/backup-1",
+        pgbackrestSet: "20260825-120000F",
+        pgbackrestType: "full",
+        sizeBytes: 4096,
+        startedAt: "2026-08-25T12:00:00.000Z",
+        verifiedAt: "2026-08-25T12:02:00.000Z",
+      },
+      {
+        activePgbackrestSets: "sets-env-secret",
+        artifactFormat: "format-env-secret",
+        artifactSha256: "sha-env-secret",
+        completedAt: "completed-env-secret",
+        objectKey: "object-env-secret",
+        pgbackrestSet: "set-env-secret",
+        pgbackrestType: "type-env-secret",
+        sizeBytes: "size-env-secret",
+        startedAt: "started-env-secret",
+        verifiedAt: "verified-env-secret",
+      }
+    );
+
+    expect(result).toEqual({
+      activePgbackrestSets: ["20260825-120000F"],
+      artifactFormat: "pgbackrest-v1",
+      artifactSha256: "sha256-safe-artifact",
+      completedAt: "2026-08-25T12:01:00.000Z",
+      objectKey: "backups/service-1/backup-1",
+      pgbackrestSet: "20260825-120000F",
+      pgbackrestType: "full",
+      sizeBytes: 4096,
+      startedAt: "2026-08-25T12:00:00.000Z",
+      verifiedAt: "2026-08-25T12:02:00.000Z",
+    });
+    expect(result).not.toHaveProperty("[REDACTED]");
+  });
+
   test("stops retrying when the control plane reports the work is gone or superseded", () => {
     expect(
       shouldStopRetryingAgentWorkMutation(
@@ -720,6 +873,7 @@ describe("buildAppContainerSpec", () => {
         "nouva.service.id": "svc_1",
         "nouva.deployment.id": "dep_1",
         "nouva.kind": "app",
+        "nouva.redaction.context.version": "hmac-sha256:redaction-context:v1:deployment",
       })
     );
   });
@@ -1185,6 +1339,7 @@ describe("buildDatabaseContainerSpec", () => {
         "nouva.service.id": "svc_1",
         "nouva.service.variant": "postgres",
         "nouva.kind": "database",
+        "nouva.redaction.context.version": "hmac-sha256:redaction-context:v1:database",
       })
     );
   });

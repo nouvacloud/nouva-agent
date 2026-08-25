@@ -181,6 +181,10 @@ describe("traefik-runtime", () => {
     expect(spec.image).toBe("traefik:v3.5");
     expect(spec.hostConfig).toEqual(
       expect.objectContaining({
+        LogConfig: {
+          Type: "json-file",
+          Config: { "max-size": "10m", "max-file": "3" },
+        },
         PortBindings: expect.objectContaining({
           "80/tcp": [{ HostIp: "0.0.0.0", HostPort: "80" }],
           "443/tcp": [{ HostIp: "0.0.0.0", HostPort: "443" }],

@@ -1,11 +1,12 @@
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { hashProjectNetwork } from "./build.js";
-import type {
-  DockerApiClient,
-  DockerContainerInspection,
-  DockerContainerSpec,
-  DockerImageInspection,
+import {
+  type DockerApiClient,
+  type DockerContainerInspection,
+  type DockerContainerSpec,
+  type DockerImageInspection,
+  REDACTION_CONTEXT_VERSION_DOCKER_LABEL,
 } from "./docker-api.js";
 import { toDockerResourceSettings } from "./docker-resource-limits.js";
 import type {
@@ -143,6 +144,7 @@ function buildWorkerLabels(input: {
   scheduleId?: string;
   scheduleRunId?: string;
   occurrenceKey?: string;
+  redactionContextVersion?: string | null;
 }): Record<string, string> {
   return {
     "nouva.managed": "true",
@@ -159,6 +161,9 @@ function buildWorkerLabels(input: {
     ...(input.scheduleId ? { "nouva.schedule.id": input.scheduleId } : {}),
     ...(input.scheduleRunId ? { "nouva.schedule.run.id": input.scheduleRunId } : {}),
     ...(input.occurrenceKey ? { "nouva.schedule.occurrence.key": input.occurrenceKey } : {}),
+    ...(input.redactionContextVersion
+      ? { [REDACTION_CONTEXT_VERSION_DOCKER_LABEL]: input.redactionContextVersion }
+      : {}),
   };
 }
 
@@ -263,6 +268,7 @@ export function buildWorkerContainerSpec(input: {
         environmentId: payload.environmentId ?? null,
         serviceId: payload.serviceId,
         deploymentId: payload.deploymentId,
+        redactionContextVersion: payload.redactionContextVersion,
         replicaIndex: input.replicaIndex,
       }),
       ...(healthcheck ? { healthcheck } : {}),
@@ -1311,6 +1317,7 @@ export async function startWorkerJob(
       scheduleId: payload.scheduleId,
       scheduleRunId: payload.scheduleRunId,
       occurrenceKey: payload.occurrenceKey,
+      redactionContextVersion: payload.redactionContextVersion,
     }),
     hostConfig: {
       ...(payload.volume

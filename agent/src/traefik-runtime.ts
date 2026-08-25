@@ -13,10 +13,11 @@ import {
 } from "node:fs/promises";
 import path from "node:path";
 
-import type {
-  DockerApiClient,
-  DockerContainerInspection,
-  DockerContainerSpec,
+import {
+  type DockerApiClient,
+  type DockerContainerInspection,
+  type DockerContainerSpec,
+  MANAGED_CONTAINER_LOG_CONFIG,
 } from "./docker-api.js";
 import type { AgentRuntimeConfig, ServerCheckStatus, ServerValidationCheck } from "./protocol.js";
 
@@ -633,6 +634,7 @@ export function buildTraefikContainerSpec(
       RestartPolicy: {
         Name: publicBindings ? "unless-stopped" : "no",
       },
+      LogConfig: MANAGED_CONTAINER_LOG_CONFIG,
     },
     networkingConfig: {
       EndpointsConfig: {

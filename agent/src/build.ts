@@ -82,6 +82,21 @@ interface BuildImageOutput {
   imageUrl: string;
 }
 
+export class BuildctlExecutionError extends Error {
+  constructor() {
+    super("BuildKit build failed");
+    this.name = "BuildctlExecutionError";
+  }
+}
+
+export function toSafeBuildctlExecutionError(error: unknown): BuildctlExecutionError {
+  if (error instanceof BuildctlExecutionError) {
+    return error;
+  }
+
+  return new BuildctlExecutionError();
+}
+
 function buildEnvVars(envVars: Record<string, string>): Record<string, string> {
   return {
     ...process.env,
@@ -341,13 +356,17 @@ async function runBuildctlBuild(
   options: BuildctlImageBuildOptions,
   env: NodeJS.ProcessEnv = process.env
 ): Promise<string | null> {
-  const { stdout, stderr } = await execFile(BUILDCTL_BIN, buildDockerfileBuildctlArgs(options), {
-    cwd: options.contextDir,
-    env,
-    maxBuffer: 1024 * 1024 * 32,
-  });
+  try {
+    const { stdout, stderr } = await execFile(BUILDCTL_BIN, buildDockerfileBuildctlArgs(options), {
+      cwd: options.contextDir,
+      env,
+      maxBuffer: 1024 * 1024 * 32,
+    });
 
-  return extractImageSha(`${stdout}\n${stderr}`);
+    return extractImageSha(`${stdout}\n${stderr}`);
+  } catch (error) {
+    throw toSafeBuildctlExecutionError(error);
+  }
 }
 
 async function loadBuiltImageIfNeeded(
@@ -404,23 +423,27 @@ async function runRailpackBuildctl(options: {
   output: string;
   planFileName: string;
 }): Promise<string | null> {
-  const { stdout, stderr } = await execFile(
-    BUILDCTL_BIN,
-    buildRailpackBuildctlArgs({
-      buildkitAddress: options.buildkitAddress,
-      buildRootDir: options.buildRootDir,
-      planFileName: options.planFileName,
-      output: options.output,
-      envVarKeys: options.envVarKeys,
-    }),
-    {
-      cwd: options.buildRootDir,
-      env: options.childEnv,
-      maxBuffer: 1024 * 1024 * 32,
-    }
-  );
+  try {
+    const { stdout, stderr } = await execFile(
+      BUILDCTL_BIN,
+      buildRailpackBuildctlArgs({
+        buildkitAddress: options.buildkitAddress,
+        buildRootDir: options.buildRootDir,
+        planFileName: options.planFileName,
+        output: options.output,
+        envVarKeys: options.envVarKeys,
+      }),
+      {
+        cwd: options.buildRootDir,
+        env: options.childEnv,
+        maxBuffer: 1024 * 1024 * 32,
+      }
+    );
 
-  return extractImageSha(`${stdout}\n${stderr}`);
+    return extractImageSha(`${stdout}\n${stderr}`);
+  } catch (error) {
+    throw toSafeBuildctlExecutionError(error);
+  }
 }
 
 async function buildRailpackApplication(options: {

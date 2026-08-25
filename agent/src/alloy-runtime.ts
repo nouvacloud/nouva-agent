@@ -1,27 +1,38 @@
 import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { access, mkdir, rename, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, rename, rm, statfs, writeFile } from "node:fs/promises";
 import path from "node:path";
 
-import type {
-  DockerApiClient,
-  DockerContainerInspection,
-  DockerContainerSpec,
+import {
+  type DockerApiClient,
+  type DockerContainerInspection,
+  type DockerContainerSpec,
+  hasManagedContainerLogConfig,
+  MANAGED_CONTAINER_LOG_CONFIG,
+  REDACTION_CONTEXT_VERSION_DOCKER_LABEL,
 } from "./docker-api.js";
 import type { AgentRuntimeConfig, ServerCheckStatus, ServerValidationCheck } from "./protocol.js";
+import { redactSensitiveText } from "./security.js";
+import { calculateDiskSafetyReserveBytes, formatStorageBytes } from "./storage-metrics.js";
 
 export const ALLOY_CONTAINER_NAME = "nouva-alloy";
 export const ALLOY_HTTP_HOST = "127.0.0.1";
 export const ALLOY_HTTP_PORT = 12345;
 export const ALLOY_CONFIG_HASH_LABEL = "nouva.alloy.config-sha";
+export const ALLOY_CONFIG_LAYOUT_LABEL = "nouva.alloy.config-layout";
 export const ALLOY_ROLE_LABEL = "nouva.alloy.role";
 export const ALLOY_VALIDATION_CONTAINER_NAME = "nouva-alloy-config-validation";
+export const ALLOY_CONFIG_LAYOUT_VERSION = "static-dynamic-v1";
+export const DEFAULT_SYSTEM_REDACTION_CONTEXT_VERSION = "unversioned-v1";
 
 const AGENT_DATA_DIR_IN_CONTAINER = "/var/lib/nouva-agent";
 const ALLOY_ROOT_DIR_IN_CONTAINER = `${AGENT_DATA_DIR_IN_CONTAINER}/alloy`;
-const ALLOY_CONFIG_PATH_IN_CONTAINER = `${ALLOY_ROOT_DIR_IN_CONTAINER}/config.alloy`;
-const ALLOY_CANDIDATE_CONFIG_PATH_IN_CONTAINER = `${ALLOY_CONFIG_PATH_IN_CONTAINER}.candidate`;
+const ALLOY_CONFIG_DIR_IN_CONTAINER = `${ALLOY_ROOT_DIR_IN_CONTAINER}/config`;
+const ALLOY_CANDIDATE_CONFIG_DIR_IN_CONTAINER = `${ALLOY_ROOT_DIR_IN_CONTAINER}/config.candidate`;
 const ALLOY_DATA_DIR_IN_CONTAINER = `${ALLOY_ROOT_DIR_IN_CONTAINER}/data`;
+const ALLOY_DYNAMIC_CONFIG_FILE_NAME = "redaction-context.alloy";
+const ALLOY_STATIC_CONFIG_FILE_NAME = "static.alloy";
+const ALLOY_PROBE_TIMEOUT_MS = 5_000;
 const DOCKER_SOCKET = "/var/run/docker.sock";
 const OBSERVABILITY_NONE_LABEL_VALUE = "__none__";
 const OBSERVABILITY_DOCKER_LABELS = {
@@ -35,14 +46,22 @@ const OBSERVABILITY_DOCKER_LABELS = {
   replicaIndex: "__meta_docker_container_label_nouva_replica_index",
   scheduleId: "__meta_docker_container_label_nouva_schedule_id",
   scheduleRunId: "__meta_docker_container_label_nouva_schedule_run_id",
+  redactionContextVersion: `__meta_docker_container_label_${REDACTION_CONTEXT_VERSION_DOCKER_LABEL.replaceAll(
+    ".",
+    "_"
+  )}`,
   containerName: "__meta_docker_container_name",
 } as const;
 
 export interface AlloyRuntimePaths {
   rootDir: string;
   dataDir: string;
-  configPath: string;
-  candidateConfigPath: string;
+  configDir: string;
+  dynamicConfigPath: string;
+  staticConfigPath: string;
+  candidateConfigDir: string;
+  candidateDynamicConfigPath: string;
+  candidateStaticConfigPath: string;
 }
 
 export interface AlloyRuntimeInput {
@@ -51,6 +70,7 @@ export interface AlloyRuntimeInput {
   serverId: string;
   apiUrl: string;
   agentToken: string;
+  redactionContextVersion?: string;
   config: AgentRuntimeConfig;
 }
 
@@ -59,6 +79,7 @@ export interface AlloyRuntimeDeps {
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
   intervalMs?: number;
+  reloadTimeoutMs?: number;
 }
 
 interface ReconcileAlloyRuntimeOptions {
@@ -66,11 +87,17 @@ interface ReconcileAlloyRuntimeOptions {
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
   intervalMs?: number;
+  reloadTimeoutMs?: number;
 }
 
 interface CollectAlloyValidationChecksOptions {
   paths?: AlloyRuntimePaths;
   fetchImpl?: typeof fetch;
+  statfsImpl?: (path: string) => Promise<{
+    bavail: bigint | number;
+    blocks: bigint | number;
+    bsize: bigint | number;
+  }>;
 }
 
 interface AlloyProbeResult {
@@ -80,7 +107,28 @@ interface AlloyProbeResult {
   inspection: DockerContainerInspection | null;
 }
 
+type AlloyRuntimeDocker = Pick<
+  DockerApiClient,
+  | "containerLogs"
+  | "createContainer"
+  | "ensureContainer"
+  | "inspectContainer"
+  | "inspectImage"
+  | "pullImage"
+  | "removeContainer"
+  | "startContainer"
+  | "waitContainer"
+>;
+
+interface PendingAlloyReconcile {
+  deps: AlloyRuntimeDeps;
+  docker: AlloyRuntimeDocker;
+  input: AlloyRuntimeInput;
+}
+
 let lastAlloyRuntimeFailure: Error | null = null;
+let pendingAlloyReconcile: PendingAlloyReconcile | null = null;
+let alloyReconcileDrain: Promise<void> | null = null;
 
 function buildCheck(
   key: string,
@@ -98,6 +146,14 @@ function quote(value: string): string {
 
 function list(values: string[]): string {
   return `[${values.map((value) => quote(value)).join(", ")}]`;
+}
+
+function resolveSystemRedactionContextVersion(input: AlloyRuntimeInput): string {
+  const version = input.redactionContextVersion?.trim() || DEFAULT_SYSTEM_REDACTION_CONTEXT_VERSION;
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/.test(version)) {
+    throw new Error("Alloy redaction context version is invalid.");
+  }
+  return version;
 }
 
 async function writeManagedFile(filePath: string, contents: string): Promise<void> {
@@ -143,6 +199,31 @@ function hasRequiredBinds(inspection: DockerContainerInspection | null): boolean
   );
 }
 
+function resolveAlloyDataVolume(
+  inspection: DockerContainerInspection | null,
+  fallback: string
+): string {
+  const existingBind = inspection?.HostConfig?.Binds?.find((bind) =>
+    bind.split(":").slice(1).join(":").startsWith(AGENT_DATA_DIR_IN_CONTAINER)
+  );
+  const source = existingBind?.split(":")[0]?.trim();
+  return source || fallback;
+}
+
+function getAlloyRunArguments(): string[] {
+  return [
+    "run",
+    "--stability.level=experimental",
+    `--server.http.listen-addr=0.0.0.0:${ALLOY_HTTP_PORT}`,
+    `--storage.path=${ALLOY_DATA_DIR_IN_CONTAINER}`,
+    ALLOY_CONFIG_DIR_IN_CONTAINER,
+  ];
+}
+
+function hasExpectedRunArguments(inspection: DockerContainerInspection | null): boolean {
+  return JSON.stringify(inspection?.Config?.Cmd ?? []) === JSON.stringify(getAlloyRunArguments());
+}
+
 function isAlloyContainerCurrent(
   inspection: DockerContainerInspection | null,
   input: AlloyRuntimeInput,
@@ -152,6 +233,9 @@ function isAlloyContainerCurrent(
     inspection?.State?.Running === true &&
     inspection.Config?.Image === input.config.observability.alloyImage &&
     inspection.Config?.Labels?.[ALLOY_CONFIG_HASH_LABEL] === stateHash &&
+    inspection.Config.Labels[ALLOY_CONFIG_LAYOUT_LABEL] === ALLOY_CONFIG_LAYOUT_VERSION &&
+    hasExpectedRunArguments(inspection) &&
+    hasManagedContainerLogConfig(inspection) &&
     hasPortBinding(inspection, `${ALLOY_HTTP_PORT}/tcp`, {
       hostIp: ALLOY_HTTP_HOST,
       hostPort: String(ALLOY_HTTP_PORT),
@@ -169,7 +253,10 @@ async function probeAlloyRuntime(
   const [inspection, image, configPresent] = await Promise.all([
     docker.inspectContainer(ALLOY_CONTAINER_NAME),
     docker.inspectImage(input.config.observability.alloyImage),
-    access(paths.configPath, fsConstants.R_OK)
+    Promise.all([
+      access(paths.staticConfigPath, fsConstants.R_OK),
+      access(paths.dynamicConfigPath, fsConstants.R_OK),
+    ])
       .then(() => true)
       .catch(() => false),
   ]);
@@ -177,7 +264,9 @@ async function probeAlloyRuntime(
   let healthOk = false;
   if (inspection?.State?.Running) {
     try {
-      const response = await fetchImpl(`http://${ALLOY_HTTP_HOST}:${ALLOY_HTTP_PORT}/metrics`);
+      const response = await fetchImpl(`http://${ALLOY_HTTP_HOST}:${ALLOY_HTTP_PORT}/metrics`, {
+        signal: AbortSignal.timeout(ALLOY_PROBE_TIMEOUT_MS),
+      });
       healthOk = response.ok;
     } catch {
       healthOk = false;
@@ -325,6 +414,12 @@ function buildRelabelRules(input: AlloyRuntimeInput): string[] {
     replacement   = "$1"
   }`,
     `  rule {
+    source_labels = [${quote(OBSERVABILITY_DOCKER_LABELS.redactionContextVersion)}]
+    target_label  = "redaction_context_version"
+    regex         = "(.+)"
+    replacement   = "$1"
+  }`,
+    `  rule {
     target_label = "service_type"
     replacement  = "system"
   }`,
@@ -393,20 +488,27 @@ function buildRelabelRules(input: AlloyRuntimeInput): string[] {
 
 export function getAlloyRuntimePaths(dataDir: string): AlloyRuntimePaths {
   const rootDir = path.join(dataDir, "alloy");
+  const configDir = path.join(rootDir, "config");
+  const candidateConfigDir = path.join(rootDir, "config.candidate");
   return {
     rootDir,
     dataDir: path.join(rootDir, "data"),
-    configPath: path.join(rootDir, "config.alloy"),
-    candidateConfigPath: path.join(rootDir, "config.alloy.candidate"),
+    configDir,
+    dynamicConfigPath: path.join(configDir, ALLOY_DYNAMIC_CONFIG_FILE_NAME),
+    staticConfigPath: path.join(configDir, ALLOY_STATIC_CONFIG_FILE_NAME),
+    candidateConfigDir,
+    candidateDynamicConfigPath: path.join(candidateConfigDir, ALLOY_DYNAMIC_CONFIG_FILE_NAME),
+    candidateStaticConfigPath: path.join(candidateConfigDir, ALLOY_STATIC_CONFIG_FILE_NAME),
   };
 }
 
 export async function ensureAlloyState(paths: AlloyRuntimePaths): Promise<void> {
   await mkdir(paths.rootDir, { recursive: true });
   await mkdir(paths.dataDir, { recursive: true });
+  await mkdir(paths.configDir, { recursive: true });
 }
 
-export function renderAlloyConfig(input: AlloyRuntimeInput): string {
+export function renderAlloyStaticConfig(input: AlloyRuntimeInput): string {
   if (!input.config.observability.organizationId) {
     throw new Error("Alloy observability config requires an organization ID.");
   }
@@ -426,6 +528,7 @@ export function renderAlloyConfig(input: AlloyRuntimeInput): string {
     "nouva.replica.index",
     "nouva.schedule.id",
     "nouva.schedule.run.id",
+    REDACTION_CONTEXT_VERSION_DOCKER_LABEL,
   ]);
   const dockerRules = buildRelabelRules(input);
   const noneValue = quote(
@@ -445,15 +548,16 @@ ${dockerRules.join("\n")}
     `loki.source.docker "nouva" {
   host       = ${quote(`unix://${DOCKER_SOCKET}`)}
   targets    = discovery.relabel.nouva_logs.output
-  forward_to = [loki.write.nouva.receiver]
+  forward_to = [loki.relabel.nouva_redaction_context.receiver]
 }`,
     `loki.write "nouva" {
   endpoint {
     url                 = ${quote(`${input.apiUrl}/api/agent/observability/logs`)}
     bearer_token        = ${quote(input.agentToken)}
+    remote_timeout      = "10s"
     min_backoff_period  = "1s"
     max_backoff_period  = "1m"
-    max_backoff_retries = 10080
+    max_backoff_retries = 1200
     retry_on_http_429   = true
 
     queue_config {
@@ -466,7 +570,7 @@ ${dockerRules.join("\n")}
 
   wal {
     enabled         = true
-    max_segment_age = "168h"
+    max_segment_age = "24h"
     drain_timeout   = "1m"
   }
 }`,
@@ -483,7 +587,7 @@ ${dockerRules.join("\n")}
   forward_to      = [prometheus.relabel.nouva_cadvisor.receiver]
 }`,
     `prometheus.relabel "nouva_cadvisor" {
-  forward_to = [prometheus.remote_write.nouva.receiver]
+  forward_to = [prometheus.relabel.nouva_redaction_context.receiver]
 
   rule {
     source_labels = ["container_label_nouva_managed"]
@@ -592,6 +696,13 @@ ${dockerRules.join("\n")}
   }
 
   rule {
+    source_labels = ["container_label_nouva_redaction_context_version"]
+    target_label  = "redaction_context_version"
+    regex         = "(.+)"
+    replacement   = "$1"
+  }
+
+  rule {
     target_label = "service_type"
     replacement  = "system"
   }
@@ -683,7 +794,7 @@ ${dockerRules.join("\n")}
   forward_to      = [prometheus.relabel.nouva_host.receiver]
 }`,
     `prometheus.relabel "nouva_host" {
-  forward_to = [prometheus.remote_write.nouva.receiver]
+  forward_to = [prometheus.relabel.nouva_redaction_context.receiver]
 
   rule {
     target_label = "organization_id"
@@ -744,10 +855,47 @@ ${dockerRules.join("\n")}
   endpoint {
     url          = ${quote(`${input.apiUrl}/api/agent/observability/metrics`)}
     bearer_token = ${quote(input.agentToken)}
+
+    metadata_config {
+      send = false
+    }
   }
 }`,
     "",
   ].join("\n\n");
+}
+
+export function renderAlloyDynamicConfig(input: AlloyRuntimeInput): string {
+  const version = quote(resolveSystemRedactionContextVersion(input));
+  return [
+    `loki.relabel "nouva_redaction_context" {
+  forward_to = [loki.write.nouva.receiver]
+
+  rule {
+    source_labels = ["service_type", "redaction_context_version"]
+    separator     = ";"
+    target_label  = "redaction_context_version"
+    regex         = "system;$"
+    replacement   = ${version}
+  }
+}`,
+    `prometheus.relabel "nouva_redaction_context" {
+  forward_to = [prometheus.remote_write.nouva.receiver]
+
+  rule {
+    source_labels = ["service_type", "redaction_context_version"]
+    separator     = ";"
+    target_label  = "redaction_context_version"
+    regex         = "system;$"
+    replacement   = ${version}
+  }
+}`,
+    "",
+  ].join("\n\n");
+}
+
+export function renderAlloyConfig(input: AlloyRuntimeInput): string {
+  return [renderAlloyStaticConfig(input), renderAlloyDynamicConfig(input)].join("\n");
 }
 
 export function createAlloyStateHash(configContents: string): string {
@@ -764,19 +912,14 @@ export function buildAlloyContainerSpec(
   return {
     name: ALLOY_CONTAINER_NAME,
     image: input.config.observability.alloyImage,
-    cmd: [
-      "run",
-      "--stability.level=experimental",
-      `--server.http.listen-addr=0.0.0.0:${ALLOY_HTTP_PORT}`,
-      `--storage.path=${ALLOY_DATA_DIR_IN_CONTAINER}`,
-      ALLOY_CONFIG_PATH_IN_CONTAINER,
-    ],
+    cmd: getAlloyRunArguments(),
     labels: {
       "nouva.managed": "true",
       "nouva.kind": "observability",
       "nouva.server.id": input.serverId,
       [ALLOY_ROLE_LABEL]: "collector",
       [ALLOY_CONFIG_HASH_LABEL]: options.stateHash,
+      [ALLOY_CONFIG_LAYOUT_LABEL]: ALLOY_CONFIG_LAYOUT_VERSION,
       ...(options.labels ?? {}),
     },
     exposedPorts: {
@@ -802,6 +945,7 @@ export function buildAlloyContainerSpec(
       RestartPolicy: {
         Name: "unless-stopped",
       },
+      LogConfig: MANAGED_CONTAINER_LOG_CONFIG,
       Privileged: true,
     },
   };
@@ -811,7 +955,7 @@ export function buildAlloyValidationContainerSpec(input: AlloyRuntimeInput): Doc
   return {
     name: ALLOY_VALIDATION_CONTAINER_NAME,
     image: input.config.observability.alloyImage,
-    cmd: ["validate", "--stability.level=experimental", ALLOY_CANDIDATE_CONFIG_PATH_IN_CONTAINER],
+    cmd: ["validate", "--stability.level=experimental", ALLOY_CANDIDATE_CONFIG_DIR_IN_CONTAINER],
     hostConfig: {
       Binds: [`${input.dataVolume}:${AGENT_DATA_DIR_IN_CONTAINER}:ro`],
       NetworkMode: "none",
@@ -829,37 +973,116 @@ async function validateAlloyConfig(
     | "startContainer"
     | "waitContainer"
   >,
-  input: AlloyRuntimeInput
+  input: AlloyRuntimeInput,
+  options: { pullImage: boolean }
 ): Promise<void> {
-  await docker.pullImage(input.config.observability.alloyImage);
+  if (options.pullImage) {
+    await docker.pullImage(input.config.observability.alloyImage);
+  }
   await docker.removeContainer(ALLOY_VALIDATION_CONTAINER_NAME, true);
 
   const containerId = await docker.createContainer(buildAlloyValidationContainerSpec(input));
   try {
     await docker.startContainer(containerId);
-    const status = await docker.waitContainer(containerId, 60_000);
+    const status = await docker.waitContainer(containerId, 30_000);
     if (status !== 0) {
       const logs = await docker.containerLogs(containerId);
-      throw new Error(`Alloy configuration validation failed${logs ? `: ${logs}` : ""}`);
+      const safeLogs = logs
+        ? redactSensitiveText(logs, {
+            NOUVA_AGENT_TOKEN: input.agentToken,
+            NOUVA_REDACTION_CONTEXT_VERSION: resolveSystemRedactionContextVersion(input),
+          }).slice(0, 2_048)
+        : "";
+      throw new Error(`Alloy configuration validation failed${safeLogs ? `: ${safeLogs}` : ""}`);
     }
   } finally {
     await docker.removeContainer(ALLOY_VALIDATION_CONTAINER_NAME, true);
   }
 }
 
+async function readManagedFile(filePath: string): Promise<string | null> {
+  try {
+    return await readFile(filePath, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+async function writeAlloyCandidateConfig(
+  paths: AlloyRuntimePaths,
+  staticContents: string,
+  dynamicContents: string
+): Promise<void> {
+  await rm(paths.candidateConfigDir, { recursive: true, force: true });
+  await writeManagedFile(paths.candidateStaticConfigPath, staticContents);
+  await writeManagedFile(paths.candidateDynamicConfigPath, dynamicContents);
+}
+
+async function reloadAlloyConfig(fetchImpl: typeof fetch, timeoutMs: number): Promise<void> {
+  const response = await fetchImpl(`http://${ALLOY_HTTP_HOST}:${ALLOY_HTTP_PORT}/-/reload`, {
+    method: "POST",
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!response.ok) {
+    throw new Error(`Alloy configuration reload failed with status ${response.status}`);
+  }
+}
+
+async function replaceAlloyDynamicConfig(
+  docker: Pick<DockerApiClient, "inspectContainer" | "inspectImage">,
+  input: AlloyRuntimeInput,
+  paths: AlloyRuntimePaths,
+  dynamicContents: string,
+  options: {
+    fetchImpl: typeof fetch;
+    reloadTimeoutMs: number;
+    readinessTimeoutMs: number;
+    intervalMs: number;
+  }
+): Promise<void> {
+  const previousContents = await readManagedFile(paths.dynamicConfigPath);
+  const nextPath = `${paths.dynamicConfigPath}.next`;
+  await writeManagedFile(nextPath, dynamicContents);
+  await rename(nextPath, paths.dynamicConfigPath);
+
+  try {
+    await reloadAlloyConfig(options.fetchImpl, options.reloadTimeoutMs);
+    await waitForAlloyHealth(docker, input, paths, {
+      fetchImpl: options.fetchImpl,
+      timeoutMs: options.readinessTimeoutMs,
+      intervalMs: options.intervalMs,
+    });
+  } catch (error) {
+    if (previousContents === null) {
+      await rm(paths.dynamicConfigPath, { force: true });
+    } else {
+      await writeManagedFile(paths.dynamicConfigPath, previousContents);
+    }
+
+    try {
+      await reloadAlloyConfig(options.fetchImpl, options.reloadTimeoutMs);
+      await waitForAlloyHealth(docker, input, paths, {
+        fetchImpl: options.fetchImpl,
+        timeoutMs: options.readinessTimeoutMs,
+        intervalMs: options.intervalMs,
+      });
+    } catch (rollbackError) {
+      throw new Error(
+        `Alloy configuration reload failed and rollback did not become healthy: ${
+          rollbackError instanceof Error ? rollbackError.message : "unknown rollback failure"
+        }`,
+        { cause: error }
+      );
+    }
+
+    throw new Error("Alloy configuration reload failed; the previous fragment was restored", {
+      cause: error,
+    });
+  }
+}
+
 export async function reconcileAlloyRuntime(
-  docker: Pick<
-    DockerApiClient,
-    | "containerLogs"
-    | "createContainer"
-    | "ensureContainer"
-    | "inspectContainer"
-    | "inspectImage"
-    | "pullImage"
-    | "removeContainer"
-    | "startContainer"
-    | "waitContainer"
-  >,
+  docker: AlloyRuntimeDocker,
   input: AlloyRuntimeInput,
   options: ReconcileAlloyRuntimeOptions = {}
 ): Promise<void> {
@@ -874,63 +1097,95 @@ export async function reconcileAlloyRuntime(
   const paths = options.paths ?? getAlloyRuntimePaths(input.dataDir);
   await ensureAlloyState(paths);
 
-  const configContents = renderAlloyConfig(input);
-  const stateHash = createAlloyStateHash(configContents);
   const inspection = await docker.inspectContainer(ALLOY_CONTAINER_NAME);
-  const configPresent = await access(paths.configPath, fsConstants.R_OK)
-    .then(() => true)
-    .catch(() => false);
-  if (configPresent && isAlloyContainerCurrent(inspection, input, stateHash)) {
+  const runtimeInput = {
+    ...input,
+    dataVolume: resolveAlloyDataVolume(inspection, input.dataVolume),
+  };
+  const staticContents = renderAlloyStaticConfig(runtimeInput);
+  const dynamicContents = renderAlloyDynamicConfig(runtimeInput);
+  const stateHash = createAlloyStateHash(staticContents);
+  const [activeStaticContents, activeDynamicContents] = await Promise.all([
+    readManagedFile(paths.staticConfigPath),
+    readManagedFile(paths.dynamicConfigPath),
+  ]);
+  const staticRuntimeCurrent =
+    activeStaticContents === staticContents &&
+    isAlloyContainerCurrent(inspection, runtimeInput, stateHash);
+  if (staticRuntimeCurrent && activeDynamicContents === dynamicContents) {
     lastAlloyRuntimeFailure = null;
     return;
   }
 
-  await writeManagedFile(paths.candidateConfigPath, configContents);
+  await writeAlloyCandidateConfig(paths, staticContents, dynamicContents);
   try {
-    await validateAlloyConfig(docker, input);
-    await rename(paths.candidateConfigPath, paths.configPath);
-  } catch (error) {
-    await rm(paths.candidateConfigPath, { force: true });
-    throw error;
-  }
+    const validationImagePresent = staticRuntimeCurrent
+      ? await docker.inspectImage(runtimeInput.config.observability.alloyImage)
+      : null;
+    await validateAlloyConfig(docker, runtimeInput, {
+      pullImage: !staticRuntimeCurrent || validationImagePresent === null,
+    });
+    if (staticRuntimeCurrent) {
+      await replaceAlloyDynamicConfig(docker, runtimeInput, paths, dynamicContents, {
+        fetchImpl: options.fetchImpl ?? fetch,
+        reloadTimeoutMs: options.reloadTimeoutMs ?? 10_000,
+        readinessTimeoutMs: options.timeoutMs ?? 30_000,
+        intervalMs: options.intervalMs ?? 500,
+      });
+    } else {
+      await writeManagedFile(paths.staticConfigPath, staticContents);
+      await writeManagedFile(paths.dynamicConfigPath, dynamicContents);
 
-  if (inspection) {
-    await docker.removeContainer(ALLOY_CONTAINER_NAME, true);
-  }
+      if (inspection) {
+        await docker.removeContainer(ALLOY_CONTAINER_NAME, true);
+      }
 
-  await docker.ensureContainer(buildAlloyContainerSpec(input, { stateHash }), false, {
-    pull: false,
-  });
-  await waitForAlloyHealth(docker, input, paths, {
-    fetchImpl: options.fetchImpl ?? fetch,
-    timeoutMs: options.timeoutMs ?? 30_000,
-    intervalMs: options.intervalMs ?? 500,
-  });
+      await docker.ensureContainer(buildAlloyContainerSpec(runtimeInput, { stateHash }), false, {
+        pull: false,
+      });
+      await waitForAlloyHealth(docker, runtimeInput, paths, {
+        fetchImpl: options.fetchImpl ?? fetch,
+        timeoutMs: options.timeoutMs ?? 30_000,
+        intervalMs: options.intervalMs ?? 500,
+      });
+      await rm(path.join(paths.rootDir, "config.alloy"), { force: true });
+    }
+  } finally {
+    await rm(paths.candidateConfigDir, { recursive: true, force: true });
+  }
   lastAlloyRuntimeFailure = null;
 }
 
 export async function ensureAlloyRuntime(
-  docker: Pick<
-    DockerApiClient,
-    | "containerLogs"
-    | "createContainer"
-    | "ensureContainer"
-    | "inspectContainer"
-    | "inspectImage"
-    | "pullImage"
-    | "removeContainer"
-    | "startContainer"
-    | "waitContainer"
-  >,
+  docker: AlloyRuntimeDocker,
   input: AlloyRuntimeInput,
   deps: AlloyRuntimeDeps = {}
 ): Promise<void> {
-  try {
-    await reconcileAlloyRuntime(docker, input, deps);
-  } catch (error) {
-    lastAlloyRuntimeFailure = error instanceof Error ? error : new Error("Alloy reconcile failed");
-    throw lastAlloyRuntimeFailure;
+  pendingAlloyReconcile = { deps, docker, input };
+  if (!alloyReconcileDrain) {
+    alloyReconcileDrain = (async () => {
+      let latestFailure: Error | null = null;
+      while (pendingAlloyReconcile) {
+        const pending = pendingAlloyReconcile;
+        pendingAlloyReconcile = null;
+        try {
+          await reconcileAlloyRuntime(pending.docker, pending.input, pending.deps);
+          latestFailure = null;
+        } catch (error) {
+          latestFailure = error instanceof Error ? error : new Error("Alloy reconcile failed");
+        }
+      }
+
+      lastAlloyRuntimeFailure = latestFailure;
+      if (latestFailure) {
+        throw latestFailure;
+      }
+    })().finally(() => {
+      alloyReconcileDrain = null;
+    });
   }
+
+  await alloyReconcileDrain;
 }
 
 export async function collectAlloyValidationChecks(
@@ -986,7 +1241,7 @@ export async function collectAlloyValidationChecks(
       "Alloy config",
       probe.configPresent ? "pass" : "fail",
       probe.configPresent ? "Alloy config file is present" : "Alloy config file is missing",
-      paths.configPath
+      paths.configDir
     )
   );
 
@@ -1013,6 +1268,39 @@ export async function collectAlloyValidationChecks(
     )
   );
 
+  try {
+    const stats = await (options.statfsImpl ?? statfs)(paths.dataDir);
+    const availableBytes = Number(stats.bavail) * Number(stats.bsize);
+    const totalBytes = Number(stats.blocks) * Number(stats.bsize);
+    const safetyReserveBytes = calculateDiskSafetyReserveBytes(totalBytes);
+    const status: ServerCheckStatus =
+      availableBytes <= safetyReserveBytes
+        ? "fail"
+        : availableBytes < safetyReserveBytes * 2
+          ? "warn"
+          : "pass";
+    checks.push(
+      buildCheck(
+        "alloy-wal-disk",
+        "Alloy WAL disk headroom",
+        status,
+        status === "pass"
+          ? `${formatStorageBytes(availableBytes)} is available for Alloy WAL and positions data.`
+          : `${formatStorageBytes(availableBytes)} is available for Alloy WAL and positions data. The safety reserve is ${formatStorageBytes(safetyReserveBytes)}.`,
+        JSON.stringify({ availableBytes, totalBytes })
+      )
+    );
+  } catch {
+    checks.push(
+      buildCheck(
+        "alloy-wal-disk",
+        "Alloy WAL disk headroom",
+        "fail",
+        "Unable to inspect disk headroom for Alloy WAL and positions data."
+      )
+    );
+  }
+
   return checks;
 }
 
@@ -1029,9 +1317,12 @@ export function buildUnavailableAlloyChecks(reason: string): ServerValidationChe
       `${ALLOY_HTTP_HOST}:${ALLOY_HTTP_PORT}`
     ),
     buildCheck("alloy-mounts", "Alloy mounts", "fail", reason),
+    buildCheck("alloy-wal-disk", "Alloy WAL disk headroom", "fail", reason),
   ];
 }
 
 export function resetAlloyRuntimeState(): void {
   lastAlloyRuntimeFailure = null;
+  pendingAlloyReconcile = null;
+  alloyReconcileDrain = null;
 }
