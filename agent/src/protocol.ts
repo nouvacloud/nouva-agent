@@ -305,6 +305,7 @@ export const DEFAULT_AGENT_POLL_INTERVAL_SECONDS = 10;
 export const DEFAULT_AGENT_LEASE_TTL_SECONDS = 120;
 export const DEFAULT_AGENT_METRICS_INTERVAL_SECONDS = 30;
 export const DEFAULT_AGENT_POSTGRES_OBSERVABILITY_INTERVAL_SECONDS = 30;
+export const MAX_PARALLEL_AGENT_WORK_ITEMS = 4;
 
 export type AgentIngressMode = "local_traefik";
 export type AgentBuildkitMode = "docker-container";
@@ -590,7 +591,7 @@ export interface AppVolumeIdentity {
 }
 
 export type DatabaseServiceVariant = "postgres" | "mongodb" | "redis";
-export type BackupDatabaseServiceVariant = "postgres" | "redis";
+export type BackupDatabaseServiceVariant = "postgres" | "mongodb" | "redis";
 
 export interface DatabaseProvisionPayload {
   projectId: string;
@@ -684,7 +685,7 @@ export interface CreateVolumeBackupPayload extends QueuedVolumeBackupPayloadBase
   dataPath?: string;
   credentials?: Record<string, string>;
   expectedObjectKey: string;
-  artifactFormat: "redis-rdb-tar-v1" | "pgbackrest-v1";
+  artifactFormat: "mongodb-archive-tar-v1" | "redis-rdb-tar-v1" | "pgbackrest-v1";
 }
 
 export interface DeleteVolumeBackupPayload extends QueuedVolumeBackupPayloadBase {
@@ -717,11 +718,23 @@ export interface RestoreVolumeBackupPayload {
   dataPath?: string;
   credentials?: Record<string, string>;
   expectedObjectKey: string;
-  artifactFormat: "redis-rdb-tar-v1" | "pgbackrest-v1";
+  artifactFormat: "mongodb-archive-tar-v1" | "redis-rdb-tar-v1" | "pgbackrest-v1";
   artifactSha256?: string | null;
 }
 
 export type AgentBackupIntegrityProofV1 =
+  | {
+      version: 1;
+      engine: "mongodb";
+      backupId: string;
+      objectKey: string;
+      artifactFormat: "mongodb-archive-tar-v1";
+      artifactSha256: string;
+      sizeBytes: number;
+      mongodumpSucceeded: true;
+      mongorestoreDryRun: true;
+      uploadChecksumVerified: true;
+    }
   | {
       version: 1;
       engine: "redis";
@@ -966,6 +979,7 @@ export interface AgentHeartbeatResponse {
 export interface AgentLeaseRequest {
   serverId: string;
   limit?: number;
+  activeWorkItemIds?: string[];
 }
 
 export type AgentLeaseResponse = AgentWorkLeaseResult;

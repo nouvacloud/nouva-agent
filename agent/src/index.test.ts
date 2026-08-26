@@ -225,6 +225,27 @@ const snapshotBackupPayload: CreateVolumeBackupPayload = {
   artifactFormat: "redis-rdb-tar-v1",
 };
 
+const mongodbBackupPayload: CreateVolumeBackupPayload = {
+  ...snapshotBackupPayload,
+  serviceId: "svc_mongo_1",
+  serviceName: "main-mongo",
+  variant: "mongodb",
+  version: "8.0",
+  volumeId: "vol_mongo_1",
+  volumeName: "nouva-vol-vol_mongo_1",
+  mountPath: "/data/db",
+  backupId: "backup_mongo_1",
+  runtimeMetadata: { containerId: "mongo-container-id" },
+  credentials: {
+    username: "root",
+    password: "mongo-secret",
+    database: "appdb",
+  },
+  expectedObjectKey:
+    "archives/v1/projects/proj_1/volumes/vol_mongo_1/backups/backup_mongo_1.tar.gz",
+  artifactFormat: "mongodb-archive-tar-v1",
+};
+
 const pgBackrestRestorePayload: RestoreVolumeBackupPayload = {
   projectId: "proj_1",
   serviceId: "svc_1",
@@ -1992,6 +2013,54 @@ describe("database runtime recreate paths", () => {
       ])
     );
     expect(task?.cmd?.[0]).toContain("--target-timeline=current");
+  });
+
+  test("creates and verifies a MongoDB logical archive through the live container network", async () => {
+    const docker = createDockerMock();
+    docker.containerLogs.mockResolvedValue(
+      "NOUVA_SIZE_BYTES:84\nNOUVA_SHA256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    );
+
+    const result = await handleCreateVolumeBackup(
+      docker as never,
+      runtimeConfig,
+      mongodbBackupPayload
+    );
+
+    const task = docker.createContainer.mock.calls[0]?.[0];
+    const script = task?.cmd?.[2];
+    expect(task).toEqual(
+      expect.objectContaining({
+        env: expect.arrayContaining([
+          "MONGODB_USERNAME=root",
+          "MONGODB_PASSWORD=mongo-secret",
+          "NOUVA_BACKUP_ID=backup_mongo_1",
+        ]),
+        hostConfig: expect.objectContaining({
+          Mounts: undefined,
+          NetworkMode: "container:mongo-container-id",
+        }),
+      })
+    );
+    expect(script).toContain("mongodump --host 127.0.0.1 --port 27017");
+    expect(script).toContain("--authenticationDatabase admin");
+    expect(script).toContain("mongorestore --host 127.0.0.1 --port 27017");
+    expect(script).toContain("--dryRun");
+    expect(script).not.toContain("mongo-secret");
+    expect(result).toEqual(
+      expect.objectContaining({
+        sizeBytes: 84,
+        objectKey: mongodbBackupPayload.expectedObjectKey,
+        artifactFormat: "mongodb-archive-tar-v1",
+        artifactSha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        integrityProof: expect.objectContaining({
+          engine: "mongodb",
+          mongodumpSucceeded: true,
+          mongorestoreDryRun: true,
+          uploadChecksumVerified: true,
+        }),
+      })
+    );
   });
 
   test("uses the installed agent image for snapshot backup tasks", async () => {

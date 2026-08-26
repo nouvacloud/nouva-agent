@@ -4,6 +4,7 @@
   "type": "module",
   "private": true,
   "exports": {
-    "./agent-metrics": "./src/agent-metrics.ts"
+    "./agent-metrics": "./src/agent-metrics.ts",
+    "./logging": "./src/logging.ts"
   }
 }

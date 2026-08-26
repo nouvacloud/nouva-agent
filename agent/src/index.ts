@@ -55,6 +55,7 @@ import {
   type EffectiveServiceResourceLimits,
   type ExpireVolumeBackupRepositoryPayload,
   getAgentRuntimeConfig,
+  MAX_PARALLEL_AGENT_WORK_ITEMS,
   parseHostMetricsSnapshot,
   type ReconcileServiceResourcesPayload,
   type RemoveServicePayload,
@@ -78,6 +79,7 @@ import {
   sanitizeSensitiveProtocolValue,
   sanitizeSensitiveValue,
 } from "./security.js";
+import { createSerializedTaskRunner } from "./serialized-task.js";
 import { resolveDatabaseProvisionSpec } from "./service-runtime.js";
 import {
   calculateDiskSafetyReserveBytes,
@@ -96,6 +98,7 @@ import {
 } from "./traefik-runtime.js";
 import { resolveUpdateAgentImageRef, toUpdateAgentPayload } from "./update-agent.js";
 import { createVolumeMetricsCollector } from "./volume-metrics-loop.js";
+import { createBoundedWorkScheduler } from "./work-scheduler.js";
 import {
   cleanupWorkerJob,
   deployWorkerRuntime,
@@ -126,12 +129,20 @@ const LOCAL_REGISTRY_CONTAINER_NAME =
 const TRAEFIK_CONTAINER_NAME = process.env.NOUVA_AGENT_TRAEFIK_CONTAINER || "nouva-traefik";
 const TRAEFIK_IMAGE = process.env.NOUVA_AGENT_TRAEFIK_IMAGE || DEFAULT_TRAEFIK_IMAGE;
 const TRAEFIK_PATHS = buildTraefikRuntimePaths(DATA_DIR);
+const traefikRuntimeTasks = createSerializedTaskRunner();
 const ALLOY_PATHS = getAlloyRuntimePaths(DATA_DIR);
 const BUILDKIT_ADDRESS = process.env.NOUVA_AGENT_BUILDKIT_ADDR || "tcp://127.0.0.1:1234";
 const DEFAULT_BUILDKIT_PORT = 1234;
 const DEFAULT_AGENT_CONTAINER_NAME = "nouva-agent";
 const DEFAULT_AGENT_IMAGE = "ghcr.io/nouvacloud/nouva-agent:latest";
 const APP_VOLUME_SNAPSHOT_IMAGE = "alpine:3.21";
+
+function ensureTraefikRuntimeSerialized(
+  docker: DockerApiClient,
+  input: TraefikRuntimeInput
+): Promise<void> {
+  return traefikRuntimeTasks.run(() => ensureTraefikRuntime(docker, input));
+}
 export function resolveReportedAgentVersion(packageVersion: string): string {
   const trimmedPackageVersion = packageVersion.trim();
   if (!trimmedPackageVersion) {
@@ -848,7 +859,7 @@ async function collectValidationSnapshot(
 
     let traefikBootstrapError: Error | null = null;
     try {
-      await ensureTraefikRuntime(docker, getTraefikRuntimeInput(config));
+      await ensureTraefikRuntimeSerialized(docker, getTraefikRuntimeInput(config));
     } catch (error) {
       traefikBootstrapError =
         error instanceof Error ? error : new Error("Failed to reconcile Traefik");
@@ -2128,7 +2139,7 @@ async function ensureBaseRuntime(
   docker: DockerApiClient,
   config: AgentRuntimeConfig
 ): Promise<void> {
-  await ensureTraefikRuntime(docker, getTraefikRuntimeInput(config));
+  await ensureTraefikRuntimeSerialized(docker, getTraefikRuntimeInput(config));
   await ensureSharedBuildkitRuntime(docker);
   if (config.imageStoreMode === "local-registry") {
     await ensureLocalRegistryRuntime(docker, config);
@@ -3166,11 +3177,113 @@ export async function handleWipeVolume(
   };
 }
 
+async function handleCreateMongoArchiveBackup(
+  docker: DockerApiClient,
+  config: Pick<AgentRuntimeConfig, "privateRegistry">,
+  payload: CreateVolumeBackupPayload
+) {
+  if (payload.artifactFormat !== "mongodb-archive-tar-v1") {
+    throw new Error(`MongoDB backup requires mongodb-archive-tar-v1 artifacts`);
+  }
+  const runtimeContainer =
+    payload.runtimeMetadata?.containerId ?? payload.runtimeMetadata?.containerName ?? null;
+  if (!runtimeContainer) {
+    throw new Error("MongoDB backup requires the authoritative live runtime container identity");
+  }
+  const username = payload.credentials?.username?.trim();
+  const password = payload.credentials?.password;
+  if (!username || !password) {
+    throw new Error("MongoDB backup requires service credentials");
+  }
+
+  const remoteExpression = buildArchiveRemoteExpression(payload.destination.verifyTls);
+  const agentTaskImage = await resolveAgentTaskImage(docker);
+  const { logs } = await runTaskContainer(docker, config, {
+    name: `nouva-backup-${payload.backupId.slice(0, 12)}`,
+    image: agentTaskImage,
+    env: [
+      `BACKUP_ACCESS_KEY_ID=${payload.destination.accessKeyId}`,
+      `BACKUP_SECRET_ACCESS_KEY=${payload.destination.secretAccessKey}`,
+      `BACKUP_ENDPOINT=${payload.destination.endpoint}`,
+      `BACKUP_REGION=${payload.destination.region}`,
+      `BACKUP_BUCKET=${payload.destination.bucket}`,
+      `BACKUP_OBJECT_KEY=${payload.expectedObjectKey}`,
+      `BACKUP_FORCE_PATH_STYLE=${payload.destination.pathStyle ? "true" : "false"}`,
+      `NOUVA_BACKUP_ID=${payload.backupId}`,
+      `MONGODB_USERNAME=${username}`,
+      `MONGODB_PASSWORD=${password}`,
+    ],
+    cmd: [
+      "sh",
+      "-c",
+      [
+        "set -eu",
+        `remote="${remoteExpression}"`,
+        "work_dir=$(mktemp -d)",
+        'archive="/tmp/nouva-mongodb-backup.tar.gz"',
+        'download="/tmp/nouva-mongodb-backup.download.tar.gz"',
+        "uploaded=0",
+        'cleanup() { rm -rf "$work_dir" "$archive" "$download"; if [ "$uploaded" = 1 ] && [ "$' +
+          '{NOUVA_BACKUP_OK:-0}" != 1 ]; then rclone deletefile "$remote" || true; fi; }',
+        "trap cleanup EXIT INT TERM",
+        'mongodump --host 127.0.0.1 --port 27017 --username "$MONGODB_USERNAME" --password "$MONGODB_PASSWORD" --authenticationDatabase admin --archive="$work_dir/dump.archive.gz" --gzip --quiet',
+        'printf \'{"version":1,"backupId":"%s","artifactFormat":"mongodb-archive-tar-v1"}\\n\' "$NOUVA_BACKUP_ID" > "$work_dir/manifest.json"',
+        'tar -C "$work_dir" -czf "$archive" manifest.json dump.archive.gz',
+        'sha256=$(sha256sum "$archive" | cut -d " " -f 1)',
+        'size_bytes=$(wc -c < "$archive" | tr -d " ")',
+        'rclone copyto "$archive" "$remote"',
+        "uploaded=1",
+        'rclone copyto "$remote" "$download"',
+        'download_sha256=$(sha256sum "$download" | cut -d " " -f 1)',
+        'test "$sha256" = "$download_sha256"',
+        'mkdir "$work_dir/restore"',
+        'tar -C "$work_dir/restore" -xzf "$download"',
+        'test "$(find "$work_dir/restore" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d " ")" = 2',
+        'mongorestore --host 127.0.0.1 --port 27017 --username "$MONGODB_USERNAME" --password "$MONGODB_PASSWORD" --authenticationDatabase admin --archive="$work_dir/restore/dump.archive.gz" --gzip --dryRun --quiet',
+        'printf "NOUVA_SIZE_BYTES:%s\\n" "$size_bytes"',
+        'printf "NOUVA_SHA256:%s\\n" "$sha256"',
+        "NOUVA_BACKUP_OK=1",
+      ].join("\n"),
+    ],
+    networkMode: `container:${runtimeContainer}`,
+    timeoutMs: 30 * 60_000,
+  });
+
+  const sizeBytes = Number.parseInt(extractPrefixedLogLine(logs, "NOUVA_SIZE_BYTES:") ?? "", 10);
+  const artifactSha256 = extractPrefixedLogLine(logs, "NOUVA_SHA256:");
+  if (!artifactSha256 || !Number.isFinite(sizeBytes)) {
+    throw new Error("MongoDB backup did not return complete integrity evidence");
+  }
+
+  return {
+    sizeBytes,
+    objectKey: payload.expectedObjectKey,
+    artifactFormat: payload.artifactFormat,
+    artifactSha256,
+    verifiedAt: new Date().toISOString(),
+    integrityProof: {
+      version: 1,
+      engine: "mongodb",
+      backupId: payload.backupId,
+      objectKey: payload.expectedObjectKey,
+      artifactFormat: "mongodb-archive-tar-v1",
+      artifactSha256,
+      sizeBytes,
+      mongodumpSucceeded: true,
+      mongorestoreDryRun: true,
+      uploadChecksumVerified: true,
+    },
+  };
+}
+
 async function handleCreateArchiveBackup(
   docker: DockerApiClient,
   config: Pick<AgentRuntimeConfig, "privateRegistry">,
   payload: CreateVolumeBackupPayload
 ) {
+  if (payload.variant === "mongodb") {
+    return handleCreateMongoArchiveBackup(docker, config, payload);
+  }
   if (payload.variant !== "redis") {
     throw new Error(`Database-native snapshot backups do not support ${payload.variant}`);
   }
@@ -3739,7 +3852,7 @@ async function handleSyncRouting(
   const runtimeMetadata = payload.runtimeMetadata ?? null;
   const containerName = runtimeMetadata?.containerName;
 
-  await ensureTraefikRuntime(docker, getTraefikRuntimeInput(config));
+  await ensureTraefikRuntimeSerialized(docker, getTraefikRuntimeInput(config));
 
   const internalPort =
     typeof runtimeMetadata?.internalPort === "number"
@@ -4260,7 +4373,6 @@ async function main() {
   }
 
   config = await sendHeartbeat(docker, credentials, config);
-  let workLoopActive = false;
   let postgresObservabilityLoopActive = false;
   let isShuttingDown = false;
   const volumeMetricsCollector = createVolumeMetricsCollector(async () => {
@@ -4274,6 +4386,27 @@ async function main() {
       } satisfies AgentMetricsRequest,
     });
   });
+  const workScheduler = createBoundedWorkScheduler<AgentRuntimeConfig, AgentWorkRecord>({
+    maxConcurrency: MAX_PARALLEL_AGENT_WORK_ITEMS,
+    leaseWork: (limit, activeWorkItemIds) =>
+      apiRequest<AgentLeaseResponse>("/api/agent/work/lease", {
+        method: "POST",
+        token: credentials!.agentToken,
+        body: {
+          serverId: SERVER_ID!,
+          limit,
+          activeWorkItemIds: [...activeWorkItemIds],
+        },
+      }),
+    processWork: (leasedConfig, workItem) =>
+      processWorkItem(docker, leasedConfig, credentials!, workItem),
+    onConfig: (leasedConfig) => {
+      config = leasedConfig;
+    },
+    onWorkError: (error, workItem) => {
+      console.error(`[nouva-agent] work ${workItem.id} failed outside its handler`, error);
+    },
+  });
 
   const shutdown = async () => {
     if (isShuttingDown) return;
@@ -4281,7 +4414,9 @@ async function main() {
     console.log("[nouva-agent] shutting down, draining work and log loops...");
     const deadline = Date.now() + 9_000;
     while (
-      (workLoopActive || postgresObservabilityLoopActive || volumeMetricsCollector.isActive()) &&
+      (workScheduler.isActive() ||
+        postgresObservabilityLoopActive ||
+        volumeMetricsCollector.isActive()) &&
       Date.now() < deadline
     ) {
       await new Promise((r) => setTimeout(r, 100));
@@ -4381,31 +4516,14 @@ async function main() {
     }, config.postgresObservabilityIntervalSeconds * 1000);
   }
 
-  setInterval(async () => {
-    if (workLoopActive || isShuttingDown) {
+  setInterval(() => {
+    if (isShuttingDown) {
       return;
     }
 
-    workLoopActive = true;
-    try {
-      const leased = await apiRequest<AgentLeaseResponse>("/api/agent/work/lease", {
-        method: "POST",
-        token: credentials!.agentToken,
-        body: {
-          serverId: SERVER_ID!,
-          limit: 1,
-        },
-      });
-
-      config = leased.config;
-      for (const workItem of leased.workItems) {
-        await processWorkItem(docker, config, credentials!, workItem);
-      }
-    } catch (error) {
+    void workScheduler.trigger().catch((error) => {
       console.error("[nouva-agent] work loop failed", error);
-    } finally {
-      workLoopActive = false;
-    }
+    });
   }, config.pollIntervalSeconds * 1000);
 }
 
