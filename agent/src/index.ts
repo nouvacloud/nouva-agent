@@ -537,6 +537,8 @@ function buildAppRolloutResult(input: {
   currentPhase: AppRolloutResult["currentPhase"];
   liveRuntimePreserved: boolean;
   rollbackCompleted: boolean;
+  drainDurationMs?: number;
+  previousContainerRetirement?: AppRolloutResult["previousContainerRetirement"];
   activeContainerName?: string | null;
   candidateContainerName?: string | null;
 }): AppRolloutResult {
@@ -546,6 +548,8 @@ function buildAppRolloutResult(input: {
     currentPhase: input.currentPhase,
     liveRuntimePreserved: input.liveRuntimePreserved,
     rollbackCompleted: input.rollbackCompleted,
+    drainDurationMs: input.drainDurationMs,
+    previousContainerRetirement: input.previousContainerRetirement ?? null,
     activeContainerName: input.activeContainerName ?? null,
     candidateContainerName: input.candidateContainerName ?? null,
   };
@@ -569,6 +573,7 @@ interface DeployAppImageDependencies {
   fetchImpl: typeof fetch;
   writeLocalTraefikRoute: typeof writeLocalTraefikRoute;
   deleteLocalTraefikRoute: typeof deleteLocalTraefikRoute;
+  sleep?: (ms: number) => Promise<void>;
 }
 
 const defaultDeployAppImageDependencies: DeployAppImageDependencies = {
@@ -577,6 +582,7 @@ const defaultDeployAppImageDependencies: DeployAppImageDependencies = {
   fetchImpl: fetch,
   writeLocalTraefikRoute,
   deleteLocalTraefikRoute,
+  sleep,
 };
 
 async function waitForAppCandidateReadiness(
@@ -601,13 +607,20 @@ async function waitForAppCandidateReadiness(
       throw new Error(`Candidate container ${containerName} is not running (${status})`);
     }
 
-    const healthStatus = state?.Health?.Status?.toLowerCase();
-    if (healthStatus === "healthy") {
-      return;
-    }
+    const health = state?.Health;
+    if (health) {
+      const healthStatus = health.Status?.toLowerCase() || "unknown";
+      if (healthStatus === "healthy") {
+        return;
+      }
 
-    if (healthStatus === "unhealthy") {
-      throw new Error(`Candidate container ${containerName} became unhealthy`);
+      if (healthStatus === "unhealthy") {
+        throw new Error(`Candidate container ${containerName} became unhealthy`);
+      }
+
+      lastError = `Candidate container ${containerName} health status is ${healthStatus}`;
+      await sleep(rollout.readiness.intervalMs);
+      continue;
     }
 
     const ipAddress = resolveContainerIpAddress(inspection);
@@ -629,6 +642,64 @@ async function waitForAppCandidateReadiness(
   }
 
   throw new Error(lastError);
+}
+
+type PreviousContainerRetirement = NonNullable<AppRolloutResult["previousContainerRetirement"]>;
+
+function getRetirementErrorType(error: unknown): string {
+  return error instanceof Error ? error.name : typeof error;
+}
+
+async function retirePreviousAppContainer(
+  dependencies: Pick<DeployAppImageDependencies, "sleep">,
+  docker: Pick<DockerApiClient, "removeContainer" | "stopContainer">,
+  containerName: string,
+  rollout: AppRolloutConfig,
+  drainDurationMs: number
+): Promise<PreviousContainerRetirement> {
+  if (drainDurationMs > 0) {
+    await (dependencies.sleep ?? sleep)(drainDurationMs);
+  }
+
+  try {
+    await docker.stopContainer(
+      containerName,
+      rollout.drain.gracefulStopTimeoutSeconds,
+      rollout.drain.cleanupTimeoutMs
+    );
+  } catch (error) {
+    console.warn("[nouva-agent] app rollout retirement fallback", {
+      containerName,
+      errorType: getRetirementErrorType(error),
+      outcome: "force_remove_attempt",
+      stage: "graceful_stop",
+    });
+    try {
+      await docker.removeContainer(containerName, true, rollout.drain.cleanupTimeoutMs);
+      return "forced";
+    } catch (fallbackError) {
+      console.warn("[nouva-agent] app rollout retirement deferred", {
+        containerName,
+        errorType: getRetirementErrorType(fallbackError),
+        outcome: "deferred",
+        stage: "force_remove",
+      });
+      return "deferred";
+    }
+  }
+
+  try {
+    await docker.removeContainer(containerName, false, rollout.drain.cleanupTimeoutMs);
+    return "graceful";
+  } catch (error) {
+    console.warn("[nouva-agent] app rollout retirement deferred", {
+      containerName,
+      errorType: getRetirementErrorType(error),
+      outcome: "deferred",
+      stage: "non_force_remove",
+    });
+    return "deferred";
+  }
 }
 
 async function waitForLocalTraefikCutover(
@@ -2526,9 +2597,16 @@ export async function deployAppImageWithDependencies(
     );
   }
 
-  if (previousContainer) {
-    await docker.removeContainer(previousContainer, true);
-  }
+  const drainDurationMs = payload.volume ? 0 : rollout.drain.durationMs;
+  const previousContainerRetirement = previousContainer
+    ? await retirePreviousAppContainer(
+        dependencies,
+        docker,
+        previousContainer,
+        rollout,
+        drainDurationMs
+      )
+    : null;
   if (payload.volume && snapshotName) {
     await deleteAppVolumeSnapshotBestEffort(docker, config, payload, snapshotName);
   }
@@ -2578,6 +2656,8 @@ export async function deployAppImageWithDependencies(
       currentPhase: "retire",
       liveRuntimePreserved: false,
       rollbackCompleted: false,
+      drainDurationMs: previousContainer ? drainDurationMs : 0,
+      previousContainerRetirement,
       activeContainerName: containerName,
       candidateContainerName: containerName,
     }),

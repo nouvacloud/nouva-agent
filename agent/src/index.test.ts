@@ -30,13 +30,14 @@ import {
   shouldStopRetryingAgentWorkMutation,
   startAgentWorkLeaseRenewal,
 } from "./index.js";
-import type {
-  AgentRuntimeConfig,
-  AppDeployPayload,
-  AppRolloutConfig,
-  CreateVolumeBackupPayload,
-  DatabaseProvisionPayload,
-  RestoreVolumeBackupPayload,
+import {
+  type AgentRuntimeConfig,
+  type AppDeployPayload,
+  type AppRolloutConfig,
+  type CreateVolumeBackupPayload,
+  type DatabaseProvisionPayload,
+  type RestoreVolumeBackupPayload,
+  resolveAppRolloutConfig,
 } from "./protocol.js";
 
 const runtimeConfig: AgentRuntimeConfig = {
@@ -294,6 +295,12 @@ function createRolloutConfig(overrides?: Partial<AppRolloutConfig>): AppRolloutC
       verificationTimeoutMs: 25,
       verificationIntervalMs: 1,
       ...overrides?.cutover,
+    },
+    drain: {
+      durationMs: 0,
+      gracefulStopTimeoutSeconds: 10,
+      cleanupTimeoutMs: 15_000,
+      ...overrides?.drain,
     },
   };
 }
@@ -880,6 +887,14 @@ describe("buildAppContainerSpec", () => {
 });
 
 describe("deployAppImageWithDependencies", () => {
+  test("uses the backward-compatible thirty-second drain defaults", () => {
+    expect(resolveAppRolloutConfig(null).drain).toEqual({
+      durationMs: 30_000,
+      gracefulStopTimeoutSeconds: 10,
+      cleanupTimeoutMs: 15_000,
+    });
+  });
+
   test("keeps the live container in place until the candidate is ready and cut over", async () => {
     const docker = createDockerMock();
     docker.ensureContainer.mockImplementation(async () => "ctr_candidate");
@@ -907,6 +922,7 @@ describe("deployAppImageWithDependencies", () => {
     const writeLocalTraefikRoute = mock(async () => {});
     const deleteLocalTraefikRoute = mock(async () => {});
     const checkTcpConnect = mock(async () => true);
+    const drainSleep = mock(async () => undefined);
     const fetchImpl: typeof fetch = mock(async () =>
       Response.json([
         {
@@ -925,13 +941,20 @@ describe("deployAppImageWithDependencies", () => {
         fetchImpl,
         writeLocalTraefikRoute,
         deleteLocalTraefikRoute,
+        sleep: drainSleep,
       },
       docker as never,
       runtimeConfig,
       {
         ...appRuntimePayload,
         volume: null,
-        rollout: createRolloutConfig(),
+        rollout: createRolloutConfig({
+          drain: {
+            durationMs: 30_000,
+            gracefulStopTimeoutSeconds: 10,
+            cleanupTimeoutMs: 15_000,
+          },
+        }),
         runtimeMetadata: {
           image: "nouva-app:dep_prev",
           imageStoreMode: "docker-local",
@@ -964,7 +987,15 @@ describe("deployAppImageWithDependencies", () => {
       },
       "http://nouva-app-svc_1-dep_1:8080"
     );
-    expect(docker.removeContainer.mock.calls).toEqual([["nouva-app-svc_1-live", true]]);
+    expect(drainSleep).toHaveBeenCalledWith(30_000);
+    expect(fetchImpl.mock.invocationCallOrder[0]).toBeLessThan(
+      drainSleep.mock.invocationCallOrder[0]!
+    );
+    expect(drainSleep.mock.invocationCallOrder[0]).toBeLessThan(
+      docker.stopContainer.mock.invocationCallOrder[0]!
+    );
+    expect(docker.stopContainer).toHaveBeenCalledWith("nouva-app-svc_1-live", 10, 15_000);
+    expect(docker.removeContainer.mock.calls).toEqual([["nouva-app-svc_1-live", false, 15_000]]);
     expect(docker.removeImage).toHaveBeenCalledWith("nouva-app:dep_older", true);
     expect(result.runtimeMetadata).toEqual(
       expect.objectContaining({
@@ -987,7 +1018,225 @@ describe("deployAppImageWithDependencies", () => {
       expect.objectContaining({
         outcome: "committed",
         currentPhase: "retire",
+        drainDurationMs: 30_000,
+        previousContainerRetirement: "graceful",
       })
+    );
+  });
+
+  test("waits for Docker health instead of accepting TCP while health is starting", async () => {
+    const docker = createDockerMock();
+    let inspectionCount = 0;
+    docker.ensureContainer.mockImplementation(async () => "ctr_candidate");
+    docker.inspectContainer.mockImplementation(async (name: string) => {
+      if (name !== "nouva-app-svc_1-dep_1") {
+        return null;
+      }
+
+      inspectionCount += 1;
+      return {
+        Id: "ctr_candidate",
+        Name: name,
+        State: {
+          Running: true,
+          Status: "running",
+          Health: { Status: inspectionCount === 1 ? "starting" : "healthy" },
+        },
+        NetworkSettings: {
+          Networks: { "nouva-local": { IPAddress: "172.19.0.10" } },
+        },
+      };
+    });
+
+    const checkTcpConnect = mock(async () => true);
+    const drainSleep = mock(async () => undefined);
+    const result = await deployAppImageWithDependencies(
+      {
+        ensureBaseRuntime: async () => undefined,
+        checkTcpConnect,
+        fetchImpl: mock(async () =>
+          Response.json([
+            {
+              name: "svc-svc_1@file",
+              loadBalancer: {
+                servers: [{ url: "http://nouva-app-svc_1-dep_1:8080" }],
+              },
+            },
+          ])
+        ) as typeof fetch,
+        writeLocalTraefikRoute: mock(async () => {}),
+        deleteLocalTraefikRoute: mock(async () => {}),
+        sleep: drainSleep,
+      },
+      docker as never,
+      runtimeConfig,
+      {
+        ...appRuntimePayload,
+        volume: null,
+        rollout: createRolloutConfig(),
+        runtimeMetadata: null,
+      }
+    );
+
+    expect(inspectionCount).toBe(2);
+    expect(checkTcpConnect).not.toHaveBeenCalled();
+    expect(drainSleep).not.toHaveBeenCalled();
+    expect(docker.stopContainer).not.toHaveBeenCalled();
+    expect(result.rollout).toEqual(
+      expect.objectContaining({
+        drainDurationMs: 0,
+        previousContainerRetirement: null,
+      })
+    );
+  });
+
+  test("fails immediately when Docker reports an unhealthy candidate", async () => {
+    const docker = createDockerMock();
+    docker.ensureContainer.mockImplementation(async () => "ctr_candidate");
+    docker.inspectContainer.mockImplementation(async (name: string) =>
+      name === "nouva-app-svc_1-dep_1"
+        ? {
+            Id: "ctr_candidate",
+            Name: name,
+            State: {
+              Running: true,
+              Status: "running",
+              Health: { Status: "unhealthy" },
+            },
+          }
+        : null
+    );
+    const checkTcpConnect = mock(async () => true);
+
+    await expect(
+      deployAppImageWithDependencies(
+        {
+          ensureBaseRuntime: async () => undefined,
+          checkTcpConnect,
+          fetchImpl: mock(async () => Response.json([])) as typeof fetch,
+          writeLocalTraefikRoute: mock(async () => {}),
+          deleteLocalTraefikRoute: mock(async () => {}),
+        },
+        docker as never,
+        runtimeConfig,
+        {
+          ...appRuntimePayload,
+          volume: null,
+          rollout: createRolloutConfig(),
+          runtimeMetadata: null,
+        }
+      )
+    ).rejects.toHaveProperty(
+      "message",
+      "Candidate container nouva-app-svc_1-dep_1 became unhealthy"
+    );
+
+    expect(checkTcpConnect).not.toHaveBeenCalled();
+    expect(docker.removeContainer).toHaveBeenCalledWith("nouva-app-svc_1-dep_1", true);
+  });
+
+  test("reports the last Docker health status when readiness times out", async () => {
+    const docker = createDockerMock();
+    docker.ensureContainer.mockImplementation(async () => "ctr_candidate");
+    docker.inspectContainer.mockImplementation(async (name: string) =>
+      name === "nouva-app-svc_1-dep_1"
+        ? {
+            Id: "ctr_candidate",
+            Name: name,
+            State: {
+              Running: true,
+              Status: "running",
+              Health: { Status: "starting" },
+            },
+          }
+        : null
+    );
+    const checkTcpConnect = mock(async () => true);
+
+    await expect(
+      deployAppImageWithDependencies(
+        {
+          ensureBaseRuntime: async () => undefined,
+          checkTcpConnect,
+          fetchImpl: mock(async () => Response.json([])) as typeof fetch,
+          writeLocalTraefikRoute: mock(async () => {}),
+          deleteLocalTraefikRoute: mock(async () => {}),
+        },
+        docker as never,
+        runtimeConfig,
+        {
+          ...appRuntimePayload,
+          volume: null,
+          rollout: createRolloutConfig({
+            readiness: {
+              timeoutMs: 0,
+              intervalMs: 1,
+              tcpConnectTimeoutMs: 1,
+            },
+          }),
+          runtimeMetadata: null,
+        }
+      )
+    ).rejects.toHaveProperty(
+      "message",
+      "Candidate container nouva-app-svc_1-dep_1 health status is starting"
+    );
+
+    expect(checkTcpConnect).not.toHaveBeenCalled();
+  });
+
+  test("uses a bounded forced removal only when graceful retirement fails", async () => {
+    const docker = createDockerMock();
+    docker.ensureContainer.mockImplementation(async () => "ctr_candidate");
+    docker.inspectContainer.mockImplementation(async (name: string) =>
+      name === "nouva-app-svc_1-dep_1"
+        ? {
+            Id: "ctr_candidate",
+            Name: name,
+            State: { Running: true },
+            NetworkSettings: {
+              Networks: { "nouva-local": { IPAddress: "172.19.0.10" } },
+            },
+          }
+        : null
+    );
+    docker.stopContainer.mockRejectedValueOnce(new Error("stop failed"));
+
+    const result = await deployAppImageWithDependencies(
+      {
+        ensureBaseRuntime: async () => undefined,
+        checkTcpConnect: mock(async () => true),
+        fetchImpl: mock(async () =>
+          Response.json([
+            {
+              name: "svc-svc_1@file",
+              loadBalancer: {
+                servers: [{ url: "http://nouva-app-svc_1-dep_1:8080" }],
+              },
+            },
+          ])
+        ) as typeof fetch,
+        writeLocalTraefikRoute: mock(async () => {}),
+        deleteLocalTraefikRoute: mock(async () => {}),
+        sleep: mock(async () => undefined),
+      },
+      docker as never,
+      runtimeConfig,
+      {
+        ...appRuntimePayload,
+        volume: null,
+        rollout: createRolloutConfig(),
+        runtimeMetadata: {
+          containerName: "nouva-app-svc_1-live",
+          internalPort: 8080,
+        },
+      }
+    );
+
+    expect(docker.stopContainer).toHaveBeenCalledWith("nouva-app-svc_1-live", 10, 15_000);
+    expect(docker.removeContainer.mock.calls).toEqual([["nouva-app-svc_1-live", true, 15_000]]);
+    expect(result.rollout).toEqual(
+      expect.objectContaining({ previousContainerRetirement: "forced" })
     );
   });
 
@@ -1147,6 +1396,7 @@ describe("deployAppImageWithDependencies", () => {
       ],
     ]);
     expect(docker.removeContainer.mock.calls).toEqual([["nouva-app-svc_1-dep_1", true]]);
+    expect(docker.stopContainer).not.toHaveBeenCalled();
   });
 
   test("stops and snapshots a volume app before launching its candidate", async () => {

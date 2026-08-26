@@ -161,10 +161,17 @@ export interface AppRolloutCutoverConfig {
   verificationIntervalMs: number;
 }
 
+export interface AppRolloutDrainConfig {
+  durationMs: number;
+  gracefulStopTimeoutSeconds: number;
+  cleanupTimeoutMs: number;
+}
+
 export interface AppRolloutConfig {
   strategy: AppRolloutStrategy;
   readiness: AppRolloutReadinessConfig;
   cutover: AppRolloutCutoverConfig;
+  drain: AppRolloutDrainConfig;
 }
 
 export interface AppRolloutResult {
@@ -173,6 +180,8 @@ export interface AppRolloutResult {
   currentPhase: AppRolloutPhase;
   liveRuntimePreserved: boolean;
   rollbackCompleted: boolean;
+  drainDurationMs?: number;
+  previousContainerRetirement?: "graceful" | "forced" | "deferred" | null;
   activeContainerName?: string | null;
   candidateContainerName?: string | null;
 }
@@ -188,6 +197,11 @@ export const DEFAULT_APP_ROLLOUT_CONFIG: AppRolloutConfig = {
     verificationTimeoutMs: 15_000,
     verificationIntervalMs: 250,
   },
+  drain: {
+    durationMs: 30_000,
+    gracefulStopTimeoutSeconds: 10,
+    cleanupTimeoutMs: 15_000,
+  },
 };
 
 export function getDefaultAppRolloutConfig(): AppRolloutConfig {
@@ -195,6 +209,7 @@ export function getDefaultAppRolloutConfig(): AppRolloutConfig {
     strategy: DEFAULT_APP_ROLLOUT_CONFIG.strategy,
     readiness: { ...DEFAULT_APP_ROLLOUT_CONFIG.readiness },
     cutover: { ...DEFAULT_APP_ROLLOUT_CONFIG.cutover },
+    drain: { ...DEFAULT_APP_ROLLOUT_CONFIG.drain },
   };
 }
 
@@ -215,6 +230,14 @@ export function resolveAppRolloutConfig(config?: AppRolloutConfig | null): AppRo
       verificationIntervalMs:
         config?.cutover?.verificationIntervalMs ??
         DEFAULT_APP_ROLLOUT_CONFIG.cutover.verificationIntervalMs,
+    },
+    drain: {
+      durationMs: config?.drain?.durationMs ?? DEFAULT_APP_ROLLOUT_CONFIG.drain.durationMs,
+      gracefulStopTimeoutSeconds:
+        config?.drain?.gracefulStopTimeoutSeconds ??
+        DEFAULT_APP_ROLLOUT_CONFIG.drain.gracefulStopTimeoutSeconds,
+      cleanupTimeoutMs:
+        config?.drain?.cleanupTimeoutMs ?? DEFAULT_APP_ROLLOUT_CONFIG.drain.cleanupTimeoutMs,
     },
   };
 }

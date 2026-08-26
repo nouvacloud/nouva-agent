@@ -354,6 +354,24 @@ describe("DockerApiClient cleanup semantics", () => {
     requestSpy.mockRestore();
   });
 
+  test("passes bounded graceful-stop and cleanup deadlines to Docker", async () => {
+    const DockerApiClientCtor = DockerApiClient as unknown as {
+      new (apiVersion: string): DockerApiClient;
+    };
+    const client = new DockerApiClientCtor("v1.51");
+    const requestSpy = spyOn(client, "request").mockResolvedValue("");
+
+    await client.stopContainer("nouva-app-svc_1-live", 10, 15_000);
+    await client.removeContainer("nouva-app-svc_1-live", false, 15_000);
+
+    expect(requestSpy.mock.calls).toEqual([
+      ["POST", "/containers/nouva-app-svc_1-live/stop?t=10", null, 15_000],
+      ["DELETE", "/containers/nouva-app-svc_1-live?force=false", null, 15_000],
+    ]);
+
+    requestSpy.mockRestore();
+  });
+
   test("propagates permission, conflict, daemon, and transport mutation failures", async () => {
     const DockerApiClientCtor = DockerApiClient as unknown as {
       new (apiVersion: string): DockerApiClient;

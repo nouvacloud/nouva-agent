@@ -691,9 +691,14 @@ export class DockerApiClient {
     }
   }
 
-  async removeContainer(nameOrId: string, force = false): Promise<void> {
+  async removeContainer(nameOrId: string, force = false, timeoutMs?: number): Promise<void> {
     try {
-      await this.request("DELETE", `/containers/${encodeURIComponent(nameOrId)}?force=${force}`);
+      await this.request(
+        "DELETE",
+        `/containers/${encodeURIComponent(nameOrId)}?force=${force}`,
+        null,
+        timeoutMs
+      );
     } catch (error) {
       if (!(error instanceof DockerApiError && error.status === 404)) {
         throw error;
@@ -714,9 +719,22 @@ export class DockerApiClient {
     }
   }
 
-  async stopContainer(nameOrId: string): Promise<void> {
+  async stopContainer(
+    nameOrId: string,
+    timeoutSeconds?: number,
+    requestTimeoutMs?: number
+  ): Promise<void> {
     try {
-      await this.request("POST", `/containers/${encodeURIComponent(nameOrId)}/stop`);
+      const timeoutQuery =
+        typeof timeoutSeconds === "number" && Number.isFinite(timeoutSeconds)
+          ? `?t=${Math.max(0, Math.trunc(timeoutSeconds))}`
+          : "";
+      await this.request(
+        "POST",
+        `/containers/${encodeURIComponent(nameOrId)}/stop${timeoutQuery}`,
+        null,
+        requestTimeoutMs
+      );
     } catch (error) {
       if (!(error instanceof DockerApiError && (error.status === 404 || error.status === 304))) {
         throw error;
