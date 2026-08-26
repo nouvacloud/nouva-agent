@@ -654,6 +654,8 @@ async function retirePreviousAppContainer(
   dependencies: Pick<DeployAppImageDependencies, "sleep">,
   docker: Pick<DockerApiClient, "removeContainer" | "stopContainer">,
   containerName: string,
+  serviceId: string,
+  deploymentId: string,
   rollout: AppRolloutConfig,
   drainDurationMs: number
 ): Promise<PreviousContainerRetirement> {
@@ -670,8 +672,10 @@ async function retirePreviousAppContainer(
   } catch (error) {
     console.warn("[nouva-agent] app rollout retirement fallback", {
       containerName,
+      deploymentId,
       errorType: getRetirementErrorType(error),
       outcome: "force_remove_attempt",
+      serviceId,
       stage: "graceful_stop",
     });
     try {
@@ -680,8 +684,10 @@ async function retirePreviousAppContainer(
     } catch (fallbackError) {
       console.warn("[nouva-agent] app rollout retirement deferred", {
         containerName,
+        deploymentId,
         errorType: getRetirementErrorType(fallbackError),
         outcome: "deferred",
+        serviceId,
         stage: "force_remove",
       });
       return "deferred";
@@ -694,8 +700,10 @@ async function retirePreviousAppContainer(
   } catch (error) {
     console.warn("[nouva-agent] app rollout retirement deferred", {
       containerName,
+      deploymentId,
       errorType: getRetirementErrorType(error),
       outcome: "deferred",
+      serviceId,
       stage: "non_force_remove",
     });
     return "deferred";
@@ -2603,6 +2611,8 @@ export async function deployAppImageWithDependencies(
         dependencies,
         docker,
         previousContainer,
+        payload.serviceId,
+        payload.deploymentId,
         rollout,
         drainDurationMs
       )
