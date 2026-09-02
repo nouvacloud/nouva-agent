@@ -246,6 +246,68 @@ const mongodbBackupPayload: CreateVolumeBackupPayload = {
   artifactFormat: "mongodb-archive-tar-v1",
 };
 
+const mysqlBackupPayload: CreateVolumeBackupPayload = {
+  ...snapshotBackupPayload,
+  serviceId: "svc_mysql_1",
+  serviceName: "main-mysql",
+  variant: "mysql",
+  version: "8.4",
+  volumeId: "vol_mysql_1",
+  volumeName: "nouva-vol-vol_mysql_1",
+  mountPath: "/var/lib/mysql",
+  backupId: "backup_mysql_1",
+  runtimeMetadata: { containerId: "mysql-container-id" },
+  credentials: {
+    username: "app_user",
+    password: "mysql-secret",
+    database: "appdb",
+  },
+  imageUrl: "mysql:8.4",
+  envVars: {
+    MYSQL_ROOT_PASSWORD: "mysql-secret",
+    MYSQL_USER: "app_user",
+    MYSQL_PASSWORD: "mysql-secret",
+    MYSQL_DATABASE: "appdb",
+  },
+  containerArgs: [],
+  dataPath: "/var/lib/mysql",
+  expectedObjectKey:
+    "archives/v1/projects/proj_1/volumes/vol_mysql_1/backups/backup_mysql_1.tar.gz",
+  artifactFormat: "mysql-dump-tar-v1",
+};
+
+const mysqlRestorePayload: RestoreVolumeBackupPayload = {
+  projectId: "proj_1",
+  serviceId: "svc_mysql_1",
+  serviceName: "main-mysql",
+  variant: "mysql",
+  version: "8.4",
+  sourceVolumeId: "vol_mysql_1",
+  sourceVolumeName: "nouva-vol-vol_mysql_1",
+  sourceMountPath: "/var/lib/mysql",
+  targetVolumeId: "vol_restored_mysql",
+  targetVolumeName: "nouva-vol-vol_restored_mysql",
+  targetMountPath: "/var/lib/mysql",
+  backupId: "backup_mysql_1",
+  engine: "snapshot",
+  backupCompletedAt: "2026-03-25T00:00:00Z",
+  pgbackrestSet: null,
+  artifactSha256: "c".repeat(64),
+  destination: {} as never,
+  imageUrl: "mysql:8.4",
+  envVars: {
+    MYSQL_ROOT_PASSWORD: "mysql-secret",
+    MYSQL_USER: "app_user",
+    MYSQL_PASSWORD: "mysql-secret",
+    MYSQL_DATABASE: "appdb",
+  },
+  containerArgs: [],
+  dataPath: "/var/lib/mysql",
+  expectedObjectKey:
+    "archives/v1/projects/proj_1/volumes/vol_mysql_1/backups/backup_mysql_1.tar.gz",
+  artifactFormat: "mysql-dump-tar-v1",
+};
+
 const pgBackrestRestorePayload: RestoreVolumeBackupPayload = {
   projectId: "proj_1",
   serviceId: "svc_1",
@@ -1973,6 +2035,143 @@ describe("database runtime recreate paths", () => {
 
     expect(result.pgbackrestSet).toBe("20260325-000000F");
     expect(result.activePgbackrestSets).toEqual(["20260325-000000F", "20260324-000000F"]);
+  });
+
+  test("dumps MySQL through a service-image sidecar and verifies the uploaded archive", async () => {
+    const docker = createDockerMock();
+    docker.containerLogs.mockResolvedValue(
+      "NOUVA_SIZE_BYTES:128\nNOUVA_SHA256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    );
+
+    const result = await handleCreateVolumeBackup(
+      docker as never,
+      runtimeConfig,
+      mysqlBackupPayload
+    );
+
+    expect(docker.createVolume).toHaveBeenCalledWith(
+      "nouva-backup-stage-backup_mysql",
+      expect.objectContaining({ "nouva.resource": "backup-stage" })
+    );
+    const dumpTask = docker.createContainer.mock.calls[0]?.[0];
+    const dumpScript = dumpTask?.cmd?.[0];
+    expect(dumpTask).toEqual(
+      expect.objectContaining({
+        image: "mysql:8.4",
+        env: ["MYSQL_PWD=mysql-secret"],
+        entrypoint: ["sh", "-c"],
+        hostConfig: expect.objectContaining({
+          NetworkMode: "container:mysql-container-id",
+          Mounts: [
+            expect.objectContaining({
+              Source: "nouva-backup-stage-backup_mysql",
+              Target: "/stage",
+            }),
+          ],
+        }),
+      })
+    );
+    expect(dumpScript).toContain("mysqldump -h127.0.0.1 -P3306 -uroot");
+    expect(dumpScript).toContain("--single-transaction");
+    expect(dumpScript).toContain("--databases");
+    expect(dumpScript).not.toContain("mysql-secret");
+
+    const verifyTask = docker.createContainer.mock.calls[1]?.[0];
+    const verifyScript = verifyTask?.cmd?.[2];
+    expect(verifyTask?.env).toEqual(expect.arrayContaining(["NOUVA_BACKUP_ID=backup_mysql_1"]));
+    expect(verifyTask?.env).not.toEqual(expect.arrayContaining(["MYSQL_PWD=mysql-secret"]));
+    expect(verifyScript).toContain('grep -q "Dump completed"');
+    expect(verifyScript).toContain("rclone copyto");
+    expect(docker.removeVolume).toHaveBeenLastCalledWith("nouva-backup-stage-backup_mysql", true);
+    expect(result).toEqual(
+      expect.objectContaining({
+        sizeBytes: 128,
+        objectKey: mysqlBackupPayload.expectedObjectKey,
+        artifactFormat: "mysql-dump-tar-v1",
+        integrityProof: expect.objectContaining({
+          engine: "mysql",
+          mysqldumpSucceeded: true,
+          dumpCompletedMarkerVerified: true,
+          uploadChecksumVerified: true,
+        }),
+      })
+    );
+  });
+
+  test("removes the MySQL staging volume when the dump sidecar fails", async () => {
+    const docker = createDockerMock();
+    docker.waitContainer.mockResolvedValueOnce(1);
+    docker.containerLogs.mockResolvedValueOnce("mysqldump: Got error: 1045");
+
+    await expect(
+      handleCreateVolumeBackup(docker as never, runtimeConfig, mysqlBackupPayload)
+    ).rejects.toThrow("mysqldump: Got error: 1045");
+
+    expect(docker.createContainer).toHaveBeenCalledTimes(1);
+    expect(docker.removeVolume).toHaveBeenLastCalledWith("nouva-backup-stage-backup_mysql", true);
+  });
+
+  test("restores a MySQL dump by replaying it through the service image on a staged volume", async () => {
+    const docker = createDockerMock();
+
+    const result = await handleRestoreVolumeBackup(
+      docker as never,
+      runtimeConfig,
+      mysqlRestorePayload
+    );
+
+    expect(docker.createVolume).toHaveBeenNthCalledWith(
+      1,
+      "nouva-vol-vol_restored_mysql",
+      expect.objectContaining({ "nouva.volume.id": "vol_restored_mysql" })
+    );
+    expect(docker.createVolume).toHaveBeenNthCalledWith(
+      2,
+      "nouva-restore-stage-backup_mysql",
+      expect.objectContaining({ "nouva.resource": "restore-stage" })
+    );
+
+    const fetchTask = docker.createContainer.mock.calls[0]?.[0];
+    expect(fetchTask?.env).toEqual(expect.arrayContaining([`EXPECTED_SHA256=${"c".repeat(64)}`]));
+    expect(fetchTask?.cmd?.[2]).toContain('grep -qx "dump.sql.gz"');
+
+    const replayTask = docker.createContainer.mock.calls[1]?.[0];
+    expect(replayTask).toEqual(
+      expect.objectContaining({
+        image: "mysql:8.4",
+        entrypoint: ["sh", "-c"],
+        hostConfig: expect.objectContaining({
+          Mounts: [
+            expect.objectContaining({
+              Source: "nouva-vol-vol_restored_mysql",
+              Target: "/var/lib/mysql",
+            }),
+            expect.objectContaining({
+              Source: "nouva-restore-stage-backup_mysql",
+              Target: "/docker-entrypoint-initdb.d",
+              ReadOnly: true,
+            }),
+          ],
+        }),
+      })
+    );
+    expect(replayTask?.env).toEqual(
+      expect.arrayContaining(["MYSQL_ROOT_PASSWORD=mysql-secret", "MYSQL_DATABASE=appdb"])
+    );
+    expect(replayTask?.env).not.toEqual(expect.arrayContaining(["MYSQL_PWD=mysql-secret"]));
+    expect(replayTask?.cmd?.[0]).toContain("docker-entrypoint.sh mysqld");
+    expect(replayTask?.cmd?.[0]).toContain("mysqladmin");
+    expect(docker.removeVolume).toHaveBeenLastCalledWith("nouva-restore-stage-backup_mysql", true);
+    expect(result).toEqual(
+      expect.objectContaining({
+        volumeName: "nouva-vol-vol_restored_mysql",
+        restoreProof: expect.objectContaining({
+          validationMethod: "mysql-startup-sql-read",
+          isolatedDatabaseStarted: true,
+          targetVolumeId: "vol_restored_mysql",
+        }),
+      })
+    );
   });
 
   test("restores a named pgBackRest backup to consistency without a time target", async () => {

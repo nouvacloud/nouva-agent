@@ -311,6 +311,34 @@ describe("agent protocol", () => {
     expect(JSON.parse(JSON.stringify(payload))).toEqual(payload);
   });
 
+  test("round-trips mysql database provision payloads", () => {
+    const payload = {
+      projectId: "proj_1",
+      serviceId: "svc_1",
+      serviceName: "main-mysql",
+      variant: "mysql" as const,
+      volumeId: "vol_1",
+      volumeName: "nouva-vol-vol_1",
+      mountPath: "/var/lib/mysql",
+      imageUrl: "mysql:8.4",
+      envVars: {
+        MYSQL_ROOT_PASSWORD: "super-secret",
+        MYSQL_DATABASE: "nouva",
+      },
+      containerArgs: [],
+      dataPath: "/var/lib/mysql",
+      internalPort: 3306,
+      storageSizeGb: 20,
+      externalHost: null,
+      externalPort: null,
+      publicAccessEnabled: false,
+      resourceLimits: null,
+      runtimeMetadata: null,
+    };
+
+    expect(JSON.parse(JSON.stringify(payload))).toEqual(payload);
+  });
+
   test("treats queued and expired work items as leaseable", () => {
     expect(
       canLeaseWorkItem({

@@ -142,4 +142,41 @@ describe("service runtime", () => {
       internalPort: 27017,
     });
   });
+
+  test("resolves mysql executor fields for generic database runtime handling", () => {
+    const resolved = resolveDatabaseProvisionSpec({
+      projectId: "proj_1",
+      serviceId: "svc_1",
+      serviceName: "main-mysql",
+      variant: "mysql",
+      volumeId: "vol_1",
+      volumeName: "nouva-vol-vol_1",
+      mountPath: "/var/lib/mysql",
+      imageUrl: "mysql:8.4",
+      envVars: {
+        MYSQL_ROOT_PASSWORD: "super-secret",
+        MYSQL_DATABASE: "nouva",
+      },
+      containerArgs: [],
+      dataPath: "/var/lib/mysql",
+      internalPort: 3306,
+      storageSizeGb: 10,
+      externalHost: null,
+      externalPort: null,
+      publicAccessEnabled: false,
+      resourceLimits: null,
+    });
+
+    expect(resolved).toEqual({
+      image: "mysql:8.4",
+      envVars: {
+        MYSQL_ROOT_PASSWORD: "super-secret",
+        MYSQL_DATABASE: "nouva",
+      },
+      containerArgs: [],
+      mountPath: "/var/lib/mysql",
+      dataPath: "/var/lib/mysql",
+      internalPort: 3306,
+    });
+  });
 });

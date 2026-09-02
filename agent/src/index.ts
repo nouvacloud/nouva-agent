@@ -278,6 +278,36 @@ function buildManagedVolumeLabels(input: {
   };
 }
 
+function buildBackupStageVolumeLabels(input: {
+  kind: "backup-stage" | "restore-stage";
+  backupId: string;
+  serviceId: string;
+}): Record<string, string> {
+  // Intentionally not a "volume" resource: staging volumes are transient scratch space and must
+  // never be mistaken for a service data volume by capacity accounting or reconciliation.
+  return {
+    "nouva.managed": "true",
+    "nouva.resource": input.kind,
+    "nouva.backup.id": input.backupId,
+    "nouva.service.id": input.serviceId,
+  };
+}
+
+function buildArchiveDestinationEnv(
+  destination: CreateVolumeBackupPayload["destination"],
+  objectKey: string
+): string[] {
+  return [
+    `BACKUP_ACCESS_KEY_ID=${destination.accessKeyId}`,
+    `BACKUP_SECRET_ACCESS_KEY=${destination.secretAccessKey}`,
+    `BACKUP_ENDPOINT=${destination.endpoint}`,
+    `BACKUP_REGION=${destination.region}`,
+    `BACKUP_BUCKET=${destination.bucket}`,
+    `BACKUP_OBJECT_KEY=${objectKey}`,
+    `BACKUP_FORCE_PATH_STYLE=${destination.pathStyle ? "true" : "false"}`,
+  ];
+}
+
 function toObject(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
 }
@@ -1616,7 +1646,7 @@ function buildProjectNetwork(projectId: string): string {
 
 function resolveRuntimeResourceLimits(
   input: unknown,
-  workload: "app" | "postgres" | "mongodb" | "redis"
+  workload: "app" | "postgres" | "mongodb" | "redis" | "mysql"
 ): EffectiveServiceResourceLimits {
   const record =
     typeof input === "object" && input !== null && !Array.isArray(input)
@@ -3276,6 +3306,176 @@ async function handleCreateMongoArchiveBackup(
   };
 }
 
+const MYSQL_SYSTEM_SCHEMAS = "'mysql','information_schema','performance_schema','sys'";
+const MYSQL_CLIENT_FLAGS = "-h127.0.0.1 -P3306 -uroot --protocol=tcp";
+
+function buildMysqlDumpScript(): string {
+  // Runs inside the service image (mysqldump ships with it) in the live container's network
+  // namespace. The root password arrives via MYSQL_PWD so it never appears on argv.
+  // The dump uses --databases so it carries CREATE DATABASE / USE statements for every
+  // user schema; grants on schemas other than MYSQL_DATABASE are not part of the dump.
+  return [
+    "set -eu",
+    `schemas=$(mysql ${MYSQL_CLIENT_FLAGS} -N -e "SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT IN (${MYSQL_SYSTEM_SCHEMAS})")`,
+    'test -n "$schemas"',
+    `mysqldump ${MYSQL_CLIENT_FLAGS} --single-transaction --routines --events --triggers --set-gtid-purged=OFF --databases $schemas > /stage/dump.sql`,
+    "test -s /stage/dump.sql",
+  ].join("\n");
+}
+
+function buildMysqlRestoreReplayScript(): string {
+  // Runs inside the service image on the freshly created target volume. The official entrypoint
+  // initializes the data directory with MYSQL_* credentials, replays /docker-entrypoint-initdb.d
+  // (our dump.sql.gz) through a --skip-networking temp server, then starts the real server. A TCP
+  // ping therefore only succeeds once the replay completed. MYSQL_PWD is set per command and
+  // never exported: the entrypoint's own client calls run against a passwordless root during init.
+  return [
+    "set -eu",
+    'test -n "$MYSQL_ROOT_PASSWORD"',
+    'test -n "$MYSQL_DATABASE"',
+    "docker-entrypoint.sh mysqld &",
+    "pid=$!",
+    "ready=0",
+    "i=0",
+    'while [ "$i" -lt 1500 ]; do',
+    '  if ! kill -0 "$pid" 2>/dev/null; then echo "mysqld exited before the restore replay completed" >&2; exit 1; fi',
+    `  if MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysqladmin ${MYSQL_CLIENT_FLAGS} ping >/dev/null 2>&1; then ready=1; break; fi`,
+    "  i=$((i + 1))",
+    "  sleep 1",
+    "done",
+    'test "$ready" = 1',
+    `schema_count=$(MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql ${MYSQL_CLIENT_FLAGS} -N -e "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = '$MYSQL_DATABASE'")`,
+    'test "$schema_count" = 1',
+    `MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysqladmin ${MYSQL_CLIENT_FLAGS} shutdown`,
+    'wait "$pid"',
+    'printf "NOUVA_MYSQL_RESTORE_VALIDATED:1\\n"',
+  ].join("\n");
+}
+
+async function handleCreateMysqlDumpBackup(
+  docker: DockerApiClient,
+  config: Pick<AgentRuntimeConfig, "privateRegistry">,
+  payload: CreateVolumeBackupPayload
+) {
+  if (payload.artifactFormat !== "mysql-dump-tar-v1") {
+    throw new Error("MySQL backup requires mysql-dump-tar-v1 artifacts");
+  }
+  const runtimeContainer =
+    payload.runtimeMetadata?.containerId ?? payload.runtimeMetadata?.containerName ?? null;
+  if (!runtimeContainer) {
+    throw new Error("MySQL backup requires the authoritative live runtime container identity");
+  }
+  const rootPassword = payload.credentials?.password;
+  if (!rootPassword) {
+    throw new Error("MySQL backup requires service credentials");
+  }
+  const serviceImage = payload.imageUrl?.trim();
+  if (!serviceImage) {
+    throw new Error("MySQL backup requires the hydrated service image reference");
+  }
+
+  const stageVolume = `nouva-backup-stage-${payload.backupId.slice(0, 12)}`;
+  const remoteExpression = buildArchiveRemoteExpression(payload.destination.verifyTls);
+  const agentTaskImage = await resolveAgentTaskImage(docker);
+  await docker.removeVolume(stageVolume, true);
+  await docker.createVolume(
+    stageVolume,
+    buildBackupStageVolumeLabels({
+      kind: "backup-stage",
+      backupId: payload.backupId,
+      serviceId: payload.serviceId,
+    })
+  );
+
+  let logs = "";
+  try {
+    await runTaskContainer(docker, config, {
+      name: `nouva-backup-dump-${payload.backupId.slice(0, 12)}`,
+      image: serviceImage,
+      env: [`MYSQL_PWD=${rootPassword}`],
+      entrypoint: ["sh", "-c"],
+      cmd: [buildMysqlDumpScript()],
+      mounts: [{ source: stageVolume, target: "/stage" }],
+      networkMode: `container:${runtimeContainer}`,
+      timeoutMs: 30 * 60_000,
+    });
+
+    const result = await runTaskContainer(docker, config, {
+      name: `nouva-backup-${payload.backupId.slice(0, 12)}`,
+      image: agentTaskImage,
+      env: [
+        ...buildArchiveDestinationEnv(payload.destination, payload.expectedObjectKey),
+        `NOUVA_BACKUP_ID=${payload.backupId}`,
+      ],
+      cmd: [
+        "sh",
+        "-c",
+        [
+          "set -eu",
+          `remote="${remoteExpression}"`,
+          "work_dir=$(mktemp -d)",
+          'archive="/tmp/nouva-mysql-backup.tar.gz"',
+          'download="/tmp/nouva-mysql-backup.download.tar.gz"',
+          "uploaded=0",
+          'cleanup() { rm -rf "$work_dir" "$archive" "$download"; if [ "$uploaded" = 1 ] && [ "$' +
+            '{NOUVA_BACKUP_OK:-0}" != 1 ]; then rclone deletefile "$remote" || true; fi; }',
+          "trap cleanup EXIT INT TERM",
+          "test -s /stage/dump.sql",
+          'gzip -c /stage/dump.sql > "$work_dir/dump.sql.gz"',
+          'printf \'{"version":1,"backupId":"%s","artifactFormat":"mysql-dump-tar-v1"}\\n\' "$NOUVA_BACKUP_ID" > "$work_dir/manifest.json"',
+          'tar -C "$work_dir" -czf "$archive" manifest.json dump.sql.gz',
+          'sha256=$(sha256sum "$archive" | cut -d " " -f 1)',
+          'size_bytes=$(wc -c < "$archive" | tr -d " ")',
+          'rclone copyto "$archive" "$remote"',
+          "uploaded=1",
+          'rclone copyto "$remote" "$download"',
+          'download_sha256=$(sha256sum "$download" | cut -d " " -f 1)',
+          'test "$sha256" = "$download_sha256"',
+          'mkdir "$work_dir/restore"',
+          'tar -C "$work_dir/restore" -xzf "$download"',
+          'test "$(find "$work_dir/restore" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d " ")" = 2',
+          'gzip -t "$work_dir/restore/dump.sql.gz"',
+          'gzip -dc "$work_dir/restore/dump.sql.gz" | tail -n 1 | grep -q "Dump completed"',
+          'printf "NOUVA_SIZE_BYTES:%s\\n" "$size_bytes"',
+          'printf "NOUVA_SHA256:%s\\n" "$sha256"',
+          "NOUVA_BACKUP_OK=1",
+        ].join("\n"),
+      ],
+      mounts: [{ source: stageVolume, target: "/stage", readOnly: true }],
+      timeoutMs: 30 * 60_000,
+    });
+    logs = result.logs;
+  } finally {
+    await docker.removeVolume(stageVolume, true);
+  }
+
+  const sizeBytes = Number.parseInt(extractPrefixedLogLine(logs, "NOUVA_SIZE_BYTES:") ?? "", 10);
+  const artifactSha256 = extractPrefixedLogLine(logs, "NOUVA_SHA256:");
+  if (!artifactSha256 || !Number.isFinite(sizeBytes)) {
+    throw new Error("MySQL backup did not return complete integrity evidence");
+  }
+
+  return {
+    sizeBytes,
+    objectKey: payload.expectedObjectKey,
+    artifactFormat: payload.artifactFormat,
+    artifactSha256,
+    verifiedAt: new Date().toISOString(),
+    integrityProof: {
+      version: 1,
+      engine: "mysql",
+      backupId: payload.backupId,
+      objectKey: payload.expectedObjectKey,
+      artifactFormat: "mysql-dump-tar-v1",
+      artifactSha256,
+      sizeBytes,
+      mysqldumpSucceeded: true,
+      dumpCompletedMarkerVerified: true,
+      uploadChecksumVerified: true,
+    },
+  };
+}
+
 async function handleCreateArchiveBackup(
   docker: DockerApiClient,
   config: Pick<AgentRuntimeConfig, "privateRegistry">,
@@ -3283,6 +3483,9 @@ async function handleCreateArchiveBackup(
 ) {
   if (payload.variant === "mongodb") {
     return handleCreateMongoArchiveBackup(docker, config, payload);
+  }
+  if (payload.variant === "mysql") {
+    return handleCreateMysqlDumpBackup(docker, config, payload);
   }
   if (payload.variant !== "redis") {
     throw new Error(`Database-native snapshot backups do not support ${payload.variant}`);
@@ -3416,11 +3619,116 @@ async function handleDeleteArchiveBackup(
   return {};
 }
 
+async function handleRestoreMysqlDumpBackup(
+  docker: DockerApiClient,
+  config: Pick<AgentRuntimeConfig, "privateRegistry">,
+  payload: RestoreVolumeBackupPayload
+) {
+  if (payload.artifactFormat !== "mysql-dump-tar-v1") {
+    throw new Error("MySQL restore requires mysql-dump-tar-v1 artifacts");
+  }
+  const spec = resolveHydratedHelperSpec({
+    imageUrl: payload.imageUrl,
+    envVars: payload.envVars,
+    containerArgs: payload.containerArgs,
+    mountPath: payload.targetMountPath,
+    dataPath: payload.dataPath,
+  });
+  if (!spec.envVars.MYSQL_ROOT_PASSWORD || !spec.envVars.MYSQL_DATABASE) {
+    throw new Error("MySQL restore requires MYSQL_ROOT_PASSWORD and MYSQL_DATABASE init variables");
+  }
+
+  const remoteExpression = buildArchiveRemoteExpression(payload.destination.verifyTls);
+  const agentTaskImage = await resolveAgentTaskImage(docker);
+  const stageVolume = `nouva-restore-stage-${payload.backupId.slice(0, 12)}`;
+  await docker.createVolume(
+    payload.targetVolumeName,
+    buildManagedVolumeLabels({
+      volumeId: payload.targetVolumeId,
+      projectId: payload.projectId,
+      serviceId: payload.serviceId,
+    })
+  );
+  await docker.removeVolume(stageVolume, true);
+  await docker.createVolume(
+    stageVolume,
+    buildBackupStageVolumeLabels({
+      kind: "restore-stage",
+      backupId: payload.backupId,
+      serviceId: payload.serviceId,
+    })
+  );
+
+  try {
+    await runTaskContainer(docker, config, {
+      name: `nouva-restore-fetch-${payload.backupId.slice(0, 12)}`,
+      image: agentTaskImage,
+      env: [
+        ...buildArchiveDestinationEnv(payload.destination, payload.expectedObjectKey),
+        `EXPECTED_SHA256=${payload.artifactSha256 ?? ""}`,
+      ],
+      cmd: [
+        "sh",
+        "-c",
+        [
+          "set -eu",
+          `remote="${remoteExpression}"`,
+          'archive="/tmp/nouva-volume-backup.tar.gz"',
+          'rclone copyto "$remote" "$archive"',
+          'actual_sha256=$(sha256sum "$archive" | cut -d " " -f 1)',
+          'if [ -n "$EXPECTED_SHA256" ]; then test "$actual_sha256" = "$EXPECTED_SHA256"; fi',
+          'entries=$(tar -tzf "$archive")',
+          'test "$(printf "%s\\n" "$entries" | wc -l | tr -d " ")" = 2',
+          'printf "%s\\n" "$entries" | grep -qx "manifest.json"',
+          'printf "%s\\n" "$entries" | grep -qx "dump.sql.gz"',
+          'tar -C /stage -xzf "$archive" dump.sql.gz',
+          "gzip -t /stage/dump.sql.gz",
+          'printf "NOUVA_SHA256:%s\\n" "$actual_sha256"',
+        ].join("\n"),
+      ],
+      mounts: [{ source: stageVolume, target: "/stage" }],
+      timeoutMs: 30 * 60_000,
+    });
+
+    await runTaskContainer(docker, config, {
+      name: `nouva-restore-replay-${payload.backupId.slice(0, 12)}`,
+      image: spec.image,
+      env: Object.entries(spec.envVars).map(([key, value]) => `${key}=${value}`),
+      entrypoint: ["sh", "-c"],
+      cmd: [buildMysqlRestoreReplayScript()],
+      mounts: [
+        { source: payload.targetVolumeName, target: spec.mountPath },
+        { source: stageVolume, target: "/docker-entrypoint-initdb.d", readOnly: true },
+      ],
+      timeoutMs: 30 * 60_000,
+    });
+  } finally {
+    await docker.removeVolume(stageVolume, true);
+  }
+
+  return {
+    volumeName: payload.targetVolumeName,
+    verifiedAt: new Date().toISOString(),
+    restoreProof: {
+      version: 1,
+      backupId: payload.backupId,
+      targetVolumeId: payload.targetVolumeId,
+      targetVolumeName: payload.targetVolumeName,
+      validationMethod: "mysql-startup-sql-read",
+      isolatedDatabaseStarted: true,
+      validatedAt: new Date().toISOString(),
+    },
+  };
+}
+
 async function handleRestoreArchiveBackup(
   docker: DockerApiClient,
   config: Pick<AgentRuntimeConfig, "privateRegistry">,
   payload: RestoreVolumeBackupPayload
 ) {
+  if (payload.variant === "mysql") {
+    return handleRestoreMysqlDumpBackup(docker, config, payload);
+  }
   if (payload.variant !== "redis") {
     throw new Error(`Database-native snapshot restore does not support ${payload.variant}`);
   }

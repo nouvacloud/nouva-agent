@@ -294,6 +294,7 @@ export type AgentCapabilities = {
   appVolumeRolloutV1?: boolean;
   publicPortPreflightV1?: boolean;
   backupIntegrityV1?: boolean;
+  mysqlBackupsV1?: boolean;
   managedVolumeCapacityV1?: boolean;
   workerServicesV1?: boolean;
   workerVolumeRolloutV1?: boolean;
@@ -590,8 +591,14 @@ export interface AppVolumeIdentity {
   mountPath: string;
 }
 
-export type DatabaseServiceVariant = "postgres" | "mongodb" | "redis";
-export type BackupDatabaseServiceVariant = "postgres" | "mongodb" | "redis";
+export type DatabaseServiceVariant = "postgres" | "mongodb" | "redis" | "mysql";
+export type BackupDatabaseServiceVariant = "postgres" | "mongodb" | "redis" | "mysql";
+
+export type VolumeBackupArtifactFormat =
+  | "mongodb-archive-tar-v1"
+  | "redis-rdb-tar-v1"
+  | "mysql-dump-tar-v1"
+  | "pgbackrest-v1";
 
 export interface DatabaseProvisionPayload {
   projectId: string;
@@ -685,7 +692,7 @@ export interface CreateVolumeBackupPayload extends QueuedVolumeBackupPayloadBase
   dataPath?: string;
   credentials?: Record<string, string>;
   expectedObjectKey: string;
-  artifactFormat: "mongodb-archive-tar-v1" | "redis-rdb-tar-v1" | "pgbackrest-v1";
+  artifactFormat: VolumeBackupArtifactFormat;
 }
 
 export interface DeleteVolumeBackupPayload extends QueuedVolumeBackupPayloadBase {
@@ -718,7 +725,7 @@ export interface RestoreVolumeBackupPayload {
   dataPath?: string;
   credentials?: Record<string, string>;
   expectedObjectKey: string;
-  artifactFormat: "mongodb-archive-tar-v1" | "redis-rdb-tar-v1" | "pgbackrest-v1";
+  artifactFormat: VolumeBackupArtifactFormat;
   artifactSha256?: string | null;
 }
 
@@ -750,6 +757,18 @@ export type AgentBackupIntegrityProofV1 =
     }
   | {
       version: 1;
+      engine: "mysql";
+      backupId: string;
+      objectKey: string;
+      artifactFormat: "mysql-dump-tar-v1";
+      artifactSha256: string;
+      sizeBytes: number;
+      mysqldumpSucceeded: true;
+      dumpCompletedMarkerVerified: true;
+      uploadChecksumVerified: true;
+    }
+  | {
+      version: 1;
       engine: "pgbackrest";
       backupId: string;
       objectKey: string;
@@ -768,7 +787,7 @@ export interface AgentBackupRestoreProofV1 {
   backupId: string;
   targetVolumeId: string;
   targetVolumeName: string;
-  validationMethod: "redis-load-ping" | "postgres-startup-sql-read";
+  validationMethod: "redis-load-ping" | "postgres-startup-sql-read" | "mysql-startup-sql-read";
   isolatedDatabaseStarted: true;
   validatedAt: string;
 }
@@ -841,6 +860,7 @@ export function getDefaultAgentCapabilities(): AgentCapabilities {
     appVolumeRolloutV1: true,
     publicPortPreflightV1: true,
     backupIntegrityV1: true,
+    mysqlBackupsV1: true,
     managedVolumeCapacityV1: true,
     workerServicesV1: true,
     workerVolumeRolloutV1: true,
