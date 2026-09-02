@@ -138,6 +138,8 @@ interface TraefikProbeResult {
   inspection: DockerContainerInspection | null;
   pingOk: boolean;
   routeFileCount: number;
+  /** Routers declared across the managed route files (one for provided hostnames, two for custom). */
+  expectedRouterCount: number;
   managedRouterCount: number | null;
   acmeStatus: ServerCheckStatus;
   acmeMessage: string;
@@ -289,12 +291,49 @@ async function writeManagedFile(filePath: string, contents: string, mode?: numbe
   }
 }
 
-async function countRouteFiles(dynamicDir: string): Promise<number> {
+/**
+ * Counts the routers declared in a managed route file rendered by `buildTraefikRouteConfig`.
+ * Provided hostnames emit a single HTTP router; custom hostnames emit an HTTP redirect router plus
+ * an HTTPS router, so the expected count differs per file and must be read back from disk.
+ */
+export function countDeclaredTraefikRouters(content: string): number {
+  let inRouters = false;
+  let count = 0;
+  for (const line of content.split(/\r?\n/)) {
+    if (/^ {2}routers:\s*$/.test(line)) {
+      inRouters = true;
+      continue;
+    }
+    if (/^ {0,2}\S/.test(line)) {
+      inRouters = false;
+      continue;
+    }
+    if (inRouters && /^ {4}[^\s:]+:\s*$/.test(line)) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+async function countRouteFiles(
+  dynamicDir: string
+): Promise<{ routeFileCount: number; expectedRouterCount: number }> {
   try {
     const entries = await readdir(dynamicDir, { withFileTypes: true });
-    return entries.filter((entry) => entry.isFile() && entry.name.endsWith(".yml")).length;
+    const routeFiles = entries.filter((entry) => entry.isFile() && entry.name.endsWith(".yml"));
+    let expectedRouterCount = 0;
+    for (const entry of routeFiles) {
+      try {
+        expectedRouterCount += countDeclaredTraefikRouters(
+          await readFile(path.join(dynamicDir, entry.name), "utf8")
+        );
+      } catch {
+        // A file that disappears mid-scan is simply not expected to be loaded.
+      }
+    }
+    return { routeFileCount: routeFiles.length, expectedRouterCount };
   } catch {
-    return 0;
+    return { routeFileCount: 0, expectedRouterCount: 0 };
   }
 }
 
@@ -330,7 +369,7 @@ async function probeTraefikRuntime(
   const inspection = await docker.inspectContainer(options.containerName ?? TRAEFIK_CONTAINER_NAME);
   const fetchImpl = options.fetchImpl ?? fetch;
   const adminPort = options.adminPort ?? TRAEFIK_ADMIN_PORT;
-  const routeFileCount = await countRouteFiles(paths.dynamicDir);
+  const { routeFileCount, expectedRouterCount } = await countRouteFiles(paths.dynamicDir);
 
   let pingOk = false;
   let managedRouterCount: number | null = null;
@@ -372,6 +411,7 @@ async function probeTraefikRuntime(
     inspection,
     pingOk,
     routeFileCount,
+    expectedRouterCount,
     managedRouterCount,
     acmeStatus,
     acmeMessage,
@@ -405,8 +445,8 @@ async function waitForTraefikHealth(
     } else if (probe.acmeStatus === "fail") {
       lastError = probe.acmeMessage;
     } else if (
-      probe.routeFileCount > 0 &&
-      (probe.managedRouterCount === null || probe.managedRouterCount < probe.routeFileCount * 2)
+      probe.expectedRouterCount > 0 &&
+      (probe.managedRouterCount === null || probe.managedRouterCount < probe.expectedRouterCount)
     ) {
       lastError = "Traefik has not loaded all file-provider routes";
     } else {
@@ -926,17 +966,17 @@ export async function collectTraefikValidationChecks(
   );
 
   const routesStatus: ServerCheckStatus =
-    probe.routeFileCount === 0
+    probe.expectedRouterCount === 0
       ? "pass"
-      : probe.managedRouterCount !== null && probe.managedRouterCount >= probe.routeFileCount * 2
+      : probe.managedRouterCount !== null && probe.managedRouterCount >= probe.expectedRouterCount
         ? "pass"
         : "fail";
   const routesMessage =
-    probe.routeFileCount === 0
+    probe.expectedRouterCount === 0
       ? "No active Traefik route files are configured"
       : routesStatus === "pass"
         ? `Loaded ${probe.managedRouterCount} routers from ${probe.routeFileCount} route files`
-        : `Expected ${probe.routeFileCount * 2} file-provider routers but found ${probe.managedRouterCount ?? 0}`;
+        : `Expected ${probe.expectedRouterCount} file-provider routers from ${probe.routeFileCount} route files but found ${probe.managedRouterCount ?? 0}`;
 
   checks.push(
     buildCheck(

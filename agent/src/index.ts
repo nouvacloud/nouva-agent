@@ -27,6 +27,7 @@ import {
   type RegistryAuth,
 } from "./docker-api.js";
 import { toDockerResourceSettings } from "./docker-resource-limits.js";
+import { ensureHostKernelSettings, HOST_INOTIFY_MAX_USER_WATCHES } from "./host-tuning.js";
 import { collectPostgresObservabilitySamples } from "./postgres-observability.js";
 import {
   type AgentCapabilities,
@@ -794,6 +795,27 @@ async function waitForLocalTraefikCutover(
   throw new Error(lastError);
 }
 
+/**
+ * A nominal "2 GB" VPS exposes roughly 1.9 GiB to the kernel once firmware and reserved pages are
+ * subtracted, so the supported minimum is checked against a tolerant threshold rather than 2 GiB.
+ */
+const NOMINAL_TWO_GB_BYTES = Math.floor(1.75 * 1024 * 1024 * 1024);
+const NOMINAL_ONE_GB_BYTES = Math.floor(0.875 * 1024 * 1024 * 1024);
+
+async function readSystemdResolvedUpstreams(): Promise<string[]> {
+  try {
+    const content = await readFile("/hostfs/run/systemd/resolve/resolv.conf", "utf8");
+    return content
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => /^nameserver\s+\S+/.test(line))
+      .map((line) => line.split(/\s+/)[1] ?? "")
+      .filter((address) => address.length > 0 && !/^127\./.test(address) && address !== "::1");
+  } catch {
+    return [];
+  }
+}
+
 async function collectValidationSnapshot(
   docker: DockerApiClient,
   config: AgentRuntimeConfig,
@@ -1070,16 +1092,18 @@ async function collectValidationSnapshot(
   }
 
   const totalMemoryBytes = os.totalmem();
-  const twoGB = 2 * 1024 * 1024 * 1024;
-  const oneGB = 1024 * 1024 * 1024;
   checks.push(
     buildCheck(
       "memory",
       "Memory headroom",
-      totalMemoryBytes >= twoGB ? "pass" : totalMemoryBytes >= oneGB ? "warn" : "fail",
-      totalMemoryBytes >= twoGB
+      totalMemoryBytes >= NOMINAL_TWO_GB_BYTES
+        ? "pass"
+        : totalMemoryBytes >= NOMINAL_ONE_GB_BYTES
+          ? "warn"
+          : "fail",
+      totalMemoryBytes >= NOMINAL_TWO_GB_BYTES
         ? "At least 2 GB RAM available"
-        : totalMemoryBytes >= oneGB
+        : totalMemoryBytes >= NOMINAL_ONE_GB_BYTES
           ? "Less than 2 GB RAM — some workloads may be constrained"
           : "Less than 1 GB RAM — insufficient for most workloads",
       String(totalMemoryBytes)
@@ -1153,7 +1177,9 @@ async function collectValidationSnapshot(
     );
   }
 
-  // DNS configuration — systemd-resolved stub listener causes silent DNS failures in containers
+  // DNS configuration — a systemd-resolved stub is fine as long as Docker can find the upstream
+  // resolvers it forwards container DNS to (/run/systemd/resolve/resolv.conf); without them
+  // containers on bridge networks would try to reach 127.0.0.53 and fail silently.
   try {
     let isStub = false;
     try {
@@ -1164,14 +1190,19 @@ async function collectValidationSnapshot(
       isStub =
         /^nameserver\s+127\.0\.0\.53$/m.test(content) && !content.includes("nameserver 127.0.0.1");
     }
+    const upstreams = isStub ? await readSystemdResolvedUpstreams() : [];
+    const stubWithoutUpstreams = isStub && upstreams.length === 0;
     checks.push(
       buildCheck(
         "dns-stub",
         "DNS configuration",
-        isStub ? "warn" : "pass",
-        isStub
-          ? "resolv.conf points to systemd-resolved stub (127.0.0.53) — container DNS resolution may fail"
-          : "DNS configuration looks correct"
+        stubWithoutUpstreams ? "warn" : "pass",
+        stubWithoutUpstreams
+          ? "resolv.conf points to the systemd-resolved stub (127.0.0.53) and no upstream resolvers were found — container DNS resolution may fail"
+          : isStub
+            ? `systemd-resolved stub in use; Docker forwards container DNS to ${upstreams.join(", ")}`
+            : "DNS configuration looks correct",
+        isStub ? upstreams.join(",") : undefined
       )
     );
   } catch (error) {
@@ -1185,20 +1216,41 @@ async function collectValidationSnapshot(
     );
   }
 
-  // inotify watch limit — Traefik file watching silently stops when the host limit is exhausted
+  // inotify watch limit — Traefik file watching silently stops when the host limit is exhausted.
+  // The agent raises the limit itself (see host-tuning.ts) before reporting on it.
+  let hostTuningMessage: string | null = null;
+  if (dockerVersion !== null) {
+    try {
+      const tuning = await ensureHostKernelSettings(docker, {
+        image: await resolveAgentTaskImage(docker),
+        labels: buildLabels({ kind: "host-tuning" }),
+      });
+      if (tuning.status === "applied") {
+        console.log(
+          `[nouva-agent] raised host inotify limits to ${tuning.limits.maxUserWatches} watches / ${tuning.limits.maxUserInstances} instances`
+        );
+      } else if (tuning.status === "failed") {
+        hostTuningMessage = tuning.message;
+        console.warn(`[nouva-agent] host tuning failed: ${tuning.message}`);
+      }
+    } catch (error) {
+      hostTuningMessage = error instanceof Error ? error.message : "Unable to tune host";
+    }
+  }
   try {
     const maxWatches = parseInt(
       (await readFile("/hostfs/proc/sys/fs/inotify/max_user_watches", "utf8")).trim(),
       10
     );
+    const sufficient = maxWatches >= HOST_INOTIFY_MAX_USER_WATCHES;
     checks.push(
       buildCheck(
         "inotify-limits",
         "inotify watch limit",
-        maxWatches >= 65536 ? "pass" : "warn",
-        maxWatches >= 65536
+        sufficient ? "pass" : "warn",
+        sufficient
           ? `inotify watch limit is sufficient (${maxWatches.toLocaleString()})`
-          : `inotify watch limit is low (${maxWatches.toLocaleString()}) — Traefik file watching may silently stop as more services are deployed`,
+          : `inotify watch limit is low (${maxWatches.toLocaleString()}) — Traefik file watching may silently stop as more services are deployed${hostTuningMessage ? ` (automatic tuning failed: ${hostTuningMessage})` : ""}`,
         String(maxWatches)
       )
     );

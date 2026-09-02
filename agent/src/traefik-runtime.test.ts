@@ -9,6 +9,7 @@ import {
   buildTraefikContainerSpec,
   buildTraefikRouteConfig,
   collectTraefikValidationChecks,
+  countDeclaredTraefikRouters,
   createTraefikStateHash,
   ensureTraefikState,
   getTraefikRuntimePaths,
@@ -436,5 +437,91 @@ describe("traefik-runtime", () => {
       "traefik-acme",
       "traefik-routes",
     ]);
+  });
+});
+
+describe("traefik route accounting", () => {
+  test("should count the routers each managed route file declares", () => {
+    expect(
+      countDeclaredTraefikRouters(
+        buildTraefikRouteConfig({
+          fileKey: "svc_1",
+          providedHostnames: ["frontend.up.nouva.cloud"],
+          serviceUrl: "http://nouva-app:3000",
+        })
+      )
+    ).toBe(1);
+    expect(
+      countDeclaredTraefikRouters(
+        buildTraefikRouteConfig({
+          fileKey: "svc_1",
+          customHostnames: ["app.example.com"],
+          serviceUrl: "http://nouva-app:3000",
+        })
+      )
+    ).toBe(2);
+    expect(
+      countDeclaredTraefikRouters(
+        buildTraefikRouteConfig({
+          fileKey: "svc_1",
+          providedHostnames: ["frontend.up.nouva.cloud"],
+          customHostnames: ["app.example.com"],
+          serviceUrl: "http://nouva-app:3000",
+          replacePath: "/_nouva/domain-pending",
+        })
+      )
+    ).toBe(3);
+    expect(countDeclaredTraefikRouters("http:\n  services:\n    svc:\n")).toBe(0);
+  });
+
+  test("should pass the routes check for provided-hostname-only services", async () => {
+    const tempDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-traefik-"));
+    try {
+      const paths = getTraefikRuntimePaths(tempDir);
+      await ensureTraefikState(paths);
+      await writeTraefikRouteFile(
+        paths,
+        "svc_1",
+        { providedHostname: "frontend.up.nouva.cloud" },
+        "http://svc_1:3000"
+      );
+
+      const staticConfig = renderTraefikStaticConfig(paths);
+      const docker = {
+        inspectContainer: mock(async () =>
+          createTraefikInspection({ stateHash: createTraefikStateHash(staticConfig) })
+        ),
+      };
+      const routers: Array<{ name: string; provider: string; rule: string }> = [];
+      const fetchImpl: typeof fetch = mock(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith("/ping")) {
+          return new Response("OK", { status: 200 });
+        }
+        if (url.endsWith("/api/http/routers")) {
+          return Response.json(routers);
+        }
+        return new Response("not found", { status: 404 });
+      }) as typeof fetch;
+
+      const failing = await collectTraefikValidationChecks(docker as never, { paths, fetchImpl });
+      expect(failing.find((check) => check.key === "traefik-routes")).toMatchObject({
+        status: "fail",
+        message: "Expected 1 file-provider routers from 1 route files but found 0",
+      });
+
+      routers.push({
+        name: "http-svc_1@file",
+        provider: "file",
+        rule: "Host(`frontend.up.nouva.cloud`)",
+      });
+      const passing = await collectTraefikValidationChecks(docker as never, { paths, fetchImpl });
+      expect(passing.find((check) => check.key === "traefik-routes")).toMatchObject({
+        status: "pass",
+        message: "Loaded 1 routers from 1 route files",
+      });
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
   });
 });
