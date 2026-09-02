@@ -2082,6 +2082,19 @@ describe("database runtime recreate paths", () => {
     expect(verifyTask?.env).not.toEqual(expect.arrayContaining(["MYSQL_PWD=mysql-secret"]));
     expect(verifyScript).toContain('grep -q "Dump completed"');
     expect(verifyScript).toContain("rclone copyto");
+    expect(verifyTask?.env).toEqual(
+      expect.arrayContaining([
+        "RCLONE_CONFIG_NOUVAARCHIVE_TYPE=s3",
+        "RCLONE_CONFIG_NOUVAARCHIVE_ENDPOINT=https://s3.example.com",
+        "RCLONE_CONFIG_NOUVAARCHIVE_SECRET_ACCESS_KEY=secret-key",
+        "RCLONE_CONFIG_NOUVAARCHIVE_INSECURE_SKIP_VERIFY=false",
+      ])
+    );
+    expect(verifyScript).toMatch(
+      /remote="nouvaarchive:\$\{BACKUP_BUCKET\}\/\$\{BACKUP_OBJECT_KEY\}"/
+    );
+    expect(verifyScript).not.toContain("secret-key");
+    expect(verifyScript).not.toContain("https://s3.example.com");
     expect(docker.removeVolume).toHaveBeenLastCalledWith("nouva-backup-stage-backup_mysql", true);
     expect(result).toEqual(
       expect.objectContaining({

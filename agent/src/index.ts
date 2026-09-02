@@ -294,11 +294,24 @@ function buildBackupStageVolumeLabels(input: {
   };
 }
 
+const ARCHIVE_RCLONE_REMOTE = "nouvaarchive";
+const ARCHIVE_RCLONE_ENV_PREFIX = `RCLONE_CONFIG_${ARCHIVE_RCLONE_REMOTE.toUpperCase()}`;
+
 function buildArchiveDestinationEnv(
   destination: CreateVolumeBackupPayload["destination"],
   objectKey: string
 ): string[] {
   return [
+    `${ARCHIVE_RCLONE_ENV_PREFIX}_TYPE=s3`,
+    `${ARCHIVE_RCLONE_ENV_PREFIX}_PROVIDER=Other`,
+    `${ARCHIVE_RCLONE_ENV_PREFIX}_ENV_AUTH=false`,
+    `${ARCHIVE_RCLONE_ENV_PREFIX}_ACCESS_KEY_ID=${destination.accessKeyId}`,
+    `${ARCHIVE_RCLONE_ENV_PREFIX}_SECRET_ACCESS_KEY=${destination.secretAccessKey}`,
+    `${ARCHIVE_RCLONE_ENV_PREFIX}_ENDPOINT=${destination.endpoint}`,
+    `${ARCHIVE_RCLONE_ENV_PREFIX}_REGION=${destination.region}`,
+    `${ARCHIVE_RCLONE_ENV_PREFIX}_FORCE_PATH_STYLE=${destination.pathStyle ? "true" : "false"}`,
+    `${ARCHIVE_RCLONE_ENV_PREFIX}_INSECURE_SKIP_VERIFY=${destination.verifyTls ? "false" : "true"}`,
+    `${ARCHIVE_RCLONE_ENV_PREFIX}_NO_CHECK_BUCKET=true`,
     `BACKUP_ACCESS_KEY_ID=${destination.accessKeyId}`,
     `BACKUP_SECRET_ACCESS_KEY=${destination.secretAccessKey}`,
     `BACKUP_ENDPOINT=${destination.endpoint}`,
@@ -2202,19 +2215,12 @@ async function runTaskContainer(
   }
 }
 
-function buildArchiveRemoteExpression(verifyTls: boolean): string {
-  return [
-    ":s3",
-    "provider=Other",
-    "env_auth=false",
-    `access_key_id=\${BACKUP_ACCESS_KEY_ID}`,
-    `secret_access_key=\${BACKUP_SECRET_ACCESS_KEY}`,
-    `endpoint=\${BACKUP_ENDPOINT}`,
-    `region=\${BACKUP_REGION}`,
-    `force_path_style=\${BACKUP_FORCE_PATH_STYLE}`,
-    `insecure_skip_verify=${verifyTls ? "false" : "true"}`,
-    `no_check_bucket=true:\${BACKUP_BUCKET}/\${BACKUP_OBJECT_KEY}`,
-  ].join(",");
+// The S3 destination is configured through RCLONE_CONFIG_* environment variables (see
+// buildArchiveDestinationEnv) instead of an inline connection string. Connection-string values
+// that contain ":" or "," (every https:// endpoint does) must be quoted for rclone, and an
+// inline string also leaks the access keys into the rclone process arguments.
+function buildArchiveRemoteExpression(): string {
+  return `${ARCHIVE_RCLONE_REMOTE}:\${BACKUP_BUCKET}/\${BACKUP_OBJECT_KEY}`;
 }
 
 async function ensureBaseRuntime(
@@ -3278,19 +3284,13 @@ async function handleCreateMongoArchiveBackup(
     throw new Error("MongoDB backup requires service credentials");
   }
 
-  const remoteExpression = buildArchiveRemoteExpression(payload.destination.verifyTls);
+  const remoteExpression = buildArchiveRemoteExpression();
   const agentTaskImage = await resolveAgentTaskImage(docker);
   const { logs } = await runTaskContainer(docker, config, {
     name: `nouva-backup-${payload.backupId.slice(0, 12)}`,
     image: agentTaskImage,
     env: [
-      `BACKUP_ACCESS_KEY_ID=${payload.destination.accessKeyId}`,
-      `BACKUP_SECRET_ACCESS_KEY=${payload.destination.secretAccessKey}`,
-      `BACKUP_ENDPOINT=${payload.destination.endpoint}`,
-      `BACKUP_REGION=${payload.destination.region}`,
-      `BACKUP_BUCKET=${payload.destination.bucket}`,
-      `BACKUP_OBJECT_KEY=${payload.expectedObjectKey}`,
-      `BACKUP_FORCE_PATH_STYLE=${payload.destination.pathStyle ? "true" : "false"}`,
+      ...buildArchiveDestinationEnv(payload.destination, payload.expectedObjectKey),
       `NOUVA_BACKUP_ID=${payload.backupId}`,
       `MONGODB_USERNAME=${username}`,
       `MONGODB_PASSWORD=${password}`,
@@ -3427,7 +3427,7 @@ async function handleCreateMysqlDumpBackup(
   }
 
   const stageVolume = `nouva-backup-stage-${payload.backupId.slice(0, 12)}`;
-  const remoteExpression = buildArchiveRemoteExpression(payload.destination.verifyTls);
+  const remoteExpression = buildArchiveRemoteExpression();
   const agentTaskImage = await resolveAgentTaskImage(docker);
   await docker.removeVolume(stageVolume, true);
   await docker.createVolume(
@@ -3547,19 +3547,13 @@ async function handleCreateArchiveBackup(
   if (!runtimeContainer) {
     throw new Error("Redis backup requires the authoritative live runtime container identity");
   }
-  const remoteExpression = buildArchiveRemoteExpression(payload.destination.verifyTls);
+  const remoteExpression = buildArchiveRemoteExpression();
   const agentTaskImage = await resolveAgentTaskImage(docker);
   const { logs } = await runTaskContainer(docker, config, {
     name: `nouva-backup-${payload.backupId.slice(0, 12)}`,
     image: agentTaskImage,
     env: [
-      `BACKUP_ACCESS_KEY_ID=${payload.destination.accessKeyId}`,
-      `BACKUP_SECRET_ACCESS_KEY=${payload.destination.secretAccessKey}`,
-      `BACKUP_ENDPOINT=${payload.destination.endpoint}`,
-      `BACKUP_REGION=${payload.destination.region}`,
-      `BACKUP_BUCKET=${payload.destination.bucket}`,
-      `BACKUP_OBJECT_KEY=${payload.expectedObjectKey}`,
-      `BACKUP_FORCE_PATH_STYLE=${payload.destination.pathStyle ? "true" : "false"}`,
+      ...buildArchiveDestinationEnv(payload.destination, payload.expectedObjectKey),
       `NOUVA_BACKUP_ID=${payload.backupId}`,
       `REDISCLI_AUTH=${payload.credentials?.password ?? ""}`,
     ],
@@ -3646,19 +3640,16 @@ async function handleDeleteArchiveBackup(
   config: Pick<AgentRuntimeConfig, "privateRegistry">,
   payload: DeleteVolumeBackupPayload
 ) {
-  const remoteExpression = buildArchiveRemoteExpression(payload.destination.verifyTls);
+  const remoteExpression = buildArchiveRemoteExpression();
   const agentTaskImage = await resolveAgentTaskImage(docker);
   await runTaskContainer(docker, config, {
     name: `nouva-delete-backup-${payload.backupId.slice(0, 12)}`,
     image: agentTaskImage,
     env: [
-      `BACKUP_ACCESS_KEY_ID=${payload.destination.accessKeyId}`,
-      `BACKUP_SECRET_ACCESS_KEY=${payload.destination.secretAccessKey}`,
-      `BACKUP_ENDPOINT=${payload.destination.endpoint}`,
-      `BACKUP_REGION=${payload.destination.region}`,
-      `BACKUP_BUCKET=${payload.destination.bucket}`,
-      `BACKUP_OBJECT_KEY=archives/v1/projects/${payload.projectId}/volumes/${payload.volumeId}/backups/${payload.backupId}.tar.gz`,
-      `BACKUP_FORCE_PATH_STYLE=${payload.destination.pathStyle ? "true" : "false"}`,
+      ...buildArchiveDestinationEnv(
+        payload.destination,
+        `archives/v1/projects/${payload.projectId}/volumes/${payload.volumeId}/backups/${payload.backupId}.tar.gz`
+      ),
     ],
     cmd: [
       "sh",
@@ -3690,7 +3681,7 @@ async function handleRestoreMysqlDumpBackup(
     throw new Error("MySQL restore requires MYSQL_ROOT_PASSWORD and MYSQL_DATABASE init variables");
   }
 
-  const remoteExpression = buildArchiveRemoteExpression(payload.destination.verifyTls);
+  const remoteExpression = buildArchiveRemoteExpression();
   const agentTaskImage = await resolveAgentTaskImage(docker);
   const stageVolume = `nouva-restore-stage-${payload.backupId.slice(0, 12)}`;
   await docker.createVolume(
@@ -3784,7 +3775,7 @@ async function handleRestoreArchiveBackup(
   if (payload.variant !== "redis") {
     throw new Error(`Database-native snapshot restore does not support ${payload.variant}`);
   }
-  const remoteExpression = buildArchiveRemoteExpression(payload.destination.verifyTls);
+  const remoteExpression = buildArchiveRemoteExpression();
   const agentTaskImage = await resolveAgentTaskImage(docker);
   await docker.createVolume(
     payload.targetVolumeName,
@@ -3798,13 +3789,7 @@ async function handleRestoreArchiveBackup(
     name: `nouva-restore-backup-${payload.backupId.slice(0, 12)}`,
     image: agentTaskImage,
     env: [
-      `BACKUP_ACCESS_KEY_ID=${payload.destination.accessKeyId}`,
-      `BACKUP_SECRET_ACCESS_KEY=${payload.destination.secretAccessKey}`,
-      `BACKUP_ENDPOINT=${payload.destination.endpoint}`,
-      `BACKUP_REGION=${payload.destination.region}`,
-      `BACKUP_BUCKET=${payload.destination.bucket}`,
-      `BACKUP_OBJECT_KEY=${payload.expectedObjectKey}`,
-      `BACKUP_FORCE_PATH_STYLE=${payload.destination.pathStyle ? "true" : "false"}`,
+      ...buildArchiveDestinationEnv(payload.destination, payload.expectedObjectKey),
       `EXPECTED_SHA256=${payload.artifactSha256 ?? ""}`,
     ],
     cmd: [
