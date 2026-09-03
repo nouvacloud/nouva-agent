@@ -49,6 +49,13 @@ export interface SafeLogger {
 export interface LogRedactionOptions {
   environmentVariables?: Readonly<Record<string, string | undefined>>;
   exactStructuredValues?: readonly string[];
+  /**
+   * Exact strings the caller's own payload declares in plaintext operational fields, such as a
+   * database provision payload's `dataPath` and `mountPath`. They are never treated as leaked
+   * material even when an environment value (for example `PGDATA`) is identical, because the
+   * payload already carries them unencrypted. Environment names stay protected.
+   */
+  operationalValues?: readonly string[];
   secretValues?: readonly string[];
 }
 
@@ -165,6 +172,47 @@ export function sanitizeEnvironmentCommitMessage(
     : commitMessage;
 }
 
+const AGENT_WORK_PAYLOAD_OPERATIONAL_PATH_KEYS = ["dataPath", "mountPath"] as const;
+
+/**
+ * Reads the plaintext operational paths an agent work payload declares (`dataPath`, `mountPath`).
+ * Agent results echo these verbatim, so both the agent and the API pass them as
+ * `operationalValues` when redacting a result against the leased environment.
+ */
+export function collectAgentWorkPayloadOperationalValues(payload: unknown): string[] {
+  const record = asRecord(payload);
+  const values = new Set<string>();
+  for (const key of AGENT_WORK_PAYLOAD_OPERATIONAL_PATH_KEYS) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim().length > 0) {
+      values.add(value.trim());
+    }
+  }
+  return [...values];
+}
+
+function resolveOperationalValueExclusions(options: LogRedactionOptions): Set<string> {
+  const exclusions = new Set<string>();
+  for (const value of options.operationalValues ?? []) {
+    if (typeof value !== "string" || value.length === 0) {
+      continue;
+    }
+    exclusions.add(value);
+    exclusions.add(encodeURIComponent(value));
+  }
+  return exclusions;
+}
+
+function excludeOperationalValues(
+  secretValues: readonly string[],
+  options: LogRedactionOptions
+): string[] {
+  const exclusions = resolveOperationalValueExclusions(options);
+  return exclusions.size === 0
+    ? [...secretValues]
+    : secretValues.filter((value) => !exclusions.has(value));
+}
+
 function resolveSecretValues(options: LogRedactionOptions): string[] {
   const configuredOrExplicitValues =
     options.secretValues === undefined
@@ -174,18 +222,25 @@ function resolveSecretValues(options: LogRedactionOptions): string[] {
     ? collectEnvironmentMapSecretValues(options.environmentVariables)
     : [];
 
-  return uniqueSortedSecretValues([...configuredOrExplicitValues, ...environmentValues]);
+  return uniqueSortedSecretValues(
+    excludeOperationalValues([...configuredOrExplicitValues, ...environmentValues], options)
+  );
 }
 
 function resolveExactStructuredValues(options: LogRedactionOptions): string[] {
   const environmentValues = options.environmentVariables
     ? collectEnvironmentMapSecretValues(options.environmentVariables)
     : [];
-  return uniqueSortedSecretValues([
-    ...(options.exactStructuredValues ?? []),
-    ...resolveSecretValues(options),
-    ...environmentValues,
-  ]);
+  return uniqueSortedSecretValues(
+    excludeOperationalValues(
+      [
+        ...(options.exactStructuredValues ?? []),
+        ...resolveSecretValues(options),
+        ...environmentValues,
+      ],
+      options
+    )
+  );
 }
 
 type LiteralSecretMatcherNode = {

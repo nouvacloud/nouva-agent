@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { readFile } from "node:fs/promises";
 import net from "node:net";
+import { collectAgentWorkPayloadOperationalValues } from "@repo/runtime/logging";
 import agentPackageJson from "../package.json" with { type: "json" };
 import type { DeployAppImageInput } from "./app-build-runtime.js";
 import { buildAndDeployAppWithDependencies } from "./app-build-runtime.js";
@@ -143,9 +144,20 @@ const databasePayload: DatabaseProvisionPayload = {
   volumeName: "nouva-vol-vol_1",
   mountPath: "/var/lib/postgresql",
   imageUrl: "postgres:17",
+  // Mirrors the executor config the control plane hydrates: PGDATA equals `dataPath`, and the
+  // socket, SSL and pgpass paths derive from `mountPath`.
   envVars: {
     POSTGRES_USER: "nouva_user",
     POSTGRES_PASSWORD: "super-secret",
+    POSTGRES_DB: "nouva_user",
+    PGDATA: "/var/lib/postgresql/pgdata",
+    POSTGRES_SOCKET_DIR: "/var/lib/postgresql/.sockets",
+    POSTGRES_SSL_DIR: "/var/lib/postgresql/ssl",
+    POSTGRES_SSL_CERT_FILE: "/var/lib/postgresql/ssl/server.crt",
+    POSTGRES_SSL_KEY_FILE: "/var/lib/postgresql/ssl/server.key",
+    PGPASSFILE: "/var/lib/postgresql/.pgpass",
+    PGBACKREST_STANZA: "vol-vol_1",
+    PGBACKREST_REPO1_PATH: "/postgres/v1/projects/proj_1/volumes/vol_1",
   },
   containerArgs: [],
   dataPath: "/var/lib/postgresql/pgdata",
@@ -576,6 +588,93 @@ describe("agent work mutation errors", () => {
     ).toEqual({
       errorMessage: "rollout failed for [REDACTED]",
       result: null,
+    });
+  });
+
+  test("keeps a postgres provision result whose data path equals the leased PGDATA", () => {
+    // Regression for #118: PGDATA is byte-identical to the reported runtimeMetadata.dataPath.
+    // Uses production-shaped ids: the volume name is `nouva-vol-` plus the first 12 characters of
+    // the 24-character volume id, while the pgBackRest stanza carries the full id, so the stanza
+    // value is not a substring of the volume name. The shared fixture's short `vol_1` id would
+    // make them collide, which real ids never do.
+    const volumeId = "q3v8k1zpd0m7wcx5tn2ryhb4";
+    const payload: DatabaseProvisionPayload = {
+      ...databasePayload,
+      volumeId,
+      volumeName: `nouva-vol-${volumeId.slice(0, 12)}`,
+      envVars: {
+        ...databasePayload.envVars,
+        PGBACKREST_STANZA: `vol-${volumeId}`,
+        PGBACKREST_REPO1_PATH: `/postgres/v1/projects/proj_1/volumes/${volumeId}`,
+      },
+    };
+    const provisionResult = {
+      internalHost: "nouva-postgres-svc_1",
+      internalPort: 5432,
+      externalHost: null,
+      externalPort: null,
+      runtimeMetadata: {
+        containerId: "ctr_pg",
+        containerName: "nouva-postgres-svc_1",
+        image: "postgres:17",
+        publishedPort: null,
+        volumeName: payload.volumeName,
+        mountPath: "/var/lib/postgresql",
+        dataPath: "/var/lib/postgresql/pgdata",
+      },
+      runtimeInstance: {
+        kind: "database",
+        status: "running",
+        name: "nouva-postgres-svc_1",
+        image: "postgres:17",
+        containerId: "ctr_pg",
+        containerName: "nouva-postgres-svc_1",
+        networkName: "nouva-project-proj_1",
+        internalHost: "nouva-postgres-svc_1",
+        internalPort: 5432,
+        externalHost: null,
+        externalPort: null,
+      },
+      statusMessage: "initdb in /var/lib/postgresql/pgdata for POSTGRES_PASSWORD=super-secret",
+    };
+
+    const result = sanitizeAgentWorkResult(
+      provisionResult,
+      payload.envVars ?? {},
+      collectAgentWorkPayloadOperationalValues(payload)
+    );
+
+    expect(result).toMatchObject({
+      runtimeMetadata: provisionResult.runtimeMetadata,
+      runtimeInstance: provisionResult.runtimeInstance,
+      statusMessage: "initdb in /var/lib/postgresql/pgdata for [REDACTED]=[REDACTED]",
+    });
+    expect(JSON.stringify(result)).not.toContain("super-secret");
+  });
+
+  test("still rejects a data path that only matches an environment value, not the payload", () => {
+    const foreignPayload = { ...databasePayload, dataPath: "/var/lib/postgresql/other" };
+
+    expect(() =>
+      sanitizeAgentWorkResult(
+        { runtimeMetadata: { dataPath: "/var/lib/postgresql/pgdata" } },
+        foreignPayload.envVars ?? {},
+        collectAgentWorkPayloadOperationalValues(foreignPayload)
+      )
+    ).toThrow("Agent work result conflicts with protected environment material");
+  });
+
+  test("keeps payload paths in failure reports", () => {
+    expect(
+      buildAgentWorkFailureReport({
+        environmentVariables: databasePayload.envVars ?? {},
+        errorMessage: "initdb failed in /var/lib/postgresql/pgdata: password super-secret rejected",
+        operationalValues: collectAgentWorkPayloadOperationalValues(databasePayload),
+        result: { runtimeMetadata: { dataPath: "/var/lib/postgresql/pgdata" } },
+      })
+    ).toEqual({
+      errorMessage: "initdb failed in /var/lib/postgresql/pgdata: password [REDACTED] rejected",
+      result: { runtimeMetadata: { dataPath: "/var/lib/postgresql/pgdata" } },
     });
   });
 

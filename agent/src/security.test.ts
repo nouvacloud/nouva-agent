@@ -77,4 +77,31 @@ describe("redactSensitiveText", () => {
       },
     });
   });
+
+  test("keeps payload operational paths that equal environment values", () => {
+    const environmentVariables = {
+      PGDATA: "/var/lib/postgresql/pgdata",
+      Q: "x",
+    };
+
+    expect(
+      sanitizeSensitiveProtocolValue(
+        {
+          dataPath: "/var/lib/postgresql/pgdata",
+          statusMessage: "Q=x at /var/lib/postgresql/pgdata",
+        },
+        environmentVariables,
+        ["/var/lib/postgresql/pgdata"]
+      )
+    ).toEqual({
+      dataPath: "/var/lib/postgresql/pgdata",
+      statusMessage: "[REDACTED]=[REDACTED] at /var/lib/postgresql/pgdata",
+    });
+    expect(
+      sanitizeSensitiveProtocolValue(
+        { dataPath: "/var/lib/postgresql/pgdata" },
+        environmentVariables
+      )
+    ).toEqual({ dataPath: "[REDACTED]" });
+  });
 });

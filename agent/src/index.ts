@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { AGENT_VOLUME_METRICS_INTERVAL_MS } from "@repo/runtime/agent-metrics";
+import { collectAgentWorkPayloadOperationalValues } from "@repo/runtime/logging";
 import agentPackageJson from "../package.json" with { type: "json" };
 import {
   type AlloyRuntimeInput,
@@ -1423,13 +1424,14 @@ function agentProtocolValueHasRedactionConflict(
 
 export function sanitizeAgentWorkResult(
   result: Record<string, unknown> | null | undefined,
-  environmentVariables: EnvironmentVariableMap
+  environmentVariables: EnvironmentVariableMap,
+  operationalValues: readonly string[] = []
 ): Record<string, unknown> | null {
   if (!result) {
     return null;
   }
 
-  const sanitizedResult = sanitizeSensitiveValue(result, environmentVariables);
+  const sanitizedResult = sanitizeSensitiveValue(result, environmentVariables, operationalValues);
   if (!sanitizedResult || typeof sanitizedResult !== "object" || Array.isArray(sanitizedResult)) {
     return null;
   }
@@ -1439,7 +1441,8 @@ export function sanitizeAgentWorkResult(
     if (Object.hasOwn(result, key)) {
       const sanitizedProtocolValue = sanitizeSensitiveProtocolValue(
         result[key],
-        environmentVariables
+        environmentVariables,
+        operationalValues
       );
       if (agentProtocolValueHasRedactionConflict(key, result[key], sanitizedProtocolValue)) {
         throw new AgentWorkResultRedactionConflictError();
@@ -1456,11 +1459,13 @@ export function sanitizeAgentWorkResult(
 export function buildAgentWorkFailureReport(input: {
   environmentVariables: EnvironmentVariableMap;
   errorMessage: string;
+  operationalValues?: readonly string[];
   result?: Record<string, unknown> | null;
 }): AgentWorkFailureReport {
+  const operationalValues = input.operationalValues ?? [];
   let result: Record<string, unknown> | null;
   try {
-    result = sanitizeAgentWorkResult(input.result, input.environmentVariables);
+    result = sanitizeAgentWorkResult(input.result, input.environmentVariables, operationalValues);
   } catch (error) {
     if (!(error instanceof AgentWorkResultRedactionConflictError)) {
       throw error;
@@ -1468,7 +1473,11 @@ export function buildAgentWorkFailureReport(input: {
     result = null;
   }
   return {
-    errorMessage: redactSensitiveText(input.errorMessage, input.environmentVariables),
+    errorMessage: redactSensitiveText(
+      input.errorMessage,
+      input.environmentVariables,
+      operationalValues
+    ),
     result,
   };
 }
@@ -4315,6 +4324,7 @@ async function processWorkItem(
   }
 
   const payload = toObject(workItem.payload);
+  const operationalValues = collectAgentWorkPayloadOperationalValues(payload);
 
   let result: Record<string, unknown> | undefined;
   let failureResult: Record<string, unknown> | undefined;
@@ -4534,6 +4544,7 @@ async function processWorkItem(
     const failureReport = buildAgentWorkFailureReport({
       environmentVariables: toRecord(payload.envVars),
       errorMessage: workError.message,
+      operationalValues,
       result: failureResult ?? null,
     });
     try {
@@ -4562,7 +4573,7 @@ async function processWorkItem(
 
   let sanitizedResult: Record<string, unknown> | null;
   try {
-    sanitizedResult = sanitizeAgentWorkResult(result, toRecord(payload.envVars));
+    sanitizedResult = sanitizeAgentWorkResult(result, toRecord(payload.envVars), operationalValues);
   } catch (error) {
     if (!(error instanceof AgentWorkResultRedactionConflictError)) {
       throw error;
