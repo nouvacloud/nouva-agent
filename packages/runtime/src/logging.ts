@@ -87,8 +87,44 @@ function normalizeLogKey(value: string): string {
   return value.toLowerCase().replaceAll(/[-_.\s]/g, "");
 }
 
+/**
+ * Name suffixes that describe an attribute of a secret rather than the secret itself:
+ * `BETTER_AUTH_COOKIE_DOMAIN`, `TUNNEL_INTERNAL_TOKEN_FILE`, `LEGACY_COOKIE_RETIREMENT_ENABLED`,
+ * `TUNNEL_LEGACY_JS_COOKIE_NAMES`. Their values are public configuration (a cookie domain, a file
+ * location, a flag, a version), so treating them as leaked material only produces false
+ * conflicts: a cookie domain of `nouva.sh` would otherwise redact every image reference under
+ * `registry.nouva.sh` and reject the agent result that carries it.
+ */
+const SECRET_ATTRIBUTE_ENVIRONMENT_NAME_SUFFIXES = [
+  "dir",
+  "disabled",
+  "domain",
+  "enabled",
+  "file",
+  "name",
+  "names",
+  "path",
+  "version",
+] as const;
+
+/** `NEXT_PUBLIC_*` values ship to browsers by convention and are never secrets. */
+const PUBLIC_ENVIRONMENT_NAME_PREFIX = "nextpublic";
+
+/** Flag literals cannot be secrets; redacting them would only strip words such as `true`. */
+const FLAG_ENVIRONMENT_VALUES = new Set(["0", "1", "false", "no", "off", "on", "true", "yes"]);
+
+function isSecretAttributeEnvironmentName(normalized: string): boolean {
+  return (
+    normalized.startsWith(PUBLIC_ENVIRONMENT_NAME_PREFIX) ||
+    SECRET_ATTRIBUTE_ENVIRONMENT_NAME_SUFFIXES.some((suffix) => normalized.endsWith(suffix))
+  );
+}
+
 function isSensitiveEnvironmentName(value: string): boolean {
   const normalized = normalizeLogKey(value);
+  if (isSecretAttributeEnvironmentName(normalized)) {
+    return false;
+  }
   return (
     isSensitiveLogKey(value) ||
     SENSITIVE_ENVIRONMENT_NAMES.has(normalized) ||
@@ -96,6 +132,10 @@ function isSensitiveEnvironmentName(value: string): boolean {
     normalized.endsWith("key") ||
     normalized.includes("privatekey")
   );
+}
+
+function isFlagEnvironmentValue(value: string): boolean {
+  return FLAG_ENVIRONMENT_VALUES.has(value.trim().toLowerCase());
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -619,7 +659,11 @@ export function collectConfiguredSecretValues(
 ): string[] {
   const values: string[] = [];
   for (const [key, value] of Object.entries(environment)) {
-    if (typeof value !== "string" || !isSensitiveEnvironmentName(key)) {
+    if (
+      typeof value !== "string" ||
+      !isSensitiveEnvironmentName(key) ||
+      isFlagEnvironmentValue(value)
+    ) {
       continue;
     }
     values.push(value);
