@@ -947,7 +947,7 @@ export function getAgentRuntimeConfig(): AgentRuntimeConfig {
       organizationId: null,
       alloyImage: process.env.NOUVA_OBSERVABILITY_ALLOY_IMAGE ?? "grafana/alloy:v1.17.1",
       scrapeIntervalSeconds: Number.parseInt(
-        process.env.NOUVA_OBSERVABILITY_SCRAPE_INTERVAL_SECONDS ?? "30",
+        process.env.NOUVA_OBSERVABILITY_SCRAPE_INTERVAL_SECONDS ?? "15",
         10
       ),
       collectorScope: "services_traefik_and_workers",
