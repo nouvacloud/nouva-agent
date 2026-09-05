@@ -8,6 +8,7 @@ import { buildAndDeployAppWithDependencies } from "./app-build-runtime.js";
 import { DockerApiError } from "./docker-api.js";
 import {
   ApiRequestError,
+  adoptReregisteredCredentials,
   buildAgentWorkFailureReport,
   buildAppContainerSpec,
   buildDatabaseContainerSpec,
@@ -27,6 +28,7 @@ import {
   resolveAgentWorkLeaseRenewalIntervalMs,
   resolveReportedAgentVersion,
   resolveServiceContainerIdentifier,
+  type StoredCredentials,
   sanitizeAgentWorkResult,
   shouldStopRetryingAgentWorkMutation,
   startAgentWorkLeaseRenewal,
@@ -432,6 +434,34 @@ describe("agent version reporting", () => {
       envInheritFlags:
         "-e NOUVA_AGENT_DATA_VOLUME -e NOUVA_API_URL -e NOUVA_SERVER_ID -e NOUVA_AGENT_IMAGE -e NOUVA_AGENT_TARGET_IMAGE",
     });
+  });
+});
+
+describe("adoptReregisteredCredentials", () => {
+  test("updates the shared credentials object in place so every caller sees the new token", () => {
+    const credentials: StoredCredentials = { serverId: "srv_1", agentToken: "stale-token" };
+    // Mirrors main(): the heartbeat loop, work scheduler, and metrics collector all close over the
+    // same object rather than re-reading credentials.json.
+    const leaseToken = () => credentials.agentToken;
+
+    const result = adoptReregisteredCredentials(credentials, {
+      serverId: "srv_1",
+      agentToken: "fresh-token",
+    });
+
+    expect(result).toBe(credentials);
+    expect(credentials).toEqual({ serverId: "srv_1", agentToken: "fresh-token" });
+    expect(leaseToken()).toBe("fresh-token");
+  });
+
+  test("does not keep a reference to the registration payload", () => {
+    const credentials: StoredCredentials = { serverId: "srv_1", agentToken: "stale-token" };
+    const payload: StoredCredentials = { serverId: "srv_1", agentToken: "fresh-token" };
+
+    adoptReregisteredCredentials(credentials, payload);
+    payload.agentToken = "mutated-after-adoption";
+
+    expect(credentials.agentToken).toBe("fresh-token");
   });
 });
 

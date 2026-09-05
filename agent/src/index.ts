@@ -230,9 +230,24 @@ function assertAgentBootstrapEnv(): void {
   }
 }
 
-interface StoredCredentials {
+export interface StoredCredentials {
   serverId: string;
   agentToken: string;
+}
+
+/**
+ * Applies re-registered credentials to the live credentials object in place. `main()` shares one
+ * credentials object with the heartbeat loop, the work scheduler, and the metrics collector, so
+ * replacing the object would leave those closures on the rejected token until the next restart
+ * (issue #167). Mutating it keeps every caller on the token the control plane just issued.
+ */
+export function adoptReregisteredCredentials(
+  current: StoredCredentials,
+  next: StoredCredentials
+): StoredCredentials {
+  current.serverId = next.serverId;
+  current.agentToken = next.agentToken;
+  return current;
 }
 
 interface ValidationSnapshot {
@@ -1692,6 +1707,9 @@ async function sendHeartbeat(
     }
 
     const next = await registerAgent(docker, config);
+    // Propagate the fresh token to every closure holding this credentials object; the next
+    // heartbeat's validation snapshot reconciles Alloy with it as well.
+    adoptReregisteredCredentials(credentials, next.credentials);
     return next.config;
   }
 
