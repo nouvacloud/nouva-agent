@@ -11,7 +11,12 @@ import {
   MANAGED_CONTAINER_LOG_CONFIG,
   REDACTION_CONTEXT_VERSION_DOCKER_LABEL,
 } from "./docker-api.js";
-import type { AgentRuntimeConfig, ServerCheckStatus, ServerValidationCheck } from "./protocol.js";
+import type {
+  AgentRedactionContextScopeVersion,
+  AgentRuntimeConfig,
+  ServerCheckStatus,
+  ServerValidationCheck,
+} from "./protocol.js";
 import { redactSensitiveText } from "./security.js";
 import { calculateDiskSafetyReserveBytes, formatStorageBytes } from "./storage-metrics.js";
 
@@ -71,6 +76,11 @@ export interface AlloyRuntimeInput {
   apiUrl: string;
   agentToken: string;
   redactionContextVersion?: string;
+  /**
+   * Expected version per active deployment or database scope. Rendered as relabel rules that
+   * override the container label, so a container whose label went stale keeps being accepted.
+   */
+  redactionContextScopeVersions?: readonly AgentRedactionContextScopeVersion[];
   config: AgentRuntimeConfig;
 }
 
@@ -148,12 +158,79 @@ function list(values: string[]): string {
   return `[${values.map((value) => quote(value)).join(", ")}]`;
 }
 
+const REDACTION_CONTEXT_VERSION_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/;
+const REDACTION_CONTEXT_SCOPE_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+
 function resolveSystemRedactionContextVersion(input: AlloyRuntimeInput): string {
   const version = input.redactionContextVersion?.trim() || DEFAULT_SYSTEM_REDACTION_CONTEXT_VERSION;
-  if (!/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/.test(version)) {
+  if (!REDACTION_CONTEXT_VERSION_PATTERN.test(version)) {
     throw new Error("Alloy redaction context version is invalid.");
   }
   return version;
+}
+
+/**
+ * Validates, de-duplicates, and orders the per-scope versions so the rendered config is
+ * deterministic and every value is safe to embed in an Alloy regex or string literal.
+ */
+export function normalizeRedactionContextScopeVersions(
+  values: readonly AgentRedactionContextScopeVersion[] | undefined
+): AgentRedactionContextScopeVersion[] {
+  const byScope = new Map<string, AgentRedactionContextScopeVersion>();
+  for (const value of values ?? []) {
+    if (value.kind !== "deployment" && value.kind !== "database") {
+      throw new Error("Alloy redaction context scope kind is invalid.");
+    }
+    // The none sentinel is the deployment_id every database container carries, so a rule keyed
+    // on it would rewrite every database stream on the server.
+    if (
+      !REDACTION_CONTEXT_SCOPE_ID_PATTERN.test(value.id) ||
+      value.id === OBSERVABILITY_NONE_LABEL_VALUE
+    ) {
+      throw new Error("Alloy redaction context scope id is invalid.");
+    }
+    if (!REDACTION_CONTEXT_VERSION_PATTERN.test(value.version)) {
+      throw new Error("Alloy redaction context scope version is invalid.");
+    }
+    const key = `${value.kind}:${value.id}`;
+    const existing = byScope.get(key);
+    if (existing && existing.version !== value.version) {
+      throw new Error("Alloy redaction context scope has conflicting versions.");
+    }
+    byScope.set(key, { kind: value.kind, id: value.id, version: value.version });
+  }
+  return [...byScope.values()].sort((left, right) =>
+    left.kind === right.kind ? left.id.localeCompare(right.id) : left.kind.localeCompare(right.kind)
+  );
+}
+
+export function redactionContextScopeVersionsEqual(
+  left: readonly AgentRedactionContextScopeVersion[] | undefined,
+  right: readonly AgentRedactionContextScopeVersion[] | undefined
+): boolean {
+  return (
+    JSON.stringify(normalizeRedactionContextScopeVersions(left)) ===
+    JSON.stringify(normalizeRedactionContextScopeVersions(right))
+  );
+}
+
+function renderRedactionContextScopeRules(input: AlloyRuntimeInput): string[] {
+  return normalizeRedactionContextScopeVersions(input.redactionContextScopeVersions).map((scope) =>
+    scope.kind === "deployment"
+      ? `  rule {
+    source_labels = ["deployment_id"]
+    regex         = ${quote(scope.id)}
+    target_label  = "redaction_context_version"
+    replacement   = ${quote(scope.version)}
+  }`
+      : `  rule {
+    source_labels = ["service_type", "service_id"]
+    separator     = ";"
+    regex         = ${quote(`database;${scope.id}`)}
+    target_label  = "redaction_context_version"
+    replacement   = ${quote(scope.version)}
+  }`
+  );
 }
 
 async function writeManagedFile(filePath: string, contents: string): Promise<void> {
@@ -867,28 +944,24 @@ ${dockerRules.join("\n")}
 
 export function renderAlloyDynamicConfig(input: AlloyRuntimeInput): string {
   const version = quote(resolveSystemRedactionContextVersion(input));
+  const systemRule = `  rule {
+    source_labels = ["service_type", "redaction_context_version"]
+    separator     = ";"
+    target_label  = "redaction_context_version"
+    regex         = "system;$"
+    replacement   = ${version}
+  }`;
+  const rules = [systemRule, ...renderRedactionContextScopeRules(input)].join("\n\n");
   return [
     `loki.relabel "nouva_redaction_context" {
   forward_to = [loki.write.nouva.receiver]
 
-  rule {
-    source_labels = ["service_type", "redaction_context_version"]
-    separator     = ";"
-    target_label  = "redaction_context_version"
-    regex         = "system;$"
-    replacement   = ${version}
-  }
+${rules}
 }`,
     `prometheus.relabel "nouva_redaction_context" {
   forward_to = [prometheus.remote_write.nouva.receiver]
 
-  rule {
-    source_labels = ["service_type", "redaction_context_version"]
-    separator     = ";"
-    target_label  = "redaction_context_version"
-    regex         = "system;$"
-    replacement   = ${version}
-  }
+${rules}
 }`,
     "",
   ].join("\n\n");

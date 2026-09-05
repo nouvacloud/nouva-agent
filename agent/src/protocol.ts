@@ -311,10 +311,20 @@ export const MAX_PARALLEL_AGENT_WORK_ITEMS = 4;
 export type AgentIngressMode = "local_traefik";
 export type AgentBuildkitMode = "docker-container";
 
+export type AgentRedactionContextScopeKind = "deployment" | "database";
+
+export interface AgentRedactionContextScopeVersion {
+  kind: AgentRedactionContextScopeKind;
+  id: string;
+  version: string;
+}
+
 export interface AgentObservabilityConfig {
   enabled: boolean;
   organizationId: string | null;
   redactionContextVersion?: string | null;
+  /** Present on registration and heartbeat responses only; lease responses omit it. */
+  redactionContextScopeVersions?: AgentRedactionContextScopeVersion[];
   alloyImage: string;
   scrapeIntervalSeconds: number;
   collectorScope: "services_traefik_and_workers";

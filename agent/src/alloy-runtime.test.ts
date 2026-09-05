@@ -15,6 +15,8 @@ import {
   createAlloyStateHash,
   ensureAlloyRuntime,
   getAlloyRuntimePaths,
+  normalizeRedactionContextScopeVersions,
+  redactionContextScopeVersionsEqual,
   renderAlloyDynamicConfig,
   renderAlloyStaticConfig,
   resetAlloyRuntimeState,
@@ -210,6 +212,101 @@ describe("alloy-runtime", () => {
     expect(dynamicV1.indexOf('prometheus.relabel "nouva_redaction_context"')).toBeLessThan(
       dynamicV1.indexOf("forward_to = [prometheus.remote_write.nouva.receiver]")
     );
+  });
+
+  test("overrides stale container labels with per-scope versions in both delivery paths", async () => {
+    tempDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-alloy-"));
+    const input = {
+      ...createAlloyInput(tempDir, "context-v2"),
+      redactionContextScopeVersions: [
+        { kind: "database" as const, id: "svc_db", version: "hmac-sha256:redaction-context:v1:b" },
+        { kind: "deployment" as const, id: "dep_1", version: "hmac-sha256:redaction-context:v1:a" },
+      ],
+    };
+
+    const dynamic = renderAlloyDynamicConfig(input);
+    const deploymentRule = [
+      "  rule {",
+      '    source_labels = ["deployment_id"]',
+      '    regex         = "dep_1"',
+      '    target_label  = "redaction_context_version"',
+      '    replacement   = "hmac-sha256:redaction-context:v1:a"',
+      "  }",
+    ].join("\n");
+    const databaseRule = [
+      "  rule {",
+      '    source_labels = ["service_type", "service_id"]',
+      '    separator     = ";"',
+      '    regex         = "database;svc_db"',
+      '    target_label  = "redaction_context_version"',
+      '    replacement   = "hmac-sha256:redaction-context:v1:b"',
+      "  }",
+    ].join("\n");
+
+    // Both blocks carry both rules, after the system rule so the system stamp is untouched.
+    expect(dynamic.split(deploymentRule).length - 1).toBe(2);
+    expect(dynamic.split(databaseRule).length - 1).toBe(2);
+    const lokiBlock = dynamic.slice(
+      0,
+      dynamic.indexOf('prometheus.relabel "nouva_redaction_context"')
+    );
+    expect(lokiBlock.indexOf('regex         = "system;$"')).toBeLessThan(
+      lokiBlock.indexOf(deploymentRule)
+    );
+    // Deployment scopes are ordered by kind then id regardless of input order.
+    expect(dynamic.indexOf(databaseRule)).toBeLessThan(dynamic.indexOf(deploymentRule));
+    expect(renderAlloyStaticConfig(input)).toBe(
+      renderAlloyStaticConfig(createAlloyInput(tempDir, "context-v2"))
+    );
+  });
+
+  test("rejects scope versions that cannot be embedded safely", () => {
+    expect(() =>
+      normalizeRedactionContextScopeVersions([
+        { kind: "deployment", id: "dep.1|.*", version: "hmac-sha256:redaction-context:v1:a" },
+      ])
+    ).toThrow("scope id is invalid");
+    // The none sentinel is the deployment_id label of every database container.
+    expect(() =>
+      normalizeRedactionContextScopeVersions([
+        { kind: "deployment", id: "__none__", version: "hmac-sha256:redaction-context:v1:a" },
+      ])
+    ).toThrow("scope id is invalid");
+    expect(() =>
+      normalizeRedactionContextScopeVersions([
+        { kind: "deployment", id: "dep_1", version: 'v1"\n' },
+      ])
+    ).toThrow("scope version is invalid");
+    expect(() =>
+      normalizeRedactionContextScopeVersions([
+        { kind: "deployment", id: "dep_1", version: "v1" },
+        { kind: "deployment", id: "dep_1", version: "v2" },
+      ])
+    ).toThrow("conflicting versions");
+    expect(
+      normalizeRedactionContextScopeVersions([
+        { kind: "deployment", id: "dep_1", version: "v1" },
+        { kind: "deployment", id: "dep_1", version: "v1" },
+      ])
+    ).toEqual([{ kind: "deployment", id: "dep_1", version: "v1" }]);
+  });
+
+  test("compares scope version maps by content, not order", () => {
+    const left = [
+      { kind: "deployment" as const, id: "dep_1", version: "v1" },
+      { kind: "database" as const, id: "svc_db", version: "v2" },
+    ];
+    const right = [...left].reverse();
+
+    expect(redactionContextScopeVersionsEqual(left, right)).toBe(true);
+    expect(redactionContextScopeVersionsEqual(undefined, [])).toBe(true);
+    expect(redactionContextScopeVersionsEqual(left, undefined)).toBe(false);
+    expect(
+      redactionContextScopeVersionsEqual(left, [
+        left[0]!,
+        { kind: "database", id: "svc_db", version: "v3" },
+      ])
+    ).toBe(false);
   });
 
   test("preserves worker identity in Loki and Mimir", async () => {

@@ -13,6 +13,7 @@ import {
   collectAlloyValidationChecks,
   ensureAlloyRuntime,
   getAlloyRuntimePaths,
+  redactionContextScopeVersionsEqual,
 } from "./alloy-runtime.js";
 import {
   buildAndDeployAppWithDependencies,
@@ -1660,6 +1661,7 @@ async function registerAgent(
   };
   await writeCredentials(credentials);
   registrationUsed = true;
+  rememberRedactionContextScopeVersions(payload.config);
 
   return { credentials, config: payload.config };
 }
@@ -1698,10 +1700,16 @@ async function sendHeartbeat(
   }
 
   const body = (await response.json()) as AgentHeartbeatResponse;
+  const previousScopeVersions = latestRedactionContextScopeVersions;
+  rememberRedactionContextScopeVersions(body.config);
   if (
     body.config.observability.enabled &&
-    body.config.observability.redactionContextVersion !==
-      config.observability.redactionContextVersion
+    (body.config.observability.redactionContextVersion !==
+      config.observability.redactionContextVersion ||
+      !redactionContextScopeVersionsEqual(
+        previousScopeVersions,
+        latestRedactionContextScopeVersions
+      ))
   ) {
     try {
       await ensureAlloyRuntime(docker, getAlloyRuntimeInput(credentials, body.config), {
@@ -1778,6 +1786,18 @@ function getTraefikRuntimeInput(config: AgentRuntimeConfig): TraefikRuntimeInput
   };
 }
 
+/**
+ * Per-scope redaction-context versions from the last registration or heartbeat response. Lease
+ * responses replace `config` without carrying the map, so it lives outside the config object.
+ */
+let latestRedactionContextScopeVersions: AlloyRuntimeInput["redactionContextScopeVersions"];
+
+function rememberRedactionContextScopeVersions(config: AgentRuntimeConfig): void {
+  if (config.observability.redactionContextScopeVersions !== undefined) {
+    latestRedactionContextScopeVersions = config.observability.redactionContextScopeVersions;
+  }
+}
+
 function getAlloyRuntimeInput(
   credentials: StoredCredentials,
   config: AgentRuntimeConfig
@@ -1790,6 +1810,9 @@ function getAlloyRuntimeInput(
     agentToken: credentials.agentToken,
     ...(config.observability.redactionContextVersion
       ? { redactionContextVersion: config.observability.redactionContextVersion }
+      : {}),
+    ...(latestRedactionContextScopeVersions
+      ? { redactionContextScopeVersions: latestRedactionContextScopeVersions }
       : {}),
     config,
   };
