@@ -291,10 +291,14 @@ function buildLocalDirectoryOutput(destDir: string): string {
 export function buildRailpackBuildctlArgs(options: {
   buildkitAddress: string;
   buildRootDir: string;
+  planDir: string;
   planFileName: string;
   output: string;
   envVarKeys?: string[];
 }): string[] {
+  if (path.resolve(options.planDir) === path.resolve(options.buildRootDir)) {
+    throw new Error("railpack plan directory must not be the build context");
+  }
   const args = [
     "--addr",
     options.buildkitAddress,
@@ -307,8 +311,11 @@ export function buildRailpackBuildctlArgs(options: {
     `filename=${options.planFileName}`,
     "--local",
     `context=${options.buildRootDir}`,
+    // The plan lists every service env var name under `secrets`, and railpack copies the whole
+    // context into the image, so the plan and info files live in their own local that only the
+    // frontend reads. Otherwise they ship inside the app image at /app.
     "--local",
-    `dockerfile=${options.buildRootDir}`,
+    `dockerfile=${options.planDir}`,
     "--output",
     options.output,
     "--opt",
@@ -385,6 +392,7 @@ async function loadBuiltImageIfNeeded(
 
 async function prepareRailpackPlan(
   buildRootDir: string,
+  planDir: string,
   envVars: Record<string, string>
 ): Promise<{
   childEnv: NodeJS.ProcessEnv;
@@ -394,9 +402,12 @@ async function prepareRailpackPlan(
   const childEnv = buildEnvVars(envVars);
   const infoFileName = "railpack-info.json";
   const planFileName = "railpack-plan.json";
-  const infoFile = path.join(buildRootDir, infoFileName);
+  const planFile = path.join(planDir, planFileName);
+  const infoFile = path.join(planDir, infoFileName);
 
-  const prepareArgs = ["prepare", "--plan-out", planFileName, "--info-out", infoFileName];
+  // Both files are written outside the build context: the plan names every env var as a build
+  // secret and railpack copies the context wholesale into the image.
+  const prepareArgs = ["prepare", "--plan-out", planFile, "--info-out", infoFile];
   for (const key of Object.keys(envVars)) {
     prepareArgs.push("--env", `${key}=\${${key}}`);
   }
@@ -417,6 +428,7 @@ async function prepareRailpackPlan(
 
 async function runRailpackBuildctl(options: {
   buildRootDir: string;
+  planDir: string;
   buildkitAddress: string;
   childEnv: NodeJS.ProcessEnv;
   envVarKeys: string[];
@@ -429,6 +441,7 @@ async function runRailpackBuildctl(options: {
       buildRailpackBuildctlArgs({
         buildkitAddress: options.buildkitAddress,
         buildRootDir: options.buildRootDir,
+        planDir: options.planDir,
         planFileName: options.planFileName,
         output: options.output,
         envVarKeys: options.envVarKeys,
@@ -446,6 +459,32 @@ async function runRailpackBuildctl(options: {
   }
 }
 
+// Prepares the railpack plan in a private temporary directory, runs the build, and removes the
+// plan afterwards. The plan directory is the frontend's `dockerfile` local, never the context.
+async function runRailpackBuild(options: {
+  buildRootDir: string;
+  envVars: Record<string, string>;
+  buildkitAddress: string;
+  output: string;
+}): Promise<{ imageSha: string | null; info: Record<string, unknown> }> {
+  const planDir = await mkdtemp(path.join(os.tmpdir(), "nouva-railpack-plan-"));
+  try {
+    const prepared = await prepareRailpackPlan(options.buildRootDir, planDir, options.envVars);
+    const imageSha = await runRailpackBuildctl({
+      buildRootDir: options.buildRootDir,
+      planDir,
+      buildkitAddress: options.buildkitAddress,
+      childEnv: prepared.childEnv,
+      envVarKeys: Object.keys(options.envVars),
+      output: options.output,
+      planFileName: prepared.planFileName,
+    });
+    return { imageSha, info: prepared.info };
+  } finally {
+    await rm(planDir, { recursive: true, force: true });
+  }
+}
+
 async function buildRailpackApplication(options: {
   docker: Pick<DockerApiClient, "inspectImage" | "loadImage">;
   buildRootDir: string;
@@ -453,21 +492,18 @@ async function buildRailpackApplication(options: {
   buildkitAddress: string;
   output: BuildImageOutput;
 }): Promise<StrategyBuildResult> {
-  const prepared = await prepareRailpackPlan(options.buildRootDir, options.envVars);
-  const imageSha = await runRailpackBuildctl({
+  const built = await runRailpackBuild({
     buildRootDir: options.buildRootDir,
+    envVars: options.envVars,
     buildkitAddress: options.buildkitAddress,
-    childEnv: prepared.childEnv,
-    envVarKeys: Object.keys(options.envVars),
     output: options.output.buildctlOutput,
-    planFileName: prepared.planFileName,
   });
   const imageId = await loadBuiltImageIfNeeded(options.docker, options.output);
 
   return {
     imageId,
-    imageSha,
-    ...inferBuildMetadata(prepared.info),
+    imageSha: built.imageSha,
+    ...inferBuildMetadata(built.info),
   };
 }
 
@@ -617,17 +653,14 @@ async function buildStaticApplication(options: {
     const staticExportDir = path.join(runtimeDir, "static-export");
     await mkdir(staticExportDir, { recursive: true });
 
-    const prepared = await prepareRailpackPlan(options.buildRootDir, options.envVars);
-    await runRailpackBuildctl({
+    const built = await runRailpackBuild({
       buildRootDir: options.buildRootDir,
+      envVars: options.envVars,
       buildkitAddress: options.buildkitAddress,
-      childEnv: prepared.childEnv,
-      envVarKeys: Object.keys(options.envVars),
       output: buildLocalDirectoryOutput(staticExportDir),
-      planFileName: prepared.planFileName,
     });
 
-    const metadata = inferBuildMetadata(prepared.info);
+    const metadata = inferBuildMetadata(built.info);
     detectedLanguage = metadata.detectedLanguage;
     detectedFramework = metadata.detectedFramework;
     languageVersion = metadata.languageVersion;

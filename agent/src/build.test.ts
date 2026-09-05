@@ -114,6 +114,7 @@ describe("build helpers", () => {
     const args = buildRailpackBuildctlArgs({
       buildkitAddress: "tcp://127.0.0.1:1234",
       buildRootDir: "/tmp/repo/backend",
+      planDir: "/tmp/nouva-railpack-plan-abc",
       planFileName: "railpack-plan.json",
       output:
         "type=image,name=127.0.0.1:5000/nouva-app:dep-1,push=true,registry.insecure=true,registry.http=true",
@@ -129,12 +130,42 @@ describe("build helpers", () => {
     const args = buildRailpackBuildctlArgs({
       buildkitAddress: "tcp://127.0.0.1:1234",
       buildRootDir: "/tmp/repo",
+      planDir: "/tmp/nouva-railpack-plan-abc",
       planFileName: "railpack-plan.json",
       output:
         "type=image,name=127.0.0.1:5000/nouva-app:dep-1,push=true,registry.insecure=true,registry.http=true",
     });
 
     expect(args).not.toContain("--secret");
+  });
+
+  test("reads the railpack plan from its own local instead of the build context", () => {
+    // The plan lists every env var name as a build secret and railpack copies the context into
+    // the image, so the plan must never be inside the context.
+    const args = buildRailpackBuildctlArgs({
+      buildkitAddress: "tcp://127.0.0.1:1234",
+      buildRootDir: "/tmp/repo/backend",
+      planDir: "/tmp/nouva-railpack-plan-abc",
+      planFileName: "railpack-plan.json",
+      output: "type=oci,dest=/tmp/out.tar",
+    });
+
+    expect(args).toContain("context=/tmp/repo/backend");
+    expect(args).toContain("dockerfile=/tmp/nouva-railpack-plan-abc");
+    expect(args).not.toContain("dockerfile=/tmp/repo/backend");
+    expect(args).toContain("filename=railpack-plan.json");
+  });
+
+  test("refuses a railpack plan directory that is the build context", () => {
+    expect(() =>
+      buildRailpackBuildctlArgs({
+        buildkitAddress: "tcp://127.0.0.1:1234",
+        buildRootDir: "/tmp/repo/backend",
+        planDir: "/tmp/repo/backend/",
+        planFileName: "railpack-plan.json",
+        output: "type=oci,dest=/tmp/out.tar",
+      })
+    ).toThrow("railpack plan directory must not be the build context");
   });
 
   test("detects exposed ports from Dockerfiles", () => {
