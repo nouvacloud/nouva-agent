@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { type BuildLogEmitter, buildProgressEntry, streamCommand } from "./build-logs.js";
 import type { DockerApiClient } from "./docker-api.js";
 import type {
   AgentImageStoreMode,
@@ -12,6 +13,7 @@ import type {
   AppDockerfileBuildConfig,
   AppRailpackBuildConfig,
   AppStaticBuildConfig,
+  BuildLogStage,
   ServiceResourceLimits,
 } from "./protocol.js";
 import { redactSensitiveText } from "./security.js";
@@ -44,6 +46,8 @@ export interface BuildAppOptions {
   buildkitAddress: string;
   appBuildType?: AppBuildType | null;
   appBuildConfig?: AppBuildConfig | null;
+  /** Receives clone, analyze and BuildKit output as it is produced. */
+  onBuildLog?: BuildLogEmitter;
 }
 
 export interface BuildAppResult {
@@ -95,6 +99,57 @@ export function toSafeBuildctlExecutionError(error: unknown): BuildctlExecutionE
   }
 
   return new BuildctlExecutionError();
+}
+
+interface StreamedBuildCommandOptions {
+  command: string;
+  args: string[];
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  stage: BuildLogStage;
+  envVars: Record<string, string>;
+  onBuildLog?: BuildLogEmitter;
+}
+
+/**
+ * Runs one step of a build, forwarding its output to the deployment's build log as it is produced.
+ * Every line is redacted against the service's own variables before it leaves the agent; the
+ * control plane redacts again on ingest.
+ */
+async function runStreamedBuildCommand(
+  options: StreamedBuildCommandOptions
+): Promise<{ stdout: string; stderr: string }> {
+  const onBuildLog = options.onBuildLog;
+  const result = await streamCommand({
+    command: options.command,
+    args: options.args,
+    cwd: options.cwd,
+    env: options.env,
+    onLine: onBuildLog
+      ? (line, stream) => {
+          onBuildLog({
+            type: stream,
+            line: redactSensitiveText(line, options.envVars),
+            timestamp: Date.now(),
+            stage: options.stage,
+          });
+        }
+      : undefined,
+  });
+
+  if (result.exitCode !== 0 || result.signal !== null) {
+    onBuildLog?.({
+      type: "stderr",
+      line: result.signal
+        ? `[nouva] ${options.stage} step terminated with signal ${result.signal}`
+        : `[nouva] ${options.stage} step exited with code ${result.exitCode}`,
+      timestamp: Date.now(),
+      stage: options.stage,
+    });
+    throw new BuildctlExecutionError();
+  }
+
+  return { stdout: result.stdout, stderr: result.stderr };
 }
 
 function buildEnvVars(envVars: Record<string, string>): Record<string, string> {
@@ -173,7 +228,8 @@ function extractImageSha(output: string): string | null {
 async function cloneRepository(
   repoUrl: string,
   commitHash: string,
-  targetDir: string
+  targetDir: string,
+  onBuildLog?: BuildLogEmitter
 ): Promise<void> {
   try {
     await execFile("git", ["clone", "--depth", "1", repoUrl, targetDir]);
@@ -186,7 +242,14 @@ async function cloneRepository(
       await execFile("git", ["-C", targetDir, "checkout", commitHash]);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Repository clone failed";
-      throw new Error(redactSensitiveText(message));
+      const safeMessage = redactSensitiveText(message);
+      onBuildLog?.({
+        type: "stderr",
+        line: safeMessage,
+        timestamp: Date.now(),
+        stage: "cloning",
+      });
+      throw new Error(safeMessage);
     }
   }
 }
@@ -303,6 +366,9 @@ export function buildRailpackBuildctlArgs(options: {
     "--addr",
     options.buildkitAddress,
     "build",
+    // Plain progress is one line per step on stderr, which is what makes the build streamable.
+    "--progress",
+    "plain",
     "--frontend",
     "gateway.v0",
     "--opt",
@@ -334,6 +400,9 @@ export function buildDockerfileBuildctlArgs(options: BuildctlImageBuildOptions):
     "--addr",
     options.buildkitAddress,
     "build",
+    // Plain progress is one line per step on stderr, which is what makes the build streamable.
+    "--progress",
+    "plain",
     "--frontend",
     "dockerfile.v0",
     "--local",
@@ -361,13 +430,18 @@ export function buildDockerfileBuildctlArgs(options: BuildctlImageBuildOptions):
 
 async function runBuildctlBuild(
   options: BuildctlImageBuildOptions,
-  env: NodeJS.ProcessEnv = process.env
+  env: NodeJS.ProcessEnv = process.env,
+  logging: { onBuildLog?: BuildLogEmitter; envVars?: Record<string, string> } = {}
 ): Promise<string | null> {
   try {
-    const { stdout, stderr } = await execFile(BUILDCTL_BIN, buildDockerfileBuildctlArgs(options), {
+    const { stdout, stderr } = await runStreamedBuildCommand({
+      command: BUILDCTL_BIN,
+      args: buildDockerfileBuildctlArgs(options),
       cwd: options.contextDir,
       env,
-      maxBuffer: 1024 * 1024 * 32,
+      stage: "building",
+      envVars: logging.envVars ?? {},
+      ...(logging.onBuildLog ? { onBuildLog: logging.onBuildLog } : {}),
     });
 
     return extractImageSha(`${stdout}\n${stderr}`);
@@ -393,7 +467,8 @@ async function loadBuiltImageIfNeeded(
 async function prepareRailpackPlan(
   buildRootDir: string,
   planDir: string,
-  envVars: Record<string, string>
+  envVars: Record<string, string>,
+  onBuildLog?: BuildLogEmitter
 ): Promise<{
   childEnv: NodeJS.ProcessEnv;
   info: Record<string, unknown>;
@@ -413,9 +488,15 @@ async function prepareRailpackPlan(
   }
   prepareArgs.push(buildRootDir);
 
-  await execFile(RAILPACK_BIN, prepareArgs, {
+  onBuildLog?.(buildProgressEntry("analyzing", "Analyzing the repository", 20));
+  await runStreamedBuildCommand({
+    command: RAILPACK_BIN,
+    args: prepareArgs,
     cwd: buildRootDir,
     env: childEnv,
+    stage: "analyzing",
+    envVars,
+    ...(onBuildLog ? { onBuildLog } : {}),
   });
 
   const infoRaw = await readFile(infoFile, "utf8");
@@ -431,14 +512,16 @@ async function runRailpackBuildctl(options: {
   planDir: string;
   buildkitAddress: string;
   childEnv: NodeJS.ProcessEnv;
+  envVars: Record<string, string>;
   envVarKeys: string[];
   output: string;
   planFileName: string;
+  onBuildLog?: BuildLogEmitter;
 }): Promise<string | null> {
   try {
-    const { stdout, stderr } = await execFile(
-      BUILDCTL_BIN,
-      buildRailpackBuildctlArgs({
+    const { stdout, stderr } = await runStreamedBuildCommand({
+      command: BUILDCTL_BIN,
+      args: buildRailpackBuildctlArgs({
         buildkitAddress: options.buildkitAddress,
         buildRootDir: options.buildRootDir,
         planDir: options.planDir,
@@ -446,12 +529,12 @@ async function runRailpackBuildctl(options: {
         output: options.output,
         envVarKeys: options.envVarKeys,
       }),
-      {
-        cwd: options.buildRootDir,
-        env: options.childEnv,
-        maxBuffer: 1024 * 1024 * 32,
-      }
-    );
+      cwd: options.buildRootDir,
+      env: options.childEnv,
+      stage: "building",
+      envVars: options.envVars,
+      ...(options.onBuildLog ? { onBuildLog: options.onBuildLog } : {}),
+    });
 
     return extractImageSha(`${stdout}\n${stderr}`);
   } catch (error) {
@@ -466,18 +549,27 @@ async function runRailpackBuild(options: {
   envVars: Record<string, string>;
   buildkitAddress: string;
   output: string;
+  onBuildLog?: BuildLogEmitter;
 }): Promise<{ imageSha: string | null; info: Record<string, unknown> }> {
   const planDir = await mkdtemp(path.join(os.tmpdir(), "nouva-railpack-plan-"));
   try {
-    const prepared = await prepareRailpackPlan(options.buildRootDir, planDir, options.envVars);
+    const prepared = await prepareRailpackPlan(
+      options.buildRootDir,
+      planDir,
+      options.envVars,
+      options.onBuildLog
+    );
+    options.onBuildLog?.(buildProgressEntry("building", "Building the image", 40));
     const imageSha = await runRailpackBuildctl({
       buildRootDir: options.buildRootDir,
       planDir,
       buildkitAddress: options.buildkitAddress,
       childEnv: prepared.childEnv,
+      envVars: options.envVars,
       envVarKeys: Object.keys(options.envVars),
       output: options.output,
       planFileName: prepared.planFileName,
+      ...(options.onBuildLog ? { onBuildLog: options.onBuildLog } : {}),
     });
     return { imageSha, info: prepared.info };
   } finally {
@@ -491,12 +583,14 @@ async function buildRailpackApplication(options: {
   envVars: Record<string, string>;
   buildkitAddress: string;
   output: BuildImageOutput;
+  onBuildLog?: BuildLogEmitter;
 }): Promise<StrategyBuildResult> {
   const built = await runRailpackBuild({
     buildRootDir: options.buildRootDir,
     envVars: options.envVars,
     buildkitAddress: options.buildkitAddress,
     output: options.output.buildctlOutput,
+    ...(options.onBuildLog ? { onBuildLog: options.onBuildLog } : {}),
   });
   const imageId = await loadBuiltImageIfNeeded(options.docker, options.output);
 
@@ -543,6 +637,7 @@ async function buildDockerfileApplication(options: {
   envVars: Record<string, string>;
   buildkitAddress: string;
   output: BuildImageOutput;
+  onBuildLog?: BuildLogEmitter;
 }): Promise<StrategyBuildResult> {
   const dockerfileAbsolutePath = resolvePathWithinBuildRoot(
     options.buildRootDir,
@@ -551,6 +646,7 @@ async function buildDockerfileApplication(options: {
   const contextDir = resolvePathWithinBuildRoot(options.buildRootDir, options.dockerContextPath);
   const dockerfileSource = await readFile(dockerfileAbsolutePath, "utf8");
 
+  options.onBuildLog?.(buildProgressEntry("building", "Building the image", 40));
   const imageSha = await runBuildctlBuild(
     {
       buildkitAddress: options.buildkitAddress,
@@ -561,7 +657,11 @@ async function buildDockerfileApplication(options: {
       output: options.output.buildctlOutput,
       targetStage: options.dockerBuildStage ?? null,
     },
-    buildEnvVars(options.envVars)
+    buildEnvVars(options.envVars),
+    {
+      envVars: options.envVars,
+      ...(options.onBuildLog ? { onBuildLog: options.onBuildLog } : {}),
+    }
   );
   const imageId = await loadBuiltImageIfNeeded(options.docker, options.output);
 
@@ -640,6 +740,7 @@ async function buildStaticApplication(options: {
   localRegistryHost: string;
   localRegistryPort: number;
   output: BuildImageOutput;
+  onBuildLog?: BuildLogEmitter;
 }): Promise<StrategyBuildResult> {
   const runtimeDir = path.join(options.tempRoot, "static-runtime");
   await mkdir(runtimeDir, { recursive: true });
@@ -658,6 +759,7 @@ async function buildStaticApplication(options: {
       envVars: options.envVars,
       buildkitAddress: options.buildkitAddress,
       output: buildLocalDirectoryOutput(staticExportDir),
+      ...(options.onBuildLog ? { onBuildLog: options.onBuildLog } : {}),
     });
 
     const metadata = inferBuildMetadata(built.info);
@@ -695,6 +797,7 @@ async function buildStaticApplication(options: {
         imageUrl: intermediateImageUrl,
         imageStoreMode: options.imageStoreMode,
       }),
+      ...(options.onBuildLog ? { onBuildLog: options.onBuildLog } : {}),
     });
 
     detectedLanguage = railpackResult.detectedLanguage;
@@ -718,13 +821,20 @@ async function buildStaticApplication(options: {
     "utf8"
   );
 
-  const imageSha = await runBuildctlBuild({
-    buildkitAddress: options.buildkitAddress,
-    contextDir: runtimeDir,
-    dockerfileDir: runtimeDir,
-    dockerfileName: "Dockerfile",
-    output: options.output.buildctlOutput,
-  });
+  const imageSha = await runBuildctlBuild(
+    {
+      buildkitAddress: options.buildkitAddress,
+      contextDir: runtimeDir,
+      dockerfileDir: runtimeDir,
+      dockerfileName: "Dockerfile",
+      output: options.output.buildctlOutput,
+    },
+    process.env,
+    {
+      envVars: options.envVars,
+      ...(options.onBuildLog ? { onBuildLog: options.onBuildLog } : {}),
+    }
+  );
   const imageId = await loadBuiltImageIfNeeded(options.docker, options.output);
 
   return {
@@ -741,9 +851,17 @@ export async function buildApp(options: BuildAppOptions): Promise<BuildAppResult
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), `nouva-agent-${options.deploymentId}-`));
   const repoDir = path.join(tempRoot, "repo");
   const buildStart = Date.now();
+  const onBuildLog = options.onBuildLog;
 
   try {
-    await cloneRepository(options.repoUrl, options.commitHash, repoDir);
+    onBuildLog?.(buildProgressEntry("cloning", "Cloning the repository", 5));
+    await cloneRepository(options.repoUrl, options.commitHash, repoDir, onBuildLog);
+    onBuildLog?.({
+      type: "stdout",
+      line: `[nouva] checked out ${options.commitHash}`,
+      timestamp: Date.now(),
+      stage: "cloning",
+    });
 
     const buildSettings = normalizeAppBuildSettings(options.appBuildType, options.appBuildConfig);
     const imageUrl = buildImageUrl({
@@ -773,6 +891,7 @@ export async function buildApp(options: BuildAppOptions): Promise<BuildAppResult
           envVars: options.envVars,
           buildkitAddress: options.buildkitAddress,
           output,
+          ...(onBuildLog ? { onBuildLog } : {}),
         });
         break;
       }
@@ -791,6 +910,7 @@ export async function buildApp(options: BuildAppOptions): Promise<BuildAppResult
           localRegistryHost: options.localRegistryHost,
           localRegistryPort: options.localRegistryPort,
           output,
+          ...(onBuildLog ? { onBuildLog } : {}),
         });
         break;
       }
@@ -801,9 +921,12 @@ export async function buildApp(options: BuildAppOptions): Promise<BuildAppResult
           envVars: options.envVars,
           buildkitAddress: options.buildkitAddress,
           output,
+          ...(onBuildLog ? { onBuildLog } : {}),
         });
         break;
     }
+
+    onBuildLog?.(buildProgressEntry("pushing", "Publishing the image", 80));
 
     return {
       imageUrl,

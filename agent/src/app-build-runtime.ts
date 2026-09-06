@@ -1,4 +1,5 @@
 import { type BuildAppResult, buildApp } from "./build.js";
+import type { BuildLogEmitter } from "./build-logs.js";
 import type { DockerApiClient } from "./docker-api.js";
 import type { AgentRuntimeConfig, AppDeployPayload, RuntimeMetadata } from "./protocol.js";
 
@@ -43,6 +44,7 @@ export interface BuildAndDeployAppDependencies {
     buildkitAddress: string;
     appBuildType?: AppDeployPayload["appBuildType"];
     appBuildConfig?: AppDeployPayload["appBuildConfig"];
+    onBuildLog?: BuildLogEmitter;
   }) => Promise<BuildAppResult>;
   deployAppImage: (
     docker: DockerApiClient,
@@ -56,7 +58,8 @@ export async function buildAndDeployAppWithDependencies(
   docker: DockerApiClient,
   config: AgentRuntimeConfig,
   payload: AppDeployPayload,
-  buildkitAddress: string
+  buildkitAddress: string,
+  onBuildLog?: BuildLogEmitter
 ) {
   await dependencies.ensureBaseRuntime(docker, config);
 
@@ -73,6 +76,15 @@ export async function buildAndDeployAppWithDependencies(
     buildkitAddress,
     appBuildType: payload.appBuildType ?? null,
     appBuildConfig: payload.appBuildConfig ?? null,
+    ...(onBuildLog ? { onBuildLog } : {}),
+  });
+
+  onBuildLog?.({
+    type: "progress",
+    stage: "deploying",
+    message: "Starting the container",
+    percent: 90,
+    timestamp: Date.now(),
   });
 
   return await dependencies.deployAppImage(docker, config, {

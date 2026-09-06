@@ -185,6 +185,29 @@ export function collectEnvironmentMapSecretValues(
   return uniqueSortedSecretValues(secretValues);
 }
 
+/**
+ * The material of an environment map that can actually be a secret: its values, minus the flag
+ * literals, and without the variable names.
+ *
+ * `collectEnvironmentMapSecretValues` deliberately treats a variable name as protected material so
+ * that an agent echoing back `{"DATABASE_URL": "…"}` is redacted key and all. Surfaces that compare
+ * a redacted copy against the original to detect a leak cannot use that set: a name is already
+ * visible in the dashboard, the deployment payload and the environment editor, so a name matching a
+ * platform-generated string is not a leak — it just made the comparison differ, which permanently
+ * failed the deployment (#187). A flag literal is dropped for the same reason it is dropped from
+ * the platform's own configured secrets: `DEBUG=true` cannot be a secret, but it can collide with
+ * a boolean an operational field reports.
+ */
+export function collectEnvironmentMapValues(
+  environmentVariables: Readonly<Record<string, string | undefined>>
+): string[] {
+  return uniqueSortedSecretValues(
+    Object.values(environmentVariables).filter(
+      (value): value is string => typeof value === "string" && !isFlagEnvironmentValue(value)
+    )
+  );
+}
+
 export function sanitizeEnvironmentCommitMessage(
   commitMessage: string,
   environmentMaps: readonly Readonly<Record<string, string | undefined>>[]
@@ -215,9 +238,69 @@ export function sanitizeEnvironmentCommitMessage(
 const AGENT_WORK_PAYLOAD_OPERATIONAL_PATH_KEYS = ["dataPath", "mountPath"] as const;
 
 /**
- * Reads the plaintext operational paths an agent work payload declares (`dataPath`, `mountPath`).
- * Agent results echo these verbatim, so both the agent and the API pass them as
- * `operationalValues` when redacting a result against the leased environment.
+ * Identity the control plane generates for a service and hands to the agent in plaintext. The agent
+ * echoes every one of these back in its operational result, and a customer variable is allowed to
+ * hold the same string — `PHX_HOST`, `ALLOWED_HOSTS` and `APP_HOST` are routinely set to the
+ * service's own provided hostname — so they are exempt from redaction just like the paths above.
+ */
+const AGENT_WORK_PAYLOAD_OPERATIONAL_IDENTITY_KEYS = [
+  "containerName",
+  "externalHost",
+  "imageUrl",
+  "internalHost",
+  "networkName",
+  "providedHostname",
+  "serviceName",
+  "subdomain",
+  "volumeName",
+] as const;
+
+const AGENT_WORK_PAYLOAD_OPERATIONAL_LIST_KEYS = ["customHostnames"] as const;
+
+/**
+ * Payload members whose every string leaf is platform-generated: the live runtime metadata the
+ * control plane resolved at lease time, and the volume identity it allocated.
+ */
+const AGENT_WORK_PAYLOAD_OPERATIONAL_RECORD_KEYS = ["runtimeMetadata", "volume"] as const;
+
+/**
+ * A one- or two-character exemption would punch a hole through redaction far wider than the
+ * identity it protects, and no hostname, container name or image reference is that short.
+ */
+const MIN_OPERATIONAL_IDENTITY_LENGTH = 3;
+const MAX_OPERATIONAL_RECORD_DEPTH = 4;
+
+function addOperationalIdentityValue(values: Set<string>, value: unknown): void {
+  if (typeof value !== "string") {
+    return;
+  }
+  const trimmed = value.trim();
+  if (trimmed.length >= MIN_OPERATIONAL_IDENTITY_LENGTH) {
+    values.add(trimmed);
+  }
+}
+
+function collectOperationalRecordValues(value: unknown, values: Set<string>, depth: number): void {
+  if (depth > MAX_OPERATIONAL_RECORD_DEPTH || value === null || typeof value !== "object") {
+    addOperationalIdentityValue(values, value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      collectOperationalRecordValues(entry, values, depth + 1);
+    }
+    return;
+  }
+  for (const entry of Object.values(asRecord(value))) {
+    collectOperationalRecordValues(entry, values, depth + 1);
+  }
+}
+
+/**
+ * Reads the plaintext operational material an agent work payload declares: the paths (`dataPath`,
+ * `mountPath`) and the service identity the control plane generated for this deployment. Agent
+ * results echo these verbatim, so both the agent and the API pass them as `operationalValues` when
+ * redacting a result against the leased environment.
  */
 export function collectAgentWorkPayloadOperationalValues(payload: unknown): string[] {
   const record = asRecord(payload);
@@ -227,6 +310,20 @@ export function collectAgentWorkPayloadOperationalValues(payload: unknown): stri
     if (typeof value === "string" && value.trim().length > 0) {
       values.add(value.trim());
     }
+  }
+  for (const key of AGENT_WORK_PAYLOAD_OPERATIONAL_IDENTITY_KEYS) {
+    addOperationalIdentityValue(values, record[key]);
+  }
+  for (const key of AGENT_WORK_PAYLOAD_OPERATIONAL_LIST_KEYS) {
+    const entries = record[key];
+    if (Array.isArray(entries)) {
+      for (const entry of entries) {
+        addOperationalIdentityValue(values, entry);
+      }
+    }
+  }
+  for (const key of AGENT_WORK_PAYLOAD_OPERATIONAL_RECORD_KEYS) {
+    collectOperationalRecordValues(record[key], values, 1);
   }
   return [...values];
 }

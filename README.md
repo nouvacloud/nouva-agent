@@ -67,10 +67,10 @@ docker run -d \
 | `NOUVA_REGISTRATION_TOKEN` | — | Initial registration token |
 | `NOUVA_APP_DOMAIN` | `up.nouva.cloud` | Base domain for deployed apps |
 | `NOUVA_AGENT_DATA_VOLUME` | `nouva-agent-data` | Agent data volume name |
-| `NOUVA_AGENT_BUILDKIT_CONTAINER` | `nouva-buildkitd` | BuildKit container name |
+| `NOUVA_AGENT_BUILDKIT_CONTAINER` | `nouva-buildkitd` | Legacy shared BuildKit container name, removed on start |
 | `NOUVA_AGENT_REGISTRY_CONTAINER` | `nouva-registry` | Local registry container name |
 | `NOUVA_AGENT_TRAEFIK_CONTAINER` | `nouva-traefik` | Traefik container name |
-| `NOUVA_AGENT_BUILDKIT_ADDR` | `tcp://127.0.0.1:1234` | BuildKit daemon address |
+| `NOUVA_AGENT_BUILDKIT_GC_KEEP_STORAGE` | `1000,4000,8000` | Build cache GC budget, `Reserved,Free,Maximum` in MB |
 | `NOUVA_HOST_OS_ID` | — | Host OS identifier |
 | `NOUVA_HOST_OS_VERSION_ID` | — | Host OS version |
 | `NOUVA_IMAGE_REGISTRY` | — | Custom image registry |

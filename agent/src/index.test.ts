@@ -22,12 +22,15 @@ import {
   handleRestorePostgresPitr,
   handleRestoreVolumeBackup,
   handleWipeVolume,
+  isAgentWorkResultRejected,
   preflightDatabasePublicPort,
   prepareAppBuildkitRuntime,
+  readApiRequestErrorMessage,
   resolveAgentTaskImage,
   resolveAgentWorkLeaseRenewalIntervalMs,
   resolveReportedAgentVersion,
   resolveServiceContainerIdentifier,
+  rollbackUnreportableWorkResult,
   type StoredCredentials,
   sanitizeAgentWorkResult,
   shouldStopRetryingAgentWorkMutation,
@@ -585,7 +588,9 @@ describe("agent work mutation errors", () => {
       },
       job: {
         status: "failed",
-        statusMessage: "[REDACTED]=[REDACTED]",
+        // The variable name survives so a failure can say which variable to change; its value does
+        // not (#187).
+        statusMessage: "job=[REDACTED]",
       },
     });
   });
@@ -677,7 +682,7 @@ describe("agent work mutation errors", () => {
     expect(result).toMatchObject({
       runtimeMetadata: provisionResult.runtimeMetadata,
       runtimeInstance: provisionResult.runtimeInstance,
-      statusMessage: "initdb in /var/lib/postgresql/pgdata for [REDACTED]=[REDACTED]",
+      statusMessage: "initdb in /var/lib/postgresql/pgdata for POSTGRES_PASSWORD=[REDACTED]",
     });
     expect(JSON.stringify(result)).not.toContain("super-secret");
   });
@@ -796,6 +801,129 @@ describe("agent work mutation errors", () => {
       )
     ).toBe(false);
     expect(shouldStopRetryingAgentWorkMutation(new Error("network exploded"))).toBe(false);
+  });
+
+  test("separates a rejected result from a lease that is genuinely gone", () => {
+    const rejection = new ApiRequestError({
+      method: "POST",
+      pathName: "/api/agent/work/work_1/complete",
+      status: 422,
+      message: JSON.stringify({
+        message: 'Agent work result field "runtimeMetadata" repeats the value of PHX_HOST.',
+      }),
+    });
+
+    expect(isAgentWorkResultRejected(rejection)).toBe(true);
+    expect(
+      isAgentWorkResultRejected(
+        new ApiRequestError({
+          method: "POST",
+          pathName: "/api/agent/work/work_1/complete",
+          status: 409,
+          message: "Work item lease is no longer active",
+        })
+      )
+    ).toBe(false);
+    expect(isAgentWorkResultRejected(new Error("network exploded"))).toBe(false);
+    expect(readApiRequestErrorMessage(rejection, "fallback")).toBe(
+      'Agent work result field "runtimeMetadata" repeats the value of PHX_HOST.'
+    );
+    expect(
+      readApiRequestErrorMessage(
+        new ApiRequestError({
+          method: "POST",
+          pathName: "/api/agent/work/work_1/complete",
+          status: 422,
+          message: "not json",
+        }),
+        "fallback"
+      )
+    ).toBe("not json");
+    expect(readApiRequestErrorMessage(new Error("network exploded"), "fallback")).toBe("fallback");
+  });
+});
+
+describe("rollbackUnreportableWorkResult", () => {
+  function createRemoveContainerRecorder() {
+    const removed: string[] = [];
+    return {
+      removed,
+      docker: {
+        removeContainer: async (nameOrId: string) => {
+          removed.push(nameOrId);
+        },
+      },
+    };
+  }
+
+  test("removes the containers this attempt started and keeps the ones it inherited", async () => {
+    const recorder = createRemoveContainerRecorder();
+
+    const removed = await rollbackUnreportableWorkResult(recorder.docker, {
+      kind: "redeploy_app",
+      workItemId: "work_1",
+      payload: {
+        runtimeMetadata: { containerName: "nouva-proj-phoenix-old", containerId: "ctr_old" },
+      },
+      result: {
+        runtimeMetadata: { containerName: "nouva-proj-phoenix", containerId: "ctr_new" },
+        rollout: {
+          activeContainerName: "nouva-proj-phoenix",
+          previousContainerRetirement: { containerName: "nouva-proj-phoenix-old" },
+        },
+        runtimeInstance: { containerName: "nouva-proj-phoenix", containerId: "ctr_new" },
+      },
+    });
+
+    expect(removed.sort()).toEqual(["ctr_new", "nouva-proj-phoenix"]);
+    expect(recorder.removed).not.toContain("nouva-proj-phoenix-old");
+    expect(recorder.removed).not.toContain("ctr_old");
+  });
+
+  test("leaves work that never starts a container alone", async () => {
+    const recorder = createRemoveContainerRecorder();
+
+    expect(
+      await rollbackUnreportableWorkResult(recorder.docker, {
+        kind: "provision_database",
+        workItemId: "work_2",
+        payload: {},
+        result: { runtimeMetadata: { containerName: "nouva-proj-db" } },
+      })
+    ).toEqual([]);
+    expect(
+      await rollbackUnreportableWorkResult(recorder.docker, {
+        kind: "deploy_app",
+        workItemId: "work_3",
+        payload: {},
+        result: null,
+      })
+    ).toEqual([]);
+    expect(recorder.removed).toEqual([]);
+  });
+
+  test("keeps removing after one container cannot be removed", async () => {
+    const removed: string[] = [];
+    const docker = {
+      removeContainer: async (nameOrId: string) => {
+        if (nameOrId === "ctr_locked") {
+          throw new Error("container is locked");
+        }
+        removed.push(nameOrId);
+      },
+    };
+
+    expect(
+      await rollbackUnreportableWorkResult(docker, {
+        kind: "deploy_worker",
+        workItemId: "work_4",
+        payload: {},
+        result: {
+          runtimeInstances: [{ containerId: "ctr_locked" }, { containerId: "ctr_ok" }],
+        },
+      })
+    ).toEqual(["ctr_ok"]);
+    expect(removed).toEqual(["ctr_ok"]);
   });
 });
 
@@ -966,17 +1094,21 @@ describe("buildAndDeployAppWithDependencies", () => {
 });
 
 describe("prepareAppBuildkitRuntime", () => {
+  const createBuildkitDocker = () => ({
+    createVolume: mock(async () => {}),
+    ensureContainer: mock(async () => "buildkit_1"),
+    removeContainer: mock(async () => {}),
+  });
+
   test("creates an isolated resource-limited BuildKit worker for bounded app builds", async () => {
-    const docker = {
-      ensureContainer: mock(async () => "buildkit_1"),
-      removeContainer: mock(async () => {}),
-    };
+    const docker = createBuildkitDocker();
     const waitUntilReady = mock(async () => {});
 
     const runtime = await prepareAppBuildkitRuntime(
       docker as never,
       {
         deploymentId: "dep_1",
+        serviceId: "svc_1",
         resourceLimits,
       },
       {
@@ -989,13 +1121,22 @@ describe("prepareAppBuildkitRuntime", () => {
     expect(docker.ensureContainer).toHaveBeenCalledWith(
       expect.objectContaining({
         name: "nouva-buildkitd-dep_1",
-        cmd: ["--addr", "tcp://0.0.0.0:4567"],
+        cmd: [
+          "--addr",
+          "tcp://0.0.0.0:4567",
+          "--oci-worker-gc",
+          "--oci-worker-gc-keepstorage",
+          "1000,4000,8000",
+        ],
         hostConfig: expect.objectContaining({
           Privileged: true,
           NetworkMode: "host",
           RestartPolicy: {
             Name: "no",
           },
+          // The state directory is a named per-service volume, so the layer cache survives to the
+          // next deployment instead of being thrown away with the container (#184).
+          Binds: ["nouva-buildkit-cache-svc_1:/var/lib/buildkit"],
           NanoCpus: expect.any(Number),
           Memory: expect.any(Number),
           MemorySwap: expect.any(Number),
@@ -1008,24 +1149,69 @@ describe("prepareAppBuildkitRuntime", () => {
 
     await runtime.cleanup();
 
-    expect(docker.removeContainer).toHaveBeenCalledWith(
-      "nouva-buildkitd-dep_1",
-      true,
-      undefined,
-      true
+    expect(docker.removeContainer).toHaveBeenCalledWith("nouva-buildkitd-dep_1", true);
+  });
+
+  test("keeps the cache volume out of the customer storage allowance", async () => {
+    const docker = createBuildkitDocker();
+
+    await prepareAppBuildkitRuntime(
+      docker as never,
+      {
+        deploymentId: "dep_1",
+        serviceId: "svc_1",
+        resourceLimits,
+      },
+      {
+        allocatePort: async () => 4567,
+        waitUntilReady: async () => {},
+      }
     );
+
+    const [volumeName, labels] = docker.createVolume.mock.calls[0] as unknown as [
+      string,
+      Record<string, string>,
+    ];
+
+    expect(volumeName).toBe("nouva-buildkit-cache-svc_1");
+    expect(labels["nouva.kind"]).toBe("buildkit-cache");
+    expect(labels["nouva.service.id"]).toBe("svc_1");
+    // Volume accounting keys off `nouva.volume.id`; agent infrastructure must not carry it.
+    expect(labels["nouva.volume.id"]).toBeUndefined();
+    expect(volumeName.startsWith("nouva-vol-")).toBe(false);
+  });
+
+  test("reuses one cache per service across deployments", async () => {
+    const docker = createBuildkitDocker();
+
+    for (const deploymentId of ["dep_1", "dep_2"]) {
+      await prepareAppBuildkitRuntime(
+        docker as never,
+        { deploymentId, serviceId: "svc_1", resourceLimits },
+        { allocatePort: async () => 4567, waitUntilReady: async () => {} }
+      );
+    }
+    await prepareAppBuildkitRuntime(
+      docker as never,
+      { deploymentId: "dep_3", serviceId: "svc_2", resourceLimits },
+      { allocatePort: async () => 4567, waitUntilReady: async () => {} }
+    );
+
+    expect(docker.createVolume.mock.calls.map((call) => call[0])).toEqual([
+      "nouva-buildkit-cache-svc_1",
+      "nouva-buildkit-cache-svc_1",
+      "nouva-buildkit-cache-svc_2",
+    ]);
   });
 
   test("creates a scoped BuildKit worker when legacy payload limits are null", async () => {
-    const docker = {
-      ensureContainer: mock(async () => "buildkit_1"),
-      removeContainer: mock(async () => {}),
-    };
+    const docker = createBuildkitDocker();
 
     const runtime = await prepareAppBuildkitRuntime(
       docker as never,
       {
         deploymentId: "dep_1",
+        serviceId: "svc_1",
         resourceLimits: null,
       },
       {
@@ -1039,25 +1225,18 @@ describe("prepareAppBuildkitRuntime", () => {
 
     await runtime.cleanup();
 
-    expect(docker.removeContainer).toHaveBeenCalledWith(
-      "nouva-buildkitd-dep_1",
-      true,
-      undefined,
-      true
-    );
+    expect(docker.removeContainer).toHaveBeenCalledWith("nouva-buildkitd-dep_1", true);
   });
 
   test("removes the container's anonymous BuildKit volume when a build fails to become ready", async () => {
-    const docker = {
-      ensureContainer: mock(async () => "buildkit_1"),
-      removeContainer: mock(async () => {}),
-    };
+    const docker = createBuildkitDocker();
 
     await expect(
       prepareAppBuildkitRuntime(
         docker as never,
         {
           deploymentId: "dep_1",
+          serviceId: "svc_1",
           resourceLimits,
         },
         {
@@ -1069,12 +1248,8 @@ describe("prepareAppBuildkitRuntime", () => {
       )
     ).rejects.toThrow("buildkit never became ready");
 
-    expect(docker.removeContainer).toHaveBeenCalledWith(
-      "nouva-buildkitd-dep_1",
-      true,
-      undefined,
-      true
-    );
+    // `docker rm -v` only sweeps anonymous volumes, so the named cache survives a failed build.
+    expect(docker.removeContainer).toHaveBeenCalledWith("nouva-buildkitd-dep_1", true);
   });
 });
 
@@ -2694,6 +2869,36 @@ describe("verified service cleanup", () => {
         { reference: "nouva-app:previous", absent: true },
       ],
     });
+  });
+
+  test("removes the service's build cache, for workers too", async () => {
+    const docker = Object.assign(createDockerMock(), {
+      listContainersByLabels: mock(async () => []),
+    });
+    docker.inspectImage.mockResolvedValue(null);
+
+    await handleDeleteService(docker as never, {
+      projectId: "proj_1",
+      serviceId: "svc_1",
+      serviceName: "app",
+      serviceType: "app" as const,
+      containerName: "nouva-app-svc_1",
+      runtimeMetadata: null,
+    });
+    await handleDeleteService(docker as never, {
+      projectId: "proj_1",
+      serviceId: "svc_2",
+      serviceName: "worker",
+      serviceType: "worker" as const,
+      containerName: "nouva-worker-svc_2",
+      runtimeMetadata: null,
+    });
+
+    // Nothing else reclaims a named cache volume once its service is gone (#184).
+    expect(docker.removeVolume.mock.calls).toEqual([
+      ["nouva-buildkit-cache-svc_1", true],
+      ["nouva-buildkit-cache-svc_2", true],
+    ]);
   });
 });
 

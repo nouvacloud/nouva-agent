@@ -691,11 +691,19 @@ export class DockerApiClient {
     }
   }
 
+  /**
+   * `removeVolumes` maps to Docker's `v=true`, which removes only the *anonymous* volumes the
+   * container owns and never a named one, so it defaults to true: no caller wants to keep an
+   * anonymous volume, and leaving it opt-in leaked one per container lifetime for every image
+   * declaring a `VOLUME` the agent does not mount over — Postgres `/var/lib/postgresql/data` and
+   * Mongo `/data/configdb` on every database work item (#176). Managed service volumes and the
+   * per-service build cache (#184) are named, so this never touches them.
+   */
   async removeContainer(
     nameOrId: string,
     force = false,
     timeoutMs?: number,
-    removeVolumes = false
+    removeVolumes = true
   ): Promise<void> {
     try {
       await this.request(

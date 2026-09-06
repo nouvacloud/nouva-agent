@@ -1035,6 +1035,34 @@ export interface AgentWorkMutationResponse {
   ok: true;
 }
 
+export type BuildLogStage = "cloning" | "analyzing" | "building" | "pushing" | "deploying";
+
+export interface BuildLogMessage {
+  type: "stdout" | "stderr" | "progress" | "exit";
+  line?: string;
+  timestamp: number;
+  stage?: BuildLogStage;
+  percent?: number;
+  message?: string;
+  exitCode?: number;
+  success?: boolean;
+}
+
+export interface AgentBuildLogBatch {
+  deploymentId: string;
+  entries: BuildLogMessage[];
+}
+
+export interface AgentBuildLogsRequest {
+  serverId: string;
+  logs: AgentBuildLogBatch[];
+}
+
+export interface AgentBuildLogsResponse {
+  ok: true;
+  accepted: number;
+}
+
 export interface AgentErrorResponse {
   message: string;
 }

@@ -366,23 +366,27 @@ describe("DockerApiClient cleanup semantics", () => {
 
     expect(requestSpy.mock.calls).toEqual([
       ["POST", "/containers/nouva-app-svc_1-live/stop?t=10", null, 15_000],
-      ["DELETE", "/containers/nouva-app-svc_1-live?force=false", null, 15_000],
+      ["DELETE", "/containers/nouva-app-svc_1-live?force=false&v=true", null, 15_000],
     ]);
 
     requestSpy.mockRestore();
   });
 
-  test("removes anonymous volumes only when explicitly requested", async () => {
+  test("removes the container's anonymous volumes by default", async () => {
     const DockerApiClientCtor = DockerApiClient as unknown as {
       new (apiVersion: string): DockerApiClient;
     };
     const client = new DockerApiClientCtor("v1.51");
     const requestSpy = spyOn(client, "request").mockResolvedValue("");
 
-    await client.removeContainer("nouva-buildkitd-dep_1", true, undefined, true);
+    // Every teardown sweeps them, or an image that declares a `VOLUME` the agent does not mount
+    // over leaks one anonymous volume per container lifetime (#176).
+    await client.removeContainer("nouva-buildkitd-dep_1", true);
+    await client.removeContainer("nouva-postgres-svc_1", true, undefined, false);
 
     expect(requestSpy.mock.calls).toEqual([
       ["DELETE", "/containers/nouva-buildkitd-dep_1?force=true&v=true", null, undefined],
+      ["DELETE", "/containers/nouva-postgres-svc_1?force=true", null, undefined],
     ]);
 
     requestSpy.mockRestore();

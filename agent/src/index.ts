@@ -20,6 +20,11 @@ import {
   type DeployAppImageInput,
 } from "./app-build-runtime.js";
 import { buildApp, hashProjectNetwork } from "./build.js";
+import {
+  type BuildLogEmitter,
+  type BuildLogPublisher,
+  createBuildLogPublisher,
+} from "./build-logs.js";
 import { collectManagedContainerLogConfigValidationCheck } from "./container-log-reconciliation.js";
 import {
   DockerApiClient,
@@ -32,6 +37,8 @@ import { toDockerResourceSettings } from "./docker-resource-limits.js";
 import { ensureHostKernelSettings, HOST_INOTIFY_MAX_USER_WATCHES } from "./host-tuning.js";
 import { collectPostgresObservabilitySamples } from "./postgres-observability.js";
 import {
+  type AgentBuildLogsRequest,
+  type AgentBuildLogsResponse,
   type AgentCapabilities,
   type AgentCleanupProof,
   type AgentHeartbeatResponse,
@@ -134,8 +141,23 @@ const TRAEFIK_IMAGE = process.env.NOUVA_AGENT_TRAEFIK_IMAGE || DEFAULT_TRAEFIK_I
 const TRAEFIK_PATHS = buildTraefikRuntimePaths(DATA_DIR);
 const traefikRuntimeTasks = createSerializedTaskRunner();
 const ALLOY_PATHS = getAlloyRuntimePaths(DATA_DIR);
-const BUILDKIT_ADDRESS = process.env.NOUVA_AGENT_BUILDKIT_ADDR || "tcp://127.0.0.1:1234";
+// Each build allocates its own loopback port for its own daemon, so there is no fixed BuildKit
+// address any more; this is only the fallback when a scoped address cannot be parsed.
 const DEFAULT_BUILDKIT_PORT = 1234;
+/**
+ * Every build gets its own BuildKit daemon so it can carry the service's resource limits, but its
+ * state directory is a named per-service volume rather than the anonymous one the image declares,
+ * so the layer cache survives between deployments (#184). Without it a language runtime mise has no
+ * prebuilt binary for — CRuby, Erlang — is recompiled from source on every single push.
+ */
+const BUILDKIT_CACHE_VOLUME_PREFIX = "nouva-buildkit-cache-";
+const BUILDKIT_STATE_PATH = "/var/lib/buildkit";
+/**
+ * `Reserved,Free,Maximum` in MB. BuildKit's own defaults (2000,8000,30000) assume a build host, not
+ * a customer's single small server, so cap the cache at 8 GB and keep 4 GB of the disk free.
+ */
+const BUILDKIT_GC_KEEP_STORAGE =
+  process.env.NOUVA_AGENT_BUILDKIT_GC_KEEP_STORAGE || "1000,4000,8000";
 const DEFAULT_AGENT_CONTAINER_NAME = "nouva-agent";
 const DEFAULT_AGENT_IMAGE = "ghcr.io/nouvacloud/nouva-agent:latest";
 const APP_VOLUME_SNAPSHOT_IMAGE = "alpine:3.21";
@@ -957,24 +979,24 @@ async function collectValidationSnapshot(
     );
 
     try {
-      await ensureSharedBuildkitRuntime(docker);
+      await ensureBuildkitImage(docker);
       checks.push(
         buildCheck(
           "buildkit",
-          "BuildKit daemon",
+          "BuildKit image",
           "pass",
-          "BuildKit daemon is reachable and ready for builds",
-          BUILDKIT_ADDRESS
+          "BuildKit image is present, so a build can start its own daemon",
+          BUILDKIT_IMAGE
         )
       );
     } catch (error) {
       checks.push(
         buildCheck(
           "buildkit",
-          "BuildKit daemon",
+          "BuildKit image",
           "fail",
-          error instanceof Error ? error.message : "BuildKit daemon is unavailable",
-          BUILDKIT_ADDRESS
+          error instanceof Error ? error.message : "BuildKit image is unavailable",
+          BUILDKIT_IMAGE
         )
       );
     }
@@ -1039,10 +1061,10 @@ async function collectValidationSnapshot(
     checks.push(
       buildCheck(
         "buildkit",
-        "BuildKit daemon",
+        "BuildKit image",
         "fail",
         "Docker Engine is unavailable, so BuildKit cannot be reconciled",
-        BUILDKIT_ADDRESS
+        BUILDKIT_IMAGE
       )
     );
     if (config.imageStoreMode === "local-registry") {
@@ -1335,6 +1357,7 @@ export class ApiRequestError extends Error {
   public readonly status: number;
   public readonly method: string;
   public readonly pathName: string;
+  public readonly responseBody: string;
 
   constructor(input: {
     method: string;
@@ -1347,6 +1370,7 @@ export class ApiRequestError extends Error {
     this.status = input.status;
     this.method = input.method;
     this.pathName = input.pathName;
+    this.responseBody = input.message;
   }
 }
 
@@ -1355,6 +1379,33 @@ export function shouldStopRetryingAgentWorkMutation(error: unknown): boolean {
     error instanceof ApiRequestError &&
     (error.status === 404 || error.status === 409 || error.status === 422)
   );
+}
+
+/**
+ * A 422 means the control plane refused the *content* of this result and always will: the lease is
+ * still ours and a retry reproduces the same rejection. It is the one non-retryable status that
+ * leaves work behind on the server, so it is handled apart from 404/409 (lease genuinely gone).
+ */
+export function isAgentWorkResultRejected(error: unknown): boolean {
+  return error instanceof ApiRequestError && error.status === 422;
+}
+
+export function readApiRequestErrorMessage(error: unknown, fallback: string): string {
+  if (!(error instanceof ApiRequestError)) {
+    return fallback;
+  }
+  try {
+    const parsed: unknown = JSON.parse(error.responseBody);
+    if (typeof parsed === "object" && parsed !== null && "message" in parsed) {
+      const message = (parsed as { message: unknown }).message;
+      if (typeof message === "string" && message.trim().length > 0) {
+        return message.trim();
+      }
+    }
+  } catch {
+    // Not a JSON error envelope; fall through to the raw body.
+  }
+  return error.responseBody.trim() || fallback;
 }
 
 export interface AgentWorkFailureReport {
@@ -1403,6 +1454,106 @@ export class AgentWorkResultRedactionConflictError extends Error {
     super("Agent work result conflicts with protected environment material");
     this.name = "AgentWorkResultRedactionConflictError";
   }
+}
+
+/**
+ * Work kinds that start a container before reporting. When such a result cannot be delivered the
+ * container is orphaned: nothing on the control plane knows it exists, and the retry starts another
+ * one beside it. These are the kinds whose result is rolled back before the failure is reported.
+ */
+const CONTAINER_STARTING_WORK_KINDS = new Set<string>([
+  "deploy_app",
+  "deploy_worker",
+  "redeploy_app",
+  "redeploy_worker",
+  "rollback_app",
+  "rollback_worker",
+  "scale_worker",
+]);
+
+const RESULT_CONTAINER_IDENTIFIER_KEYS = new Set([
+  "activeContainerName",
+  "candidateContainerName",
+  "containerId",
+  "containerName",
+]);
+
+const MAX_RESULT_CONTAINER_SCAN_DEPTH = 6;
+
+function collectResultContainerIdentifiers(
+  value: unknown,
+  identifiers: Set<string>,
+  depth = 0
+): void {
+  if (depth > MAX_RESULT_CONTAINER_SCAN_DEPTH || value === null || typeof value !== "object") {
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      collectResultContainerIdentifiers(entry, identifiers, depth + 1);
+    }
+    return;
+  }
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (RESULT_CONTAINER_IDENTIFIER_KEYS.has(key) && typeof entry === "string") {
+      const identifier = entry.trim();
+      if (identifier.length > 0) {
+        identifiers.add(identifier);
+      }
+      continue;
+    }
+    collectResultContainerIdentifiers(entry, identifiers, depth + 1);
+  }
+}
+
+/**
+ * Removes the containers a work item started when its result will never be accepted — either the
+ * agent's own sanitizer refused to ship it, or the control plane rejected it with a 422. Containers
+ * the payload already described are left alone: those were running before this attempt, and the
+ * service keeps serving from them.
+ */
+export async function rollbackUnreportableWorkResult(
+  docker: Pick<DockerApiClient, "removeContainer">,
+  input: {
+    kind: string;
+    workItemId: string;
+    payload: Record<string, unknown>;
+    result: Record<string, unknown> | null | undefined;
+  }
+): Promise<string[]> {
+  if (!CONTAINER_STARTING_WORK_KINDS.has(input.kind) || !input.result) {
+    return [];
+  }
+
+  const started = new Set<string>();
+  collectResultContainerIdentifiers(input.result, started);
+  const preexisting = new Set<string>();
+  collectResultContainerIdentifiers(input.payload.runtimeMetadata, preexisting);
+
+  const removed: string[] = [];
+  for (const identifier of started) {
+    if (preexisting.has(identifier)) {
+      continue;
+    }
+    try {
+      await docker.removeContainer(identifier, true);
+      removed.push(identifier);
+    } catch (error) {
+      console.error(
+        `[nouva-agent] failed to remove container ${identifier} after work ${input.workItemId} ` +
+          "produced an unreportable result:",
+        error
+      );
+    }
+  }
+
+  if (removed.length > 0) {
+    console.warn(
+      `[nouva-agent] work ${input.workItemId} produced a result the control plane cannot accept; ` +
+        `removed ${removed.join(", ")}`
+    );
+  }
+  return removed;
 }
 
 function normalizeAgentProtocolValueForConflictCheck(
@@ -1860,6 +2011,16 @@ function buildScopedBuildkitContainerName(deploymentId: string): string {
   return `nouva-buildkitd-${suffix}`;
 }
 
+/**
+ * Keyed by service, not by deployment: consecutive pushes of the same service reuse the cache,
+ * while two services building at once never share a BuildKit state directory.
+ */
+export function buildBuildkitCacheVolumeName(serviceId: string): string {
+  const sanitized = serviceId.toLowerCase().replace(/[^a-z0-9_.-]+/g, "-");
+  const suffix = sanitized.slice(0, 32) || "shared";
+  return `${BUILDKIT_CACHE_VOLUME_PREFIX}${suffix}`;
+}
+
 function createBuildkitAddress(port: number): string {
   return `tcp://127.0.0.1:${port}`;
 }
@@ -1931,14 +2092,25 @@ function buildBuildkitContainerSpec(options: {
   resourceLimits: EffectiveServiceResourceLimits;
   restartPolicyName: "no" | "unless-stopped";
   deploymentId?: string | null;
+  serviceId?: string | null;
+  cacheVolumeName?: string | null;
 }): DockerContainerSpec {
   return {
     name: options.name,
     image: BUILDKIT_IMAGE,
-    cmd: ["--addr", `tcp://0.0.0.0:${options.port}`],
+    cmd: [
+      "--addr",
+      `tcp://0.0.0.0:${options.port}`,
+      // A persistent state directory has to be bounded, or the cache that makes builds fast fills
+      // the customer's disk instead (#184).
+      "--oci-worker-gc",
+      "--oci-worker-gc-keepstorage",
+      BUILDKIT_GC_KEEP_STORAGE,
+    ],
     labels: buildLabels({
       kind: "buildkit",
       deploymentId: options.deploymentId ?? null,
+      serviceId: options.serviceId ?? null,
     }),
     hostConfig: {
       Privileged: true,
@@ -1946,6 +2118,9 @@ function buildBuildkitContainerSpec(options: {
       RestartPolicy: {
         Name: options.restartPolicyName,
       },
+      ...(options.cacheVolumeName
+        ? { Binds: [`${options.cacheVolumeName}:${BUILDKIT_STATE_PATH}`] }
+        : {}),
       ...toDockerResourceSettings(options.resourceLimits),
     },
   };
@@ -1966,23 +2141,22 @@ function getBuildkitResourceLimits(): EffectiveServiceResourceLimits {
   };
 }
 
-async function ensureSharedBuildkitRuntime(
-  docker: Pick<DockerApiClient, "ensureContainer" | "inspectContainer" | "removeContainer">
+/**
+ * Every build runs against its own scoped daemon, because a daemon has to carry the deploying
+ * service's resource limits and the control plane always sends them. The long-lived
+ * `nouva-buildkitd` container therefore never built anything — it sat at 0% CPU holding a cache
+ * nothing read (#184). What is worth doing up front is having the image on disk, so the first build
+ * of a fresh server does not pay for the pull, and so a Docker or registry problem surfaces during
+ * validation rather than mid-deploy.
+ */
+async function ensureBuildkitImage(
+  docker: Pick<DockerApiClient, "pullImage" | "inspectContainer" | "removeContainer">
 ): Promise<void> {
-  const existingBuildkit = await docker.inspectContainer(BUILDKIT_CONTAINER_NAME);
-  if (existingBuildkit?.HostConfig?.NetworkMode !== "host") {
+  if (await docker.inspectContainer(BUILDKIT_CONTAINER_NAME)) {
     await docker.removeContainer(BUILDKIT_CONTAINER_NAME, true);
   }
 
-  await docker.ensureContainer({
-    ...buildBuildkitContainerSpec({
-      name: BUILDKIT_CONTAINER_NAME,
-      port: resolveBuildkitPort(BUILDKIT_ADDRESS),
-      resourceLimits: getBuildkitResourceLimits(),
-      restartPolicyName: "unless-stopped",
-    }),
-  });
-  await waitForBuildkitAvailability(BUILDKIT_ADDRESS);
+  await docker.pullImage(BUILDKIT_IMAGE);
 }
 
 async function ensureLocalRegistryRuntime(
@@ -2019,17 +2193,25 @@ export interface PreparedAppBuildkitRuntime {
 }
 
 export async function prepareAppBuildkitRuntime(
-  docker: Pick<DockerApiClient, "ensureContainer" | "removeContainer">,
-  payload: Pick<AppDeployPayload, "deploymentId" | "resourceLimits">,
+  docker: Pick<DockerApiClient, "ensureContainer" | "removeContainer" | "createVolume">,
+  payload: Pick<AppDeployPayload, "deploymentId" | "resourceLimits" | "serviceId">,
   options: {
-    sharedAddress?: string;
     allocatePort?: () => Promise<number>;
     waitUntilReady?: (address: string) => Promise<void>;
   } = {}
 ): Promise<PreparedAppBuildkitRuntime> {
   const port = await (options.allocatePort ?? allocateAvailableLocalPort)();
   const containerName = buildScopedBuildkitContainerName(payload.deploymentId);
+  const cacheVolumeName = buildBuildkitCacheVolumeName(payload.serviceId);
   const address = createBuildkitAddress(port);
+
+  // The cache outlives the container that fills it, so it is a named volume the container-scoped
+  // sweep below cannot touch. It is deliberately not labelled `nouva.volume.id`: it is agent
+  // infrastructure, not a customer volume, and must stay out of the storage allowance (#184).
+  await docker.createVolume(
+    cacheVolumeName,
+    buildLabels({ kind: "buildkit-cache", serviceId: payload.serviceId })
+  );
 
   try {
     await docker.ensureContainer(
@@ -2039,22 +2221,24 @@ export async function prepareAppBuildkitRuntime(
         resourceLimits: getBuildkitResourceLimits(),
         restartPolicyName: "no",
         deploymentId: payload.deploymentId,
+        serviceId: payload.serviceId,
+        cacheVolumeName,
       }),
       true
     );
     await (options.waitUntilReady ?? waitForBuildkitAvailability)(address);
   } catch (error) {
-    // This scoped BuildKit container is single-use, so its anonymous
-    // /var/lib/buildkit volume (declared by BUILDKIT_IMAGE) has no reuse
-    // value and must be swept alongside it, or it leaks on every build (#142).
-    await docker.removeContainer(containerName, true, undefined, true);
+    // The scoped container is single-use; any anonymous volume it picked up has no reuse value and
+    // must be swept alongside it, or it leaks on every build (#142). The named cache volume is not
+    // anonymous, so `docker rm -v` leaves it alone.
+    await docker.removeContainer(containerName, true);
     throw error;
   }
 
   return {
     address,
     cleanup: async () => {
-      await docker.removeContainer(containerName, true, undefined, true);
+      await docker.removeContainer(containerName, true);
     },
   };
 }
@@ -2281,7 +2465,7 @@ async function ensureBaseRuntime(
   config: AgentRuntimeConfig
 ): Promise<void> {
   await ensureTraefikRuntimeSerialized(docker, getTraefikRuntimeInput(config));
-  await ensureSharedBuildkitRuntime(docker);
+  await ensureBuildkitImage(docker);
   if (config.imageStoreMode === "local-registry") {
     await ensureLocalRegistryRuntime(docker, config);
   }
@@ -2861,7 +3045,8 @@ export async function deployAppImage(
 async function handleBuildAndDeployApp(
   docker: DockerApiClient,
   config: AgentRuntimeConfig,
-  payload: AppDeployPayload
+  payload: AppDeployPayload,
+  onBuildLog?: BuildLogEmitter
 ) {
   const dependencies = {
     ensureBaseRuntime,
@@ -2877,7 +3062,8 @@ async function handleBuildAndDeployApp(
       docker,
       config,
       payload,
-      buildkitRuntime.address
+      buildkitRuntime.address,
+      onBuildLog
     );
   } finally {
     await buildkitRuntime.cleanup();
@@ -2907,7 +3093,8 @@ function getWorkerRuntimeEnvironment(config: AgentRuntimeConfig) {
 async function handleBuildAndDeployWorker(
   docker: DockerApiClient,
   config: AgentRuntimeConfig,
-  payload: WorkerDeployPayload
+  payload: WorkerDeployPayload,
+  onBuildLog?: BuildLogEmitter
 ) {
   const requestedBuildType = payload.appBuildType as string | null | undefined;
   if (requestedBuildType === "static") {
@@ -2932,6 +3119,7 @@ async function handleBuildAndDeployWorker(
       buildkitAddress: buildkitRuntime.address,
       appBuildType: payload.appBuildType ?? null,
       appBuildConfig: payload.appBuildConfig ?? null,
+      ...(onBuildLog ? { onBuildLog } : {}),
     });
     const result = await deployWorkerRuntime(docker, getWorkerRuntimeEnvironment(config), {
       ...payload,
@@ -4201,6 +4389,10 @@ async function handleRemove(
 }
 
 export async function handleDeleteService(docker: DockerApiClient, payload: RemoveServicePayload) {
+  // The build cache outlives any single deployment, so nothing else reclaims it when the service
+  // it belongs to goes away (#184). Removing a volume that was never created is a no-op.
+  await docker.removeVolume(buildBuildkitCacheVolumeName(payload.serviceId), true);
+
   if (payload.serviceType === "worker") {
     return await removeWorkerServiceRuntime(docker, {
       serviceId: payload.serviceId,
@@ -4345,6 +4537,46 @@ async function handleUpdateAgent(
   };
 }
 
+const BUILD_LOG_WORK_KINDS = new Set<string>([
+  "deploy_app",
+  "redeploy_app",
+  "deploy_worker",
+  "redeploy_worker",
+]);
+
+/**
+ * Build logs are the only window a customer has into a failed build (#181), so they are shipped
+ * independently of the work item's own reporting: a build whose lease was lost or whose result was
+ * rejected still leaves its output behind.
+ */
+function createWorkItemBuildLogPublisher(
+  credentials: StoredCredentials,
+  workItem: AgentWorkRecord,
+  payload: Record<string, unknown>
+): BuildLogPublisher | null {
+  if (!BUILD_LOG_WORK_KINDS.has(workItem.kind)) {
+    return null;
+  }
+
+  const deploymentId = typeof payload.deploymentId === "string" ? payload.deploymentId : "";
+  if (deploymentId.length === 0) {
+    return null;
+  }
+
+  return createBuildLogPublisher({
+    deploymentId,
+    send: (batch) =>
+      apiRequest<AgentBuildLogsResponse>("/api/agent/logs/build", {
+        method: "POST",
+        token: credentials.agentToken,
+        body: { serverId: SERVER_ID!, logs: [batch] } satisfies AgentBuildLogsRequest,
+      }),
+    onSendError: (error) => {
+      console.error(`[nouva-agent] failed to ship build logs for work ${workItem.id}:`, error);
+    },
+  });
+}
+
 async function processWorkItem(
   docker: DockerApiClient,
   config: AgentRuntimeConfig,
@@ -4375,6 +4607,7 @@ async function processWorkItem(
 
   const payload = toObject(workItem.payload);
   const operationalValues = collectAgentWorkPayloadOperationalValues(payload);
+  const buildLogPublisher = createWorkItemBuildLogPublisher(credentials, workItem, payload);
 
   let result: Record<string, unknown> | undefined;
   let failureResult: Record<string, unknown> | undefined;
@@ -4388,7 +4621,8 @@ async function processWorkItem(
         result = await handleBuildAndDeployApp(
           docker,
           config,
-          payload as unknown as AppDeployPayload
+          payload as unknown as AppDeployPayload,
+          buildLogPublisher?.emit
         );
         break;
       case "rollback_app":
@@ -4399,7 +4633,8 @@ async function processWorkItem(
         result = await handleBuildAndDeployWorker(
           docker,
           config,
-          payload as unknown as WorkerDeployPayload
+          payload as unknown as WorkerDeployPayload,
+          buildLogPublisher?.emit
         );
         break;
       case "rollback_worker":
@@ -4582,12 +4817,28 @@ async function processWorkItem(
     await leaseRenewal.stop();
   }
 
+  if (buildLogPublisher) {
+    buildLogPublisher.emit({
+      type: "exit",
+      timestamp: Date.now(),
+      success: workError === null,
+      exitCode: workError === null ? 0 : 1,
+      message: workError
+        ? redactSensitiveText(workError.message, toRecord(payload.envVars), operationalValues)
+        : "Deployment finished",
+    });
+    await buildLogPublisher.close();
+  }
+
   if (leaseRenewal.leaseLost()) {
+    // The work is finished either way, and the control plane now accepts a terminal report from a
+    // lease nothing else has claimed (#186). Report it and let the control plane decide: if the
+    // lease is genuinely gone the report answers 409 and the branches below drop it, which costs
+    // one request instead of discarding a build that has already run to completion.
     console.warn(
-      `[nouva-agent] work ${workItem.id} finished locally after its lease was superseded; ` +
-        "skipping the stale terminal report"
+      `[nouva-agent] work ${workItem.id} finished locally after a lease renewal failed; ` +
+        "reporting anyway"
     );
-    return;
   }
 
   if (workError) {
@@ -4621,13 +4872,13 @@ async function processWorkItem(
     return;
   }
 
-  let sanitizedResult: Record<string, unknown> | null;
-  try {
-    sanitizedResult = sanitizeAgentWorkResult(result, toRecord(payload.envVars), operationalValues);
-  } catch (error) {
-    if (!(error instanceof AgentWorkResultRedactionConflictError)) {
-      throw error;
-    }
+  const reportUnreportableResult = async (errorMessage: string): Promise<void> => {
+    await rollbackUnreportableWorkResult(docker, {
+      kind: workItem.kind,
+      workItemId: workItem.id,
+      payload,
+      result,
+    });
     try {
       await apiRequest(`/api/agent/work/${workItem.id}/fail`, {
         method: "POST",
@@ -4636,7 +4887,7 @@ async function processWorkItem(
           serverId: SERVER_ID!,
           leaseId: workItem.leaseId,
           result: null,
-          errorMessage: error.message,
+          errorMessage,
         },
       });
     } catch (reportError) {
@@ -4647,6 +4898,16 @@ async function processWorkItem(
         );
       }
     }
+  };
+
+  let sanitizedResult: Record<string, unknown> | null;
+  try {
+    sanitizedResult = sanitizeAgentWorkResult(result, toRecord(payload.envVars), operationalValues);
+  } catch (error) {
+    if (!(error instanceof AgentWorkResultRedactionConflictError)) {
+      throw error;
+    }
+    await reportUnreportableResult(error.message);
     return;
   }
 
@@ -4662,6 +4923,15 @@ async function processWorkItem(
     });
     console.log(`[nouva-agent] work ${workItem.id} (${workItem.kind}) completed`);
   } catch (reportErr) {
+    if (isAgentWorkResultRejected(reportErr)) {
+      // The lease is still ours; the control plane refused the content of this result and will
+      // refuse it again. Retrying would leave a second container behind and end in the same silent
+      // failure, so tear this attempt down and report why it failed (#122, #187).
+      await reportUnreportableResult(
+        readApiRequestErrorMessage(reportErr, "Agent work result was rejected by the control plane")
+      );
+      return;
+    }
     if (shouldStopRetryingAgentWorkMutation(reportErr)) {
       console.warn(
         `[nouva-agent] completion report for work ${workItem.id} was already superseded:`,
