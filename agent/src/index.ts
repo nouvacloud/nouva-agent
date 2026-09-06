@@ -2044,14 +2044,17 @@ export async function prepareAppBuildkitRuntime(
     );
     await (options.waitUntilReady ?? waitForBuildkitAvailability)(address);
   } catch (error) {
-    await docker.removeContainer(containerName, true);
+    // This scoped BuildKit container is single-use, so its anonymous
+    // /var/lib/buildkit volume (declared by BUILDKIT_IMAGE) has no reuse
+    // value and must be swept alongside it, or it leaks on every build (#142).
+    await docker.removeContainer(containerName, true, undefined, true);
     throw error;
   }
 
   return {
     address,
     cleanup: async () => {
-      await docker.removeContainer(containerName, true);
+      await docker.removeContainer(containerName, true, undefined, true);
     },
   };
 }
@@ -2322,7 +2325,13 @@ export function buildAppContainerSpec(
     spec: {
       name: containerName,
       image: payload.imageUrl,
-      env: Object.entries(payload.envVars).map(([key, value]) => `${key}=${value}`),
+      // Always pin PORT to the value the agent resolved and will probe/route to (#152) — otherwise
+      // a build (e.g. a Railpack static/Vite app) that never sets PORT falls back to its own
+      // runtime default, which can differ from resolveAppPort's fallback and the app never
+      // becomes reachable on the port the agent thinks it's listening on.
+      env: Object.entries({ ...payload.envVars, PORT: String(appPort) }).map(
+        ([key, value]) => `${key}=${value}`
+      ),
       labels: buildLabels({
         kind: "app",
         projectId: payload.projectId,

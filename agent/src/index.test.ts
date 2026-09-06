@@ -1008,7 +1008,12 @@ describe("prepareAppBuildkitRuntime", () => {
 
     await runtime.cleanup();
 
-    expect(docker.removeContainer).toHaveBeenCalledWith("nouva-buildkitd-dep_1", true);
+    expect(docker.removeContainer).toHaveBeenCalledWith(
+      "nouva-buildkitd-dep_1",
+      true,
+      undefined,
+      true
+    );
   });
 
   test("creates a scoped BuildKit worker when legacy payload limits are null", async () => {
@@ -1034,7 +1039,42 @@ describe("prepareAppBuildkitRuntime", () => {
 
     await runtime.cleanup();
 
-    expect(docker.removeContainer).toHaveBeenCalledWith("nouva-buildkitd-dep_1", true);
+    expect(docker.removeContainer).toHaveBeenCalledWith(
+      "nouva-buildkitd-dep_1",
+      true,
+      undefined,
+      true
+    );
+  });
+
+  test("removes the container's anonymous BuildKit volume when a build fails to become ready", async () => {
+    const docker = {
+      ensureContainer: mock(async () => "buildkit_1"),
+      removeContainer: mock(async () => {}),
+    };
+
+    await expect(
+      prepareAppBuildkitRuntime(
+        docker as never,
+        {
+          deploymentId: "dep_1",
+          resourceLimits,
+        },
+        {
+          allocatePort: async () => 4569,
+          waitUntilReady: async () => {
+            throw new Error("buildkit never became ready");
+          },
+        }
+      )
+    ).rejects.toThrow("buildkit never became ready");
+
+    expect(docker.removeContainer).toHaveBeenCalledWith(
+      "nouva-buildkitd-dep_1",
+      true,
+      undefined,
+      true
+    );
   });
 });
 
@@ -1095,6 +1135,36 @@ describe("buildAppContainerSpec", () => {
         "nouva.redaction.context.version": "hmac-sha256:redaction-context:v1:deployment",
       })
     );
+  });
+
+  test("injects the resolved PORT so the container listens on what the agent will probe (#152)", () => {
+    const spec = buildAppContainerSpec(runtimeConfig, appRuntimePayload);
+
+    expect(spec.appPort).toBe(8080);
+    expect(spec.spec.env).toContain("PORT=8080");
+  });
+
+  test("falls back to the default port and still injects it when no PORT is set anywhere", () => {
+    const spec = buildAppContainerSpec(runtimeConfig, {
+      ...appRuntimePayload,
+      envVars: {},
+      internalPort: null,
+    });
+
+    expect(spec.appPort).toBe(3000);
+    expect(spec.spec.env).toContain("PORT=3000");
+  });
+
+  test("overrides an invalid user-provided PORT with the resolved fallback", () => {
+    const spec = buildAppContainerSpec(runtimeConfig, {
+      ...appRuntimePayload,
+      envVars: { PORT: "not-a-port" },
+      internalPort: null,
+    });
+
+    expect(spec.appPort).toBe(3000);
+    expect(spec.spec.env).toContain("PORT=3000");
+    expect(spec.spec.env).not.toContain("PORT=not-a-port");
   });
 });
 

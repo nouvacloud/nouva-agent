@@ -691,11 +691,16 @@ export class DockerApiClient {
     }
   }
 
-  async removeContainer(nameOrId: string, force = false, timeoutMs?: number): Promise<void> {
+  async removeContainer(
+    nameOrId: string,
+    force = false,
+    timeoutMs?: number,
+    removeVolumes = false
+  ): Promise<void> {
     try {
       await this.request(
         "DELETE",
-        `/containers/${encodeURIComponent(nameOrId)}?force=${force}`,
+        `/containers/${encodeURIComponent(nameOrId)}?force=${force}${removeVolumes ? "&v=true" : ""}`,
         null,
         timeoutMs
       );

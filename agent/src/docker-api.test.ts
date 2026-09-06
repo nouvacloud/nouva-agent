@@ -372,6 +372,22 @@ describe("DockerApiClient cleanup semantics", () => {
     requestSpy.mockRestore();
   });
 
+  test("removes anonymous volumes only when explicitly requested", async () => {
+    const DockerApiClientCtor = DockerApiClient as unknown as {
+      new (apiVersion: string): DockerApiClient;
+    };
+    const client = new DockerApiClientCtor("v1.51");
+    const requestSpy = spyOn(client, "request").mockResolvedValue("");
+
+    await client.removeContainer("nouva-buildkitd-dep_1", true, undefined, true);
+
+    expect(requestSpy.mock.calls).toEqual([
+      ["DELETE", "/containers/nouva-buildkitd-dep_1?force=true&v=true", null, undefined],
+    ]);
+
+    requestSpy.mockRestore();
+  });
+
   test("propagates permission, conflict, daemon, and transport mutation failures", async () => {
     const DockerApiClientCtor = DockerApiClient as unknown as {
       new (apiVersion: string): DockerApiClient;
