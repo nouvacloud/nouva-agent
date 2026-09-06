@@ -6,6 +6,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { AGENT_VOLUME_METRICS_INTERVAL_MS } from "@repo/runtime/agent-metrics";
 import { collectAgentWorkPayloadOperationalValues } from "@repo/runtime/logging";
+import { calculateBuildReserve } from "@repo/runtime/server-capacity";
 import agentPackageJson from "../package.json" with { type: "json" };
 import {
   type AlloyRuntimeInput,
@@ -2126,16 +2127,22 @@ function buildBuildkitContainerSpec(options: {
   };
 }
 
+/**
+ * Resource limits for a scoped BuildKit daemon.
+ *
+ * These come from the control plane's build reserve policy rather than a second set of constants
+ * here: the agent used to grant BuildKit a 1 GiB floor against a 256 MiB reserve, so on a 2 GB host
+ * the control plane offered memory a builder could already claim (#182).
+ */
 function getBuildkitResourceLimits(): EffectiveServiceResourceLimits {
-  const cpuMillicores = Math.min(2000, Math.max(500, Math.floor(os.cpus().length * 1000 * 0.15)));
-  const memoryBytes = Math.min(
-    2 * 1024 * 1024 * 1024,
-    Math.max(1024 * 1024 * 1024, Math.floor(os.totalmem() * 0.15))
-  );
+  const reserve = calculateBuildReserve({
+    cpuMillicores: os.cpus().length * 1000,
+    memoryBytes: os.totalmem(),
+  });
 
   return {
-    cpuMillicores,
-    memoryBytes,
+    cpuMillicores: reserve.cpuMillicores,
+    memoryBytes: reserve.memoryBytes,
     pidsLimit: 512,
     policyVersion: 1,
   };
