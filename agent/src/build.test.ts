@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdir, mkdtemp, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import {
   BuildctlExecutionError,
   buildDockerfileBuildctlArgs,
@@ -7,6 +10,7 @@ import {
   buildStaticRuntimeDockerfile,
   detectDockerfileExposedPort,
   normalizeAppBuildSettings,
+  stripRepositoryGitMetadata,
   toSafeBuildctlExecutionError,
 } from "./build.js";
 
@@ -175,5 +179,73 @@ describe("build helpers", () => {
         EXPOSE 3000
       `)
     ).toBe(3000);
+  });
+});
+
+// #163: railpack hands the checkout to buildctl as `--local context=`, so anything left in the
+// working tree lands in `/app`. The image used to ship the full history and the remote URL with it.
+describe("stripRepositoryGitMetadata", () => {
+  async function withTempRepo(run: (repoDir: string) => Promise<void>) {
+    const repoDir = await mkdtemp(path.join(os.tmpdir(), "nouva-strip-git-"));
+    try {
+      await run(repoDir);
+    } finally {
+      await rm(repoDir, { recursive: true, force: true });
+    }
+  }
+
+  test("removes a .git directory and leaves the rest of the tree", async () => {
+    await withTempRepo(async (repoDir) => {
+      await mkdir(path.join(repoDir, ".git", "refs"), { recursive: true });
+      await writeFile(path.join(repoDir, ".git", "config"), '[remote "origin"]\n');
+      await mkdir(path.join(repoDir, "src"), { recursive: true });
+      await writeFile(path.join(repoDir, "src", "index.ts"), "export {};\n");
+      await writeFile(path.join(repoDir, ".gitignore"), "node_modules\n");
+
+      await stripRepositoryGitMetadata(repoDir);
+
+      expect((await readdir(repoDir)).sort()).toEqual([".gitignore", "src"]);
+    });
+  });
+
+  // A worktree or submodule checkout has `.git` as a file holding a `gitdir:` pointer, not a
+  // directory, and that pointer is just as unwanted in the image.
+  test("removes a .git file", async () => {
+    await withTempRepo(async (repoDir) => {
+      await writeFile(path.join(repoDir, ".git"), "gitdir: /var/lib/git/worktrees/app\n");
+
+      await stripRepositoryGitMetadata(repoDir);
+
+      expect(await readdir(repoDir)).toEqual([]);
+    });
+  });
+
+  // The shallow-clone fallback in `cloneRepository` deletes and re-clones, so a repo can reach the
+  // build with no `.git` at all. That must not fail the build.
+  test("is a no-op when there is nothing to remove", async () => {
+    await withTempRepo(async (repoDir) => {
+      await writeFile(path.join(repoDir, "README.md"), "# app\n");
+
+      await stripRepositoryGitMetadata(repoDir);
+
+      expect(await readdir(repoDir)).toEqual(["README.md"]);
+    });
+  });
+
+  // Removal must not follow a symlink out of the checkout: a repo can commit `.git` as a symlink,
+  // and `rm -r` on the link itself must unlink it rather than delete the target's contents.
+  test("unlinks a symlinked .git without touching the target", async () => {
+    await withTempRepo(async (repoDir) => {
+      const outside = path.join(repoDir, "outside");
+      await mkdir(outside, { recursive: true });
+      await writeFile(path.join(outside, "keep.txt"), "keep\n");
+      await mkdir(path.join(repoDir, "checkout"), { recursive: true });
+      await symlink(outside, path.join(repoDir, "checkout", ".git"), "dir");
+
+      await stripRepositoryGitMetadata(path.join(repoDir, "checkout"));
+
+      expect(await readdir(path.join(repoDir, "checkout"))).toEqual([]);
+      expect(await readdir(outside)).toEqual(["keep.txt"]);
+    });
   });
 });

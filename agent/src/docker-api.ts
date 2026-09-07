@@ -573,6 +573,23 @@ export class DockerApiClient {
     }
   }
 
+  /**
+   * Delete a network, tolerating one that is already gone.
+   *
+   * A 404 means the desired end state already holds, so it is not an error — same reasoning as
+   * `removeVolume`. A 403 is not swallowed here: Docker returns it when containers are still
+   * attached, and silently reporting success would leave the network behind.
+   */
+  async removeNetwork(name: string): Promise<void> {
+    try {
+      await this.request("DELETE", `/networks/${encodeURIComponent(name)}`);
+    } catch (error) {
+      if (!(error instanceof DockerApiError && error.status === 404)) {
+        throw error;
+      }
+    }
+  }
+
   async ensureNetwork(name: string, labels: Record<string, string> = {}): Promise<void> {
     const networks = await this.listNetworks();
     if (networks.some((network) => network.Name === name)) {

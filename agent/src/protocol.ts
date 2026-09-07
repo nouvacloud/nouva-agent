@@ -42,6 +42,7 @@ export const AGENT_WORK_KINDS = [
   "restart_database",
   "delete_service",
   "delete_volume",
+  "delete_project",
   "wipe_volume",
   "create_volume_backup",
   "delete_volume_backup",
@@ -65,6 +66,11 @@ export type AgentCleanupProof =
       version: 1;
       kind: "delete_volume";
       volume: { name: string; absent: true };
+    }
+  | {
+      version: 1;
+      kind: "delete_project";
+      network: { name: string; absent: true };
     }
   | {
       version: 1;
@@ -648,6 +654,11 @@ export interface DeleteVolumePayload {
   volumeName: string;
 }
 
+export interface DeleteProjectPayload {
+  [key: string]: unknown;
+  projectId: string;
+}
+
 export interface PlatformBackupDestinationMetadata {
   [key: string]: unknown;
   id: string;
@@ -867,6 +878,7 @@ export function getDefaultAgentCapabilities(): AgentCapabilities {
     cleanupProofV1: true,
     resourceIsolationV1: true,
     projectNetworkIsolationV1: true,
+    projectNetworkReapV1: true,
     appVolumeRolloutV1: true,
     publicPortPreflightV1: true,
     backupIntegrityV1: true,

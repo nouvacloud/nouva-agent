@@ -60,6 +60,7 @@ import {
   type CreateVolumeBackupPayload,
   type DatabaseProvisionPayload,
   DEFAULT_AGENT_LEASE_TTL_SECONDS,
+  type DeleteProjectPayload,
   type DeleteVolumeBackupPayload,
   type DeleteVolumePayload,
   type DeployOnlyPayload,
@@ -528,6 +529,15 @@ async function verifyVolumeAbsent(
 ): Promise<void> {
   if (await docker.inspectVolume(volumeName)) {
     throw new Error(`Docker volume ${volumeName} still exists after cleanup`);
+  }
+}
+
+async function verifyNetworkAbsent(
+  docker: Pick<DockerApiClient, "inspectNetwork">,
+  networkName: string
+): Promise<void> {
+  if (await docker.inspectNetwork(networkName)) {
+    throw new Error(`Docker network ${networkName} still exists after cleanup`);
   }
 }
 
@@ -3451,6 +3461,35 @@ export async function handleDeleteVolume(docker: DockerApiClient, payload: Delet
   };
 }
 
+/**
+ * Remove the per-project Docker network left behind when the last service in a project is deleted.
+ *
+ * The control plane only queues this once the project holds no services, volumes or buckets, so the
+ * only endpoint still attached is Traefik, which every project network gets connected to on the
+ * first app deploy. Docker refuses to delete a network with endpoints attached, so Traefik is
+ * disconnected first; `disconnectNetwork` already tolerates the network or the container being
+ * gone.
+ *
+ * The name is derived here rather than taken from the payload so it is produced by the same
+ * function that created the network (`buildProjectNetwork`), which is the only definition of it.
+ */
+export async function handleDeleteProject(docker: DockerApiClient, payload: DeleteProjectPayload) {
+  const networkName = buildProjectNetwork(payload.projectId);
+
+  await docker.disconnectNetwork(networkName, TRAEFIK_CONTAINER_NAME, true);
+  await docker.removeNetwork(networkName);
+  await verifyNetworkAbsent(docker, networkName);
+
+  return {
+    networkName,
+    cleanupProof: {
+      version: 1,
+      kind: "delete_project",
+      network: { name: networkName, absent: true },
+    } satisfies AgentCleanupProof,
+  };
+}
+
 export async function handleWipeVolume(
   docker: DockerApiClient,
   config: Pick<AgentRuntimeConfig, "privateRegistry">,
@@ -4723,6 +4762,9 @@ async function processWorkItem(
         break;
       case "delete_volume":
         result = await handleDeleteVolume(docker, payload as unknown as DeleteVolumePayload);
+        break;
+      case "delete_project":
+        result = await handleDeleteProject(docker, payload as unknown as DeleteProjectPayload);
         break;
       case "wipe_volume":
         result = await handleWipeVolume(

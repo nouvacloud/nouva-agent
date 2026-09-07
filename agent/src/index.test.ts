@@ -5,6 +5,7 @@ import { collectAgentWorkPayloadOperationalValues } from "@repo/runtime/logging"
 import agentPackageJson from "../package.json" with { type: "json" };
 import type { DeployAppImageInput } from "./app-build-runtime.js";
 import { buildAndDeployAppWithDependencies } from "./app-build-runtime.js";
+import { hashProjectNetwork } from "./build.js";
 import { DockerApiError } from "./docker-api.js";
 import {
   ApiRequestError,
@@ -17,6 +18,7 @@ import {
   handleApplyDatabaseVolume,
   handleCreateVolumeBackup,
   handleDatabaseProvision,
+  handleDeleteProject,
   handleDeleteService,
   handleDeleteVolume,
   handleRestorePostgresPitr,
@@ -365,6 +367,9 @@ function createDockerMock() {
     createVolume: mock(async () => {}),
     ensureContainer: mock(async () => "ctr_1"),
     connectNetwork: mock(async () => {}),
+    disconnectNetwork: mock(async () => {}),
+    removeNetwork: mock(async () => {}),
+    inspectNetwork: mock(async () => null),
     inspectContainer: mock(async () => null),
     listContainersUsingVolume: mock(async () => []),
     inspectImage: mock(async () => ({ Id: "img_candidate" })),
@@ -2817,6 +2822,64 @@ describe("verified volume cleanup", () => {
       })
     ).rejects.toBe(conflict);
     expect(docker.inspectVolume).not.toHaveBeenCalled();
+  });
+});
+
+// #143: the per-project network was created on the first deploy and never removed, so every deleted
+// project left a `nouva-project-<hash>` behind on the customer's server for good.
+describe("verified project network cleanup", () => {
+  const PROJECT_NETWORK = `nouva-project-${hashProjectNetwork("proj_1")}`;
+
+  test("detaches Traefik, removes the network, and proves it is gone", async () => {
+    const docker = createDockerMock();
+
+    const result = await handleDeleteProject(docker as never, { projectId: "proj_1" });
+
+    expect(docker.disconnectNetwork).toHaveBeenCalledWith(PROJECT_NETWORK, "nouva-traefik", true);
+    expect(docker.removeNetwork).toHaveBeenCalledWith(PROJECT_NETWORK);
+    expect(docker.inspectNetwork).toHaveBeenCalledWith(PROJECT_NETWORK);
+    expect(result.cleanupProof).toEqual({
+      version: 1,
+      kind: "delete_project",
+      network: { name: PROJECT_NETWORK, absent: true },
+    });
+  });
+
+  // The name must come from the same derivation that created the network, not from the payload.
+  test("derives the network name from the project id", async () => {
+    const docker = createDockerMock();
+
+    const result = await handleDeleteProject(docker as never, { projectId: "proj_2" });
+
+    expect(result.networkName).toBe(`nouva-project-${hashProjectNetwork("proj_2")}`);
+    expect(result.networkName).not.toBe(PROJECT_NETWORK);
+  });
+
+  test("does not emit proof when Docker still reports the network", async () => {
+    const docker = createDockerMock();
+    docker.inspectNetwork.mockResolvedValueOnce({ Name: PROJECT_NETWORK });
+
+    await expect(handleDeleteProject(docker as never, { projectId: "proj_1" })).rejects.toThrow(
+      "still exists after cleanup"
+    );
+  });
+
+  // Docker refuses to delete a network that still has endpoints attached. Reporting that as success
+  // would leave the network behind with a proof saying it was removed.
+  test("propagates an endpoints-still-attached conflict without claiming absence", async () => {
+    const docker = createDockerMock();
+    const conflict = new DockerApiError(
+      403,
+      "DELETE",
+      `/v1.51/networks/${PROJECT_NETWORK}`,
+      "network has active endpoints"
+    );
+    docker.removeNetwork.mockRejectedValueOnce(conflict);
+
+    await expect(handleDeleteProject(docker as never, { projectId: "proj_1" })).rejects.toBe(
+      conflict
+    );
+    expect(docker.inspectNetwork).not.toHaveBeenCalled();
   });
 });
 

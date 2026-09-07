@@ -254,6 +254,21 @@ async function cloneRepository(
   }
 }
 
+/**
+ * Delete the checkout's git metadata before anything reads the tree as a build context.
+ *
+ * Every strategy hands a directory under `repoDir` to buildctl as `--local context=`, and railpack's
+ * generated plan copies that context wholesale into `/app`. Without this the shipped image carries
+ * the full history, the remote URL (including any credentials baked into it), the reflog and any
+ * hooks. Nothing downstream needs it: the commit being built is control-plane supplied via
+ * `payload.commitHash`, never read back out of `.git`.
+ *
+ * `.git` is a file rather than a directory in a worktree checkout, so this removes either.
+ */
+export async function stripRepositoryGitMetadata(repoDir: string): Promise<void> {
+  await rm(path.join(repoDir, ".git"), { recursive: true, force: true });
+}
+
 function inferBuildMetadata(info: Record<string, unknown>): {
   detectedLanguage: string | null;
   detectedFramework: string | null;
@@ -856,6 +871,8 @@ export async function buildApp(options: BuildAppOptions): Promise<BuildAppResult
   try {
     onBuildLog?.(buildProgressEntry("cloning", "Cloning the repository", 5));
     await cloneRepository(options.repoUrl, options.commitHash, repoDir, onBuildLog);
+    // After the last git command and before any directory under `repoDir` becomes a build context.
+    await stripRepositoryGitMetadata(repoDir);
     onBuildLog?.({
       type: "stdout",
       line: `[nouva] checked out ${options.commitHash}`,
