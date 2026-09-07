@@ -879,10 +879,10 @@ ${dockerRules.join("\n")}
     regex         = "traefik_service_requests_total"
   }
 
-  # A request counter belongs to a route, not to a container. Traefik is a system container and
-  # these are its metrics, so the series stays in the system scope exactly like the rest of
-  # Traefik's telemetry, and the routed service travels in a separate, non-authoritative label.
-  # Putting it in service_id instead would make an unowned series look like a service's own.
+  // A request counter belongs to a route, not to a container. Traefik is a system container and
+  // these are its metrics, so the series stays in the system scope exactly like the rest of
+  // Traefik's telemetry, and the routed service travels in a separate, non-authoritative label.
+  // Putting it in service_id instead would make an unowned series look like a service's own.
   rule {
     target_label = "organization_id"
     replacement  = ${organizationId}
@@ -953,8 +953,8 @@ ${dockerRules.join("\n")}
     replacement  = ${noneValue}
   }
 
-  # Route files are named by service id and the renderer names the load balancer svc-<serviceId>,
-  # so Traefik's own service label carries the id the dashboard queries by.
+  // Route files are named by service id and the renderer names the load balancer svc-<serviceId>,
+  // so Traefik's own service label carries the id the dashboard queries by.
   rule {
     source_labels = ["service"]
     target_label  = "ingress_service_id"
@@ -962,15 +962,15 @@ ${dockerRules.join("\n")}
     replacement   = "$1"
   }
 
-  # Traefik's api, dashboard and ping endpoints are @internal, never match the rule above, and
-  # keep the none placeholder. They are not a service's traffic, so they are not shipped.
+  // Traefik's api, dashboard and ping endpoints are @internal, never match the rule above, and
+  // keep the none placeholder. They are not a service's traffic, so they are not shipped.
   rule {
     source_labels = ["ingress_service_id"]
     action        = "drop"
     regex         = ${noneValue}
   }
 
-  # Traefik's own service label would otherwise reach Mimir as a second copy of the id.
+  // Traefik's own service label would otherwise reach Mimir as a second copy of the id.
   rule {
     action = "labeldrop"
     regex  = "instance|job|service"

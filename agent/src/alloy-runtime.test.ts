@@ -211,6 +211,32 @@ describe("alloy-runtime", () => {
   }`);
   });
 
+  test("comments the rendered config in Alloy syntax rather than shell syntax", async () => {
+    tempDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-alloy-"));
+
+    const staticConfig = renderAlloyStaticConfig(createAlloyInput(tempDir));
+    const dynamicConfig = renderAlloyDynamicConfig(createAlloyInput(tempDir));
+
+    // Alloy's parser rejects `#` outright ("illegal character U+0023"), and the whole config is
+    // one file: a single `#` comment invalidates every block, so `alloy validate` fails, the
+    // reconcile never swaps the container in and the collector silently keeps running the last
+    // good config. v0.4.30 shipped exactly that and the Traefik request scrape never started.
+    for (const [name, config] of [
+      ["static", staticConfig],
+      ["dynamic", dynamicConfig],
+    ] as const) {
+      const shellComments = config
+        .split("\n")
+        .filter((line) => /^\s*#/.test(line))
+        .map((line) => `${name}: ${line.trim()}`);
+      expect(shellComments).toEqual([]);
+    }
+
+    expect(staticConfig).toContain(
+      "  // Traefik's own service label would otherwise reach Mimir as a second copy of the id."
+    );
+  });
+
   test("renders bounded WAL delivery and v1 metadata-free remote write", async () => {
     tempDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-alloy-"));
 
