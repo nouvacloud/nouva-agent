@@ -19,6 +19,7 @@ import type {
 } from "./protocol.js";
 import { redactSensitiveText } from "./security.js";
 import { calculateDiskSafetyReserveBytes, formatStorageBytes } from "./storage-metrics.js";
+import { TRAEFIK_ADMIN_PORT, TRAEFIK_CONTAINER_NAME } from "./traefik-runtime.js";
 
 export const ALLOY_CONTAINER_NAME = "nouva-alloy";
 export const ALLOY_HTTP_HOST = "127.0.0.1";
@@ -122,6 +123,7 @@ type AlloyRuntimeDocker = Pick<
   | "containerLogs"
   | "createContainer"
   | "ensureContainer"
+  | "ensureNetwork"
   | "inspectContainer"
   | "inspectImage"
   | "pullImage"
@@ -860,6 +862,120 @@ ${dockerRules.join("\n")}
     regex  = "container_label_.*|instance|job|id|name|image|container"
   }
 }`,
+    // Traefik publishes request counters on its admin entrypoint, which is bound to the host
+    // loopback only. Alloy reaches it container-to-container over the ingress network instead,
+    // so nothing new is exposed on the host (#137).
+    `prometheus.scrape "nouva_traefik" {
+  targets         = [{ __address__ = ${quote(`${TRAEFIK_CONTAINER_NAME}:${TRAEFIK_ADMIN_PORT}`)} }]
+  scrape_interval = ${quote(`${scrapeIntervalSeconds}s`)}
+  forward_to      = [prometheus.relabel.nouva_traefik.receiver]
+}`,
+    `prometheus.relabel "nouva_traefik" {
+  forward_to = [prometheus.relabel.nouva_redaction_context.receiver]
+
+  rule {
+    source_labels = ["__name__"]
+    action        = "keep"
+    regex         = "traefik_service_requests_total"
+  }
+
+  # A request counter belongs to a route, not to a container. Traefik is a system container and
+  # these are its metrics, so the series stays in the system scope exactly like the rest of
+  # Traefik's telemetry, and the routed service travels in a separate, non-authoritative label.
+  # Putting it in service_id instead would make an unowned series look like a service's own.
+  rule {
+    target_label = "organization_id"
+    replacement  = ${organizationId}
+  }
+
+  rule {
+    target_label = "server_id"
+    replacement  = ${serverId}
+  }
+
+  rule {
+    target_label = "project_id"
+    replacement  = ${noneValue}
+  }
+
+  rule {
+    target_label = "service_id"
+    replacement  = ${noneValue}
+  }
+
+  rule {
+    target_label = "deployment_id"
+    replacement  = ${noneValue}
+  }
+
+  rule {
+    target_label = "environment_id"
+    replacement  = ${noneValue}
+  }
+
+  rule {
+    target_label = "replica_index"
+    replacement  = ${noneValue}
+  }
+
+  rule {
+    target_label = "schedule_id"
+    replacement  = ${noneValue}
+  }
+
+  rule {
+    target_label = "schedule_run_id"
+    replacement  = ${noneValue}
+  }
+
+  rule {
+    target_label = "service_type"
+    replacement  = "system"
+  }
+
+  rule {
+    target_label = "service_variant"
+    replacement  = "traefik"
+  }
+
+  rule {
+    target_label = "container_name"
+    replacement  = ${quote(TRAEFIK_CONTAINER_NAME)}
+  }
+
+  rule {
+    target_label = "runtime_kind"
+    replacement  = "traefik"
+  }
+
+  rule {
+    target_label = "ingress_service_id"
+    replacement  = ${noneValue}
+  }
+
+  # Route files are named by service id and the renderer names the load balancer svc-<serviceId>,
+  # so Traefik's own service label carries the id the dashboard queries by.
+  rule {
+    source_labels = ["service"]
+    target_label  = "ingress_service_id"
+    regex         = "svc-(.+)@file"
+    replacement   = "$1"
+  }
+
+  # Traefik's api, dashboard and ping endpoints are @internal, never match the rule above, and
+  # keep the none placeholder. They are not a service's traffic, so they are not shipped.
+  rule {
+    source_labels = ["ingress_service_id"]
+    action        = "drop"
+    regex         = ${noneValue}
+  }
+
+  # Traefik's own service label would otherwise reach Mimir as a second copy of the id.
+  rule {
+    action = "labeldrop"
+    regex  = "instance|job|service"
+  }
+}`,
     `prometheus.exporter.unix "nouva" {
   rootfs_path = ${quote("/rootfs")}
   procfs_path = ${quote("/rootfs/proc")}
@@ -1020,6 +1136,14 @@ export function buildAlloyContainerSpec(
       },
       LogConfig: MANAGED_CONTAINER_LOG_CONFIG,
       Privileged: true,
+    },
+    // Traefik's admin entrypoint is bound to the host loopback only, so the scrape has to happen
+    // container-to-container. Joining the ingress network reaches `nouva-traefik:8082` on the
+    // in-container listener without opening anything new on the host (#137).
+    networkingConfig: {
+      EndpointsConfig: {
+        [input.config.localTraefikNetwork]: {},
+      },
     },
   };
 }
@@ -1213,6 +1337,9 @@ export async function reconcileAlloyRuntime(
         await docker.removeContainer(ALLOY_CONTAINER_NAME, true);
       }
 
+      // The container joins the ingress network at creation, so the network has to exist even
+      // when the Traefik reconcile has not run yet on this boot. `ensureNetwork` is idempotent.
+      await docker.ensureNetwork(runtimeInput.config.localTraefikNetwork);
       await docker.ensureContainer(buildAlloyContainerSpec(runtimeInput, { stateHash }), false, {
         pull: false,
       });

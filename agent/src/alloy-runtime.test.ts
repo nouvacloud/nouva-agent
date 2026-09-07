@@ -136,6 +136,81 @@ describe("alloy-runtime", () => {
     }
   });
 
+  test("scrapes Traefik request counters and attributes them to the routed service", async () => {
+    tempDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-alloy-"));
+
+    const config = renderAlloyStaticConfig(createAlloyInput(tempDir));
+
+    // Reached container-to-container. Traefik binds 8082 to the host loopback only, so a host
+    // target would not resolve from inside Alloy.
+    expect(config).toContain('targets         = [{ __address__ = "nouva-traefik:8082" }]');
+    // Only the request counter is kept. Traefik publishes config reloads, TLS expiry and open
+    // connection gauges on the same endpoint, and none of them are charted.
+    expect(config).toContain('regex         = "traefik_service_requests_total"');
+    // The route file is named by service id and the load balancer is svc-<serviceId>, so
+    // Traefik's own service label is what carries the id the dashboard queries by.
+    expect(config).toContain(`rule {
+    source_labels = ["service"]
+    target_label  = "ingress_service_id"
+    regex         = "svc-(.+)@file"
+    replacement   = "$1"
+  }`);
+    // Traefik's own service label would otherwise reach Mimir as a second copy of the id.
+    expect(config).toContain(`  rule {
+    action = "labeldrop"
+    regex  = "instance|job|service"
+  }`);
+  });
+
+  test("keeps Traefik request counters in the system scope", async () => {
+    tempDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-alloy-"));
+
+    const config = renderAlloyStaticConfig(createAlloyInput(tempDir));
+    const traefikBlock = config.slice(
+      config.indexOf('prometheus.relabel "nouva_traefik"'),
+      config.indexOf('prometheus.exporter.unix "nouva"')
+    );
+
+    // These are Traefik's metrics, and Traefik is a system container. Writing the routed service
+    // into `service_id` would give an unowned series a service's authoritative identity and make
+    // it indistinguishable at ingest from that service's own container metrics, so the route id
+    // travels in its own non-authoritative label instead.
+    expect(traefikBlock).toContain(`  rule {
+    target_label = "service_id"
+    replacement  = "__none__"
+  }`);
+    expect(traefikBlock).toContain(`  rule {
+    target_label = "service_type"
+    replacement  = "system"
+  }`);
+    // service_variant/runtime_kind of traefik/traefik is the pair the ingest path already
+    // accepts for a system-scope series, so this needs no new authorization path.
+    expect(traefikBlock).toContain(`  rule {
+    target_label = "service_variant"
+    replacement  = "traefik"
+  }`);
+    expect(traefikBlock).toContain(`  rule {
+    target_label = "runtime_kind"
+    replacement  = "traefik"
+  }`);
+  });
+
+  test("drops Traefik routes that are not a Nouva service route", async () => {
+    tempDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-alloy-"));
+
+    const config = renderAlloyStaticConfig(createAlloyInput(tempDir));
+
+    // Traefik routes its own dashboard, api and ping endpoints through @internal services.
+    // Those never match svc-<id>@file, so they keep the none placeholder. A keep filter on
+    // "no @ in the value" would have let __none__ straight through; the drop is on the
+    // placeholder itself. They are not a service's traffic, so they are not shipped at all.
+    expect(config).toContain(`  rule {
+    source_labels = ["ingress_service_id"]
+    action        = "drop"
+    regex         = "__none__"
+  }`);
+  });
+
   test("renders bounded WAL delivery and v1 metadata-free remote write", async () => {
     tempDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-alloy-"));
 
@@ -421,6 +496,7 @@ describe("alloy-runtime", () => {
           dockerState.inspection = null;
         }
       }),
+      ensureNetwork: mock(async () => undefined),
       ensureContainer: mock(async (spec: DockerContainerSpec) => {
         dockerState.inspection = createAlloyInspection({
           image: spec.image,
@@ -529,6 +605,7 @@ describe("alloy-runtime", () => {
           dockerState.inspection = null;
         }
       }),
+      ensureNetwork: mock(async () => undefined),
       ensureContainer: mock(async (spec: DockerContainerSpec) => {
         ensuredSpecs.push(spec);
         dockerState.inspection = createAlloyInspection({
@@ -624,6 +701,7 @@ describe("alloy-runtime", () => {
           dockerState.inspection = null;
         }
       }),
+      ensureNetwork: mock(async () => undefined),
       ensureContainer: mock(async (spec: DockerContainerSpec) => {
         dockerState.inspection = createAlloyInspection({
           image: spec.image,
@@ -684,6 +762,7 @@ describe("alloy-runtime", () => {
           dockerState.inspection = null;
         }
       }),
+      ensureNetwork: mock(async () => undefined),
       ensureContainer: mock(async (spec: DockerContainerSpec) => {
         dockerState.inspection = createAlloyInspection({
           image: spec.image,
@@ -756,6 +835,7 @@ describe("alloy-runtime", () => {
           dockerState.inspection = null;
         }
       }),
+      ensureNetwork: mock(async () => undefined),
       ensureContainer: mock(async (spec: DockerContainerSpec) => {
         ensuredSpecs.push(spec);
         dockerState.inspection = createAlloyInspection({
@@ -815,6 +895,7 @@ describe("alloy-runtime", () => {
       waitContainer: mock(async () => 1),
       containerLogs: mock(async () => "invalid queue_config token=agent-token context=context-v1"),
       removeContainer,
+      ensureNetwork: mock(async () => undefined),
       ensureContainer: mock(async () => ALLOY_CONTAINER_NAME),
     };
 

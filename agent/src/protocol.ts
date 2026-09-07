@@ -291,6 +291,7 @@ export type AgentCapabilities = {
   localRegistry?: boolean;
   localTraefik?: boolean;
   alloyObservability?: boolean;
+  traefikRequestMetrics?: boolean;
   hostMetrics?: boolean;
   containerMetrics?: boolean;
   postgresObservability?: boolean;
@@ -899,6 +900,7 @@ export function resolveAgentCapabilities(config: AgentRuntimeConfig): AgentCapab
   return {
     ...capabilities,
     alloyObservability: true,
+    traefikRequestMetrics: true,
   };
 }
 

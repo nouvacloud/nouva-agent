@@ -163,6 +163,33 @@ describe("traefik-runtime", () => {
     expect(config).toContain("url: https://nouva.sh");
   });
 
+  test("publishes request metrics on the loopback admin entrypoint only", async () => {
+    tempDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-traefik-"));
+    const paths = getTraefikRuntimePaths(tempDir);
+    await ensureTraefikState(paths);
+
+    const staticConfig = renderTraefikStaticConfig(paths);
+
+    expect(staticConfig).toContain("metrics:");
+    expect(staticConfig).toContain("  prometheus:");
+    // The admin entrypoint is already bound to 127.0.0.1, so metrics add no host exposure.
+    expect(staticConfig).toContain(`    entryPoint: ${TRAEFIK_API_ENTRYPOINT}`);
+    expect(staticConfig).toContain("    addServicesLabels: true");
+    // Entrypoint series say nothing per service; router series would multiply each service by
+    // its router count for a breakdown nothing queries.
+    expect(staticConfig).toContain("    addEntryPointsLabels: false");
+    expect(staticConfig).toContain("    addRoutersLabels: false");
+
+    const spec = buildTraefikContainerSpec(runtimeConfig, {
+      dataVolume: "nouva-agent-data",
+      stateHash: createTraefikStateHash(staticConfig),
+    });
+    // Still loopback-only on the host: Alloy reaches 8082 over the ingress network instead.
+    expect(spec.hostConfig?.PortBindings?.["8082/tcp"]).toEqual([
+      { HostIp: "127.0.0.1", HostPort: "8082" },
+    ]);
+  });
+
   test("should pin Traefik v3.5 and bind 80, 443, and localhost 8082", async () => {
     tempDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-traefik-"));
     const paths = getTraefikRuntimePaths(tempDir);

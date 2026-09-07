@@ -610,6 +610,18 @@ export function renderTraefikStaticConfig(paths: TraefikRuntimePaths): string {
     '    address: ":443"',
     `  ${TRAEFIK_API_ENTRYPOINT}:`,
     '    address: ":8082"',
+    // Request metrics ride the existing admin entrypoint, which is already bound to
+    // 127.0.0.1 on the host, so this adds no new host exposure. Alloy reaches it
+    // container-to-container over `nouva-ingress` instead (#137).
+    "metrics:",
+    "  prometheus:",
+    `    entryPoint: ${TRAEFIK_API_ENTRYPOINT}`,
+    // Only the service dimension is kept. Entrypoint series say nothing per service, and
+    // router series would multiply every service by its router count (provided HTTP, custom
+    // HTTP, custom HTTPS) for a breakdown nothing queries.
+    "    addEntryPointsLabels: false",
+    "    addRoutersLabels: false",
+    "    addServicesLabels: true",
     "providers:",
     "  file:",
     `    directory: "${paths.dynamicDir}"`,
