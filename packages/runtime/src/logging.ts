@@ -56,6 +56,13 @@ export interface LogRedactionOptions {
    * payload already carries them unencrypted. Environment names stay protected.
    */
   operationalValues?: readonly string[];
+  /**
+   * Which of the redacted values the platform generated rather than the customer typing them.
+   * These stay redacted; the provenance only relaxes a *word* among them to whole-lexeme matching,
+   * so a fixed literal such as `require` stops eating the word inside `requirements.txt` (#219).
+   * A value not listed here is treated as the customer's and matched strictly.
+   */
+  platformGeneratedValues?: readonly string[];
   secretValues?: readonly string[];
 }
 
@@ -138,6 +145,86 @@ function isFlagEnvironmentValue(value: string): boolean {
   return FLAG_ENVIRONMENT_VALUES.has(value.trim().toLowerCase());
 }
 
+/**
+ * Two characters carry too little to be a credential and match almost every line, so a token that
+ * short has always been confined to whole-lexeme matching. Unchanged by #219.
+ */
+const MIN_SUBSTRING_TOKEN_LENGTH = 3;
+
+/**
+ * Past this many letters a single-case, letter-only value stops reading as prose: twelve lowercase
+ * letters already carry ~56 bits, so a longer run is generated material rather than a word even
+ * when the platform emitted it, and keeps the strict matching.
+ */
+const MAX_WORD_TOKEN_LENGTH = 12;
+
+/** One run of letters with no internal case change: `require`, `Require`, `ADMIN`. */
+const WORD_TOKEN_PATTERN = /^(?:[A-Za-z][a-z]*|[A-Z]+)$/;
+
+/**
+ * Who put a redaction token into the map.
+ *
+ * `platform` is for values the control plane generated into a deployment's environment itself. It
+ * is never inferred from what a value looks like — see `collectDeploymentLogRedactionValues` for
+ * the only place that establishes it.
+ */
+export type RedactionTokenProvenance = "customer" | "platform";
+
+/** How far a redaction token may reach into the text it is redacted from. */
+export type RedactionTokenMatch = "boundary" | "substring";
+
+/**
+ * Classifies how a redaction token is allowed to match.
+ *
+ * `substring` is the strict mode and the default: the token is masked wherever it occurs, including
+ * inside a longer run of characters, because a leaked credential can be embedded in one. `boundary`
+ * masks the token only where it stands as its own lexeme.
+ *
+ * A token is relaxed to `boundary` only when the platform generated it *and* it is a single word.
+ * Both halves are load-bearing. The platform emits fixed word literals for every service of a kind
+ * — `require` (`PGSSLMODE`), `admin` (MongoDB's auth source), `postgres` (the fallback database
+ * name) — none of which is secret, and matching one inside a word is what turned
+ * `requirements.txt` into `[REDACTED]ments.txt` in a build log (#219). Shape alone cannot carry
+ * that decision: a weak customer password such as `changeme` or `hunterhunter` is word-shaped too,
+ * and it must keep being masked wherever it appears, including glued to other characters. So a
+ * customer's value is always `substring`, however ordinary it looks.
+ *
+ * A generated value that is not a word stays `substring` as well, which is what keeps the generated
+ * credentials in the same catalog (`PGPASSWORD` and the connection URLs, 32 base64url characters)
+ * fully protected.
+ */
+export function classifyRedactionToken(
+  token: string,
+  provenance: RedactionTokenProvenance = "customer"
+): RedactionTokenMatch {
+  if (token.length < MIN_SUBSTRING_TOKEN_LENGTH) {
+    return "boundary";
+  }
+  if (provenance !== "platform") {
+    return "substring";
+  }
+  return token.length <= MAX_WORD_TOKEN_LENGTH && WORD_TOKEN_PATTERN.test(token)
+    ? "boundary"
+    : "substring";
+}
+
+function partitionRedactionTokens(
+  tokens: readonly string[],
+  platformGeneratedValues: ReadonlySet<string>
+): { boundary: string[]; substring: string[] } {
+  const boundary: string[] = [];
+  const substring: string[] = [];
+  for (const token of tokens) {
+    const provenance = platformGeneratedValues.has(token) ? "platform" : "customer";
+    if (classifyRedactionToken(token, provenance) === "boundary") {
+      boundary.push(token);
+    } else {
+      substring.push(token);
+    }
+  }
+  return { boundary, substring };
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
@@ -206,6 +293,61 @@ export function collectEnvironmentMapValues(
       (value): value is string => typeof value === "string" && !isFlagEnvironmentValue(value)
     )
   );
+}
+
+/** The pair of maps a deployment stores: what it runs with, and what it was built with. */
+export interface DeploymentLogEnvironmentMaps {
+  build: Readonly<Record<string, string | undefined>>;
+  runtime: Readonly<Record<string, string | undefined>>;
+}
+
+/** Spreads straight into `LogRedactionOptions`. */
+export interface DeploymentLogRedactionValues {
+  platformGeneratedValues: string[];
+  secretValues: string[];
+}
+
+/**
+ * Reads a deployment's environment maps as a redaction context for its logs: what to mask, and
+ * which of those values the platform generated rather than the customer typing them.
+ *
+ * The provenance is not a guess. `runtime` is the customer's own map with its `${{…}}` references
+ * resolved; `build` is that same map laid over the complete generated catalog of every resource it
+ * references, because `resolveProjectBuildEnvironmentVariables` spreads the catalog underneath it.
+ * So a service referencing only `${{db.DATABASE_URL}}` still stores `PGSSLMODE=require` and
+ * `PGDATABASE=postgres` in its build map, and a variable that appears only there is one the
+ * platform put in. That is the single place a fixed literal such as `require` entered a build log's
+ * redaction context and mangled `requirements.txt` (#219).
+ *
+ * A value the customer also holds under some name of their own is theirs, not the platform's: the
+ * customer wins the tie, exactly as they do for a chosen database name in the diagnostic audit
+ * (#125). Names are not collected at all — see `collectEnvironmentMapValues`.
+ */
+export function collectDeploymentLogRedactionValues(
+  environmentMaps: DeploymentLogEnvironmentMaps
+): DeploymentLogRedactionValues {
+  const customerValues = new Set(collectEnvironmentMapValues(environmentMaps.runtime));
+  const platformGeneratedValues = new Set<string>();
+
+  for (const [name, value] of Object.entries(environmentMaps.build)) {
+    if (
+      typeof value !== "string" ||
+      value.length === 0 ||
+      isFlagEnvironmentValue(value) ||
+      Object.hasOwn(environmentMaps.runtime, name) ||
+      customerValues.has(value)
+    ) {
+      continue;
+    }
+    platformGeneratedValues.add(value);
+  }
+
+  return {
+    platformGeneratedValues: [...platformGeneratedValues],
+    secretValues: [
+      ...new Set([...customerValues, ...collectEnvironmentMapValues(environmentMaps.build)]),
+    ].sort((left, right) => right.length - left.length || left.localeCompare(right)),
+  };
 }
 
 export function sanitizeEnvironmentCommitMessage(
@@ -389,9 +531,9 @@ type LiteralSecretMatcherNode = {
 type LiteralSecretMatcher = readonly LiteralSecretMatcherNode[];
 
 type CompiledLogRedaction = {
+  boundaryTextValues: readonly string[];
   exactStructuredValues: ReadonlySet<string>;
-  longTextMatcher: LiteralSecretMatcher;
-  shortTextValues: readonly string[];
+  substringMatcher: LiteralSecretMatcher;
 };
 
 export interface CompiledLogValueRedactor {
@@ -449,13 +591,19 @@ function createLiteralSecretMatcher(secretValues: readonly string[]): LiteralSec
   return nodes;
 }
 
+function resolvePlatformGeneratedValues(options: LogRedactionOptions): ReadonlySet<string> {
+  return new Set(options.platformGeneratedValues ?? []);
+}
+
 function compileLogRedaction(options: LogRedactionOptions): CompiledLogRedaction {
-  const textValues = resolveSecretValues(options);
-  const exactStructuredValues = resolveExactStructuredValues(options);
+  const { boundary, substring } = partitionRedactionTokens(
+    resolveSecretValues(options),
+    resolvePlatformGeneratedValues(options)
+  );
   return {
-    exactStructuredValues: new Set(exactStructuredValues),
-    longTextMatcher: createLiteralSecretMatcher(textValues.filter((value) => value.length >= 3)),
-    shortTextValues: textValues.filter((value) => value.length <= 2),
+    boundaryTextValues: boundary,
+    exactStructuredValues: new Set(resolveExactStructuredValues(options)),
+    substringMatcher: createLiteralSecretMatcher(substring),
   };
 }
 
@@ -467,13 +615,13 @@ function isLexicalBoundaryMatch(value: string, start: number, length: number): b
   return !isLexicalCharacter(value[start - 1]) && !isLexicalCharacter(value[start + length]);
 }
 
-function addShortLexicalMatches(
+function addBoundaryMatches(
   value: string,
-  shortTextValues: readonly string[],
+  boundaryTextValues: readonly string[],
   longestMatchAt: Uint32Array
 ): boolean {
   let hasMatch = false;
-  for (const secretValue of shortTextValues) {
+  for (const secretValue of boundaryTextValues) {
     let offset = value.indexOf(secretValue);
     while (offset !== -1) {
       if (
@@ -492,9 +640,9 @@ function addShortLexicalMatches(
 function redactLiteralSecretsWithMatcher(
   value: string,
   matcher: LiteralSecretMatcher,
-  shortTextValues: readonly string[] = []
+  boundaryTextValues: readonly string[] = []
 ): string {
-  if ((matcher.length <= 1 && shortTextValues.length === 0) || value.length === 0) {
+  if ((matcher.length <= 1 && boundaryTextValues.length === 0) || value.length === 0) {
     return value;
   }
 
@@ -513,7 +661,7 @@ function redactLiteralSecretsWithMatcher(
       hasMatch = true;
     }
   }
-  hasMatch = addShortLexicalMatches(value, shortTextValues, longestMatchAt) || hasMatch;
+  hasMatch = addBoundaryMatches(value, boundaryTextValues, longestMatchAt) || hasMatch;
   if (!hasMatch) {
     return value;
   }
@@ -538,9 +686,9 @@ function redactLiteralSecretsWithMatcher(
 function redactTextWithSecretMatcher(
   value: string,
   matcher: LiteralSecretMatcher,
-  shortTextValues: readonly string[] = []
+  boundaryTextValues: readonly string[] = []
 ): string {
-  const redacted = redactLiteralSecretsWithMatcher(value, matcher, shortTextValues);
+  const redacted = redactLiteralSecretsWithMatcher(value, matcher, boundaryTextValues);
 
   return redacted
     .replace(SENSITIVE_HEADER_PATTERN, `$1=${REDACTED_LOG_VALUE}`)
@@ -552,20 +700,27 @@ function redactTextWithSecretMatcher(
     .replace(GITHUB_TOKEN_PATTERN, REDACTED_LOG_VALUE);
 }
 
-function redactTextWithSecrets(value: string, secretValues: readonly string[]): string {
-  const normalized = uniqueSortedSecretValues(secretValues);
-  return redactTextWithSecretMatcher(
-    value,
-    createLiteralSecretMatcher(normalized.filter((entry) => entry.length >= 3)),
-    normalized.filter((entry) => entry.length <= 2)
+function redactTextWithSecrets(
+  value: string,
+  secretValues: readonly string[],
+  platformGeneratedValues: ReadonlySet<string>
+): string {
+  const { boundary, substring } = partitionRedactionTokens(
+    uniqueSortedSecretValues(secretValues),
+    platformGeneratedValues
   );
+  return redactTextWithSecretMatcher(value, createLiteralSecretMatcher(substring), boundary);
 }
 
 function sanitizeStructuredText(value: string, redaction: CompiledLogRedaction): string {
   if (redaction.exactStructuredValues.has(value)) {
     return REDACTED_LOG_VALUE;
   }
-  return redactTextWithSecretMatcher(value, redaction.longTextMatcher, redaction.shortTextValues);
+  return redactTextWithSecretMatcher(
+    value,
+    redaction.substringMatcher,
+    redaction.boundaryTextValues
+  );
 }
 
 function sanitizeValue(
@@ -577,7 +732,11 @@ function sanitizeValue(
     if (redaction.exactStructuredValues.has(value)) {
       return REDACTED_LOG_VALUE;
     }
-    return redactTextWithSecretMatcher(value, redaction.longTextMatcher, redaction.shortTextValues);
+    return redactTextWithSecretMatcher(
+      value,
+      redaction.substringMatcher,
+      redaction.boundaryTextValues
+    );
   }
 
   if (
@@ -625,8 +784,8 @@ function sanitizeObjectValue(
   if (value instanceof URL) {
     return redactTextWithSecretMatcher(
       value.toString(),
-      redaction.longTextMatcher,
-      redaction.shortTextValues
+      redaction.substringMatcher,
+      redaction.boundaryTextValues
     );
   }
 
@@ -784,7 +943,11 @@ export function collectConfiguredSecretValues(
 }
 
 export function redactLogText(value: string, options: LogRedactionOptions = {}): string {
-  return redactTextWithSecrets(value, resolveSecretValues(options));
+  return redactTextWithSecrets(
+    value,
+    resolveSecretValues(options),
+    resolvePlatformGeneratedValues(options)
+  );
 }
 
 export function createLogTextRedactor(
@@ -792,7 +955,7 @@ export function createLogTextRedactor(
 ): (value: string) => string {
   const redaction = compileLogRedaction(options);
   return (value) =>
-    redactTextWithSecretMatcher(value, redaction.longTextMatcher, redaction.shortTextValues);
+    redactTextWithSecretMatcher(value, redaction.substringMatcher, redaction.boundaryTextValues);
 }
 
 export function createLogValueRedactor(
@@ -802,7 +965,7 @@ export function createLogValueRedactor(
   return {
     hasExactStructuredValue: (value) => redaction.exactStructuredValues.has(value),
     redactText: (value) =>
-      redactTextWithSecretMatcher(value, redaction.longTextMatcher, redaction.shortTextValues),
+      redactTextWithSecretMatcher(value, redaction.substringMatcher, redaction.boundaryTextValues),
     sanitize: (value) => sanitizeValue(value, redaction, new WeakSet<object>()),
   };
 }
@@ -829,7 +992,7 @@ export function serializeSafeRequestForLog(
   const redaction = compileLogRedaction(options);
   const sanitizeUrl = options.sanitizeUrl ?? sanitizeLogUrl;
   const redactText = (value: string): string =>
-    redactTextWithSecretMatcher(value, redaction.longTextMatcher, redaction.shortTextValues);
+    redactTextWithSecretMatcher(value, redaction.substringMatcher, redaction.boundaryTextValues);
   return {
     hostname: request.hostname === undefined ? undefined : redactText(request.hostname),
     method: request.method === undefined ? undefined : redactText(request.method),
@@ -874,8 +1037,8 @@ export function createSafeLogger(options: SafeLoggerOptions = {}): SafeLogger {
     const safeFields = asRecord(sanitizeValue(fields, redaction, new WeakSet<object>()));
     const safeMessage = redactTextWithSecretMatcher(
       message,
-      redaction.longTextMatcher,
-      redaction.shortTextValues
+      redaction.substringMatcher,
+      redaction.boundaryTextValues
     );
     const record = {
       ...bindings,

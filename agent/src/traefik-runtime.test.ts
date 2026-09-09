@@ -552,3 +552,158 @@ describe("traefik route accounting", () => {
     }
   });
 });
+
+describe("traefik forwarded headers", () => {
+  let tempDir = "";
+
+  afterEach(async () => {
+    resetTraefikRuntimeState();
+    if (tempDir) {
+      await rm(tempDir, { recursive: true, force: true });
+      tempDir = "";
+    }
+  });
+
+  test("should trust the hosted edge on the provided-domain entrypoint only", async () => {
+    tempDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-traefik-"));
+    const paths = getTraefikRuntimePaths(tempDir);
+    await ensureTraefikState(paths);
+
+    const staticConfig = renderTraefikStaticConfig(paths, [
+      "40.160.2.8/32",
+      "2604:2dc0:101:200::310e",
+    ]);
+
+    // Provided hostnames reach this entrypoint over plain HTTP from the edge, so without the peer
+    // the app is told the request was `http` on port 80 however the browser actually connected.
+    expect(staticConfig).toContain(
+      [
+        "  web:",
+        '    address: ":80"',
+        "    forwardedHeaders:",
+        "      trustedIPs:",
+        "        - 40.160.2.8/32",
+        "        - 2604:2dc0:101:200::310e",
+        "  websecure:",
+        '    address: ":443"',
+      ].join("\n")
+    );
+    expect(staticConfig.split("  websecure:")[1]).not.toContain("forwardedHeaders");
+  });
+
+  test("should leave the entrypoint untrusting when the control plane names no edge", async () => {
+    tempDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-traefik-"));
+    const paths = getTraefikRuntimePaths(tempDir);
+    await ensureTraefikState(paths);
+
+    expect(renderTraefikStaticConfig(paths)).not.toContain("forwardedHeaders");
+    expect(renderTraefikStaticConfig(paths, [])).not.toContain("forwardedHeaders");
+  });
+
+  test("should drop peers that trust the internet or that Traefik cannot parse", async () => {
+    tempDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-traefik-"));
+    const paths = getTraefikRuntimePaths(tempDir);
+    await ensureTraefikState(paths);
+
+    for (const peer of [
+      "0.0.0.0/0",
+      "::/0",
+      "edge.nouva.sh",
+      "40.160.2.8:80",
+      "40.160.2.8/33",
+      "2604:2dc0:101:200::310e/129",
+      "999.1.1.1",
+      "40.160.2.8/32/32",
+      '"\n  websecure:\n    address: ":8443"',
+      // Half-written IPv6: each of these would be rendered by a looser check and would then
+      // stop Traefik on every reconcile instead of leaving the entrypoint untrusting.
+      ":",
+      "1:2",
+      ":::1",
+      "1:2:3:4:5:6:7:",
+      "1:2:3:4:5:6:7:8:9",
+      "2001:db8::1::2",
+      "::ffff:999.1.1.1",
+      // Go reads a leading zero as an error, not as octal, so traefik:v3.5 aborts with
+      // `invalid CIDR address: 010.0.0.1` rather than trusting 10.0.0.1 or 8.0.0.1.
+      "010.0.0.1",
+      "10.0.0.01",
+      "::ffff:010.0.0.1",
+      "010.0.0.0/8",
+    ]) {
+      expect(renderTraefikStaticConfig(paths, [peer])).not.toContain("forwardedHeaders");
+    }
+
+    // `::` is the unspecified address: syntactically an address Traefik loads, and no peer ever
+    // presents it, so there is no reason for this to be the check that rejects it.
+    for (const peer of [
+      "::",
+      "2604:2dc0:101:200::310e/64",
+      "::ffff:192.0.2.1",
+      "2001:0db8:0000:0000:0000:0000:0000:0001",
+      // A bare zero octet is not a leading zero, and Traefik loads it.
+      "10.0.0.0/8",
+      "0.0.0.1",
+    ]) {
+      expect(renderTraefikStaticConfig(paths, [peer])).toContain(`        - ${peer}`);
+    }
+
+    expect(
+      renderTraefikStaticConfig(paths, ["203.0.113.7", "  203.0.113.7  ", "10.0.0.0/8"])
+    ).toContain(["      trustedIPs:", "        - 203.0.113.7", "        - 10.0.0.0/8"].join("\n"));
+  });
+
+  test("should cut Traefik over when the trusted edge changes", async () => {
+    tempDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-traefik-"));
+    const paths = getTraefikRuntimePaths(tempDir);
+    await ensureTraefikState(paths);
+
+    const untrustedHash = createTraefikStateHash(renderTraefikStaticConfig(paths));
+    const trustedHash = createTraefikStateHash(renderTraefikStaticConfig(paths, ["40.160.2.8/32"]));
+    expect(trustedHash).not.toBe(untrustedHash);
+
+    const dockerState: Record<string, DockerContainerInspection | null> = {
+      [TRAEFIK_CONTAINER_NAME]: createTraefikInspection({ stateHash: untrustedHash }),
+    };
+    const docker = {
+      ensureNetwork: mock(async () => {}),
+      listNetworks: mock(async () => []),
+      connectNetwork: mock(async () => {}),
+      pullImage: mock(async () => {}),
+      removeContainer: mock(async (name: string) => {
+        dockerState[name] = null;
+      }),
+      inspectContainer: mock(async (name: string) => dockerState[name] ?? null),
+      ensureContainer: mock(
+        async (spec: { name: string; image: string; labels?: Record<string, string> }) => {
+          dockerState[spec.name] = createTraefikInspection({
+            name: spec.name,
+            image: spec.image,
+            adminPort:
+              spec.name === TRAEFIK_CANDIDATE_CONTAINER_NAME
+                ? TRAEFIK_CANDIDATE_ADMIN_PORT
+                : TRAEFIK_ADMIN_PORT,
+            port80: spec.name !== TRAEFIK_CANDIDATE_CONTAINER_NAME,
+            port443: spec.name !== TRAEFIK_CANDIDATE_CONTAINER_NAME,
+            stateHash: spec.labels?.[TRAEFIK_CONFIG_HASH_LABEL] ?? untrustedHash,
+          });
+          return spec.name;
+        }
+      ),
+    };
+    const fetchImpl: typeof fetch = mock(async (input: RequestInfo | URL) =>
+      String(input).endsWith("/ping") ? new Response("OK", { status: 200 }) : Response.json([])
+    ) as typeof fetch;
+
+    await reconcileTraefikRuntime(
+      docker as never,
+      { ...runtimeConfig, trustedForwardedPeers: ["40.160.2.8/32"] },
+      { dataVolume: "nouva-agent-data", paths, fetchImpl, timeoutMs: 200, intervalMs: 1 }
+    );
+
+    expect(await readFile(paths.staticConfigPath, "utf8")).toContain("        - 40.160.2.8/32");
+    expect(
+      docker.ensureContainer.mock.calls.map((call) => call[0].labels?.[TRAEFIK_CONFIG_HASH_LABEL])
+    ).toEqual([trustedHash, trustedHash]);
+  });
+});

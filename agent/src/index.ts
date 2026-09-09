@@ -1954,6 +1954,7 @@ function getTraefikRuntimeInput(config: AgentRuntimeConfig): TraefikRuntimeInput
     serverId: SERVER_ID!,
     image: TRAEFIK_IMAGE,
     acmeEmail: process.env.NOUVA_AGENT_TRAEFIK_ACME_EMAIL ?? null,
+    trustedForwardedPeers: config.trustedForwardedPeers,
   };
 }
 

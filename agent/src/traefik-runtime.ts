@@ -69,6 +69,7 @@ export interface TraefikRuntimeInput {
   serverId: string;
   image: string;
   acmeEmail: string | null;
+  trustedForwardedPeers?: readonly string[];
 }
 
 export interface TraefikRuntimeDeps {
@@ -170,7 +171,103 @@ function formatMode(mode: number): string {
   return `0${(mode & 0o777).toString(8)}`;
 }
 
-function buildTraefikRuntimeConfig(networkName: string): AgentRuntimeConfig {
+/**
+ * Go's address parser, which is what Traefik ultimately uses, rejects a leading zero in an octet
+ * rather than reading it as octal. Verified on traefik:v3.5: `010.0.0.1` and `::ffff:010.0.0.1`
+ * both abort the process with `invalid CIDR address`, so accepting them here would write a static
+ * config the proxy refuses to start with.
+ */
+function isIpv4Address(value: string): boolean {
+  const octets = value.split(".");
+  return (
+    octets.length === 4 &&
+    octets.every((octet) => /^(?:0|[1-9]\d{0,2})$/.test(octet) && Number.parseInt(octet, 10) <= 255)
+  );
+}
+
+/**
+ * Recognizes exactly what Traefik will accept, because anything looser defeats the reason these
+ * entries are filtered at all: a half-address like `1:2` that survives this check is written into
+ * the static config, and Traefik then refuses to start with it.
+ */
+function isIpv6Address(value: string): boolean {
+  const compressionParts = value.split("::");
+  if (compressionParts.length > 2) {
+    return false;
+  }
+
+  const isCompressed = compressionParts.length === 2;
+  const head = compressionParts[0] ?? "";
+  const tail = isCompressed ? (compressionParts[1] ?? "") : "";
+  const groups = [
+    ...(head.length > 0 ? head.split(":") : []),
+    ...(tail.length > 0 ? tail.split(":") : []),
+  ];
+
+  // An empty group here is a stray colon: `:`, `:::1`, `1:2:3:4:5:6:7:` and friends.
+  if (groups.some((group) => group.length === 0)) {
+    return false;
+  }
+
+  // A trailing dotted-quad stands in for the last two hextets, as in `::ffff:192.0.2.1`.
+  const lastGroup = groups.at(-1);
+  const ipv4Tail = lastGroup?.includes(".") ? lastGroup : null;
+  const hextets = ipv4Tail === null ? groups : groups.slice(0, -1);
+
+  if (ipv4Tail !== null && !isIpv4Address(ipv4Tail)) {
+    return false;
+  }
+
+  if (!hextets.every((hextet) => /^[0-9a-fA-F]{1,4}$/.test(hextet))) {
+    return false;
+  }
+
+  // `::` stands for at least one zero hextet, so a compressed address spells out at most seven.
+  const hextetCount = hextets.length + (ipv4Tail === null ? 0 : 2);
+  return isCompressed ? hextetCount <= 7 : hextetCount === 8;
+}
+
+function isForwardingPeer(value: string): boolean {
+  const parts = value.split("/");
+  const address = parts[0] ?? "";
+  const prefix = parts[1];
+
+  if (parts.length > 2 || address.length === 0) {
+    return false;
+  }
+
+  const maxPrefixLength = address.includes(":") ? 128 : 32;
+  if (prefix !== undefined) {
+    const prefixLength = /^\d{1,3}$/.test(prefix) ? Number.parseInt(prefix, 10) : Number.NaN;
+    // A `/0` prefix would trust every peer, which is the one thing this list must never do.
+    if (!(prefixLength >= 1 && prefixLength <= maxPrefixLength)) {
+      return false;
+    }
+  }
+
+  return address.includes(":") ? isIpv6Address(address) : isIpv4Address(address);
+}
+
+/**
+ * Keeps the peers this proxy can safely be told to trust, in the order the control plane sent
+ * them. An entry Traefik could not parse is dropped rather than rendered: an unreadable static
+ * config stops the proxy and takes every route on the server down, while dropping one entry only
+ * leaves that peer as untrusted as it was before.
+ */
+function selectTrustedForwardedPeers(peers: readonly string[] | undefined): string[] {
+  const selected: string[] = [];
+
+  for (const candidate of peers ?? []) {
+    const peer = typeof candidate === "string" ? candidate.trim() : "";
+    if (peer.length > 0 && !selected.includes(peer) && isForwardingPeer(peer)) {
+      selected.push(peer);
+    }
+  }
+
+  return selected;
+}
+
+function buildTraefikRuntimeConfig(input: TraefikRuntimeInput): AgentRuntimeConfig {
   return {
     heartbeatIntervalSeconds: 30,
     pollIntervalSeconds: 10,
@@ -191,8 +288,9 @@ function buildTraefikRuntimeConfig(networkName: string): AgentRuntimeConfig {
     },
     localRegistryHost: "127.0.0.1",
     localRegistryPort: 5000,
-    localTraefikNetwork: networkName,
+    localTraefikNetwork: input.networkName,
     clientIngressPlaceholderUrl: "https://nouva.sh/_nouva/domain-pending",
+    trustedForwardedPeers: [...(input.trustedForwardedPeers ?? [])],
     observability: {
       enabled: false,
       organizationId: null,
@@ -596,7 +694,12 @@ export function buildTraefikRouteConfig(route: TraefikRouteConfig): string {
   return serializeYaml(lines);
 }
 
-export function renderTraefikStaticConfig(paths: TraefikRuntimePaths): string {
+export function renderTraefikStaticConfig(
+  paths: TraefikRuntimePaths,
+  trustedForwardedPeers?: readonly string[]
+): string {
+  const forwardingPeers = selectTrustedForwardedPeers(trustedForwardedPeers);
+
   return serializeYaml([
     "api:",
     "  insecure: true",
@@ -606,6 +709,21 @@ export function renderTraefikStaticConfig(paths: TraefikRuntimePaths): string {
     "entryPoints:",
     "  web:",
     '    address: ":80"',
+    // A provided hostname arrives here as a plain HTTP hop from the hosted edge, which already
+    // terminated the browser's TLS. With no peer named, Traefik discards the incoming
+    // `X-Forwarded-*` headers and re-derives them from this connection, so the app sees `http` on
+    // port 80 for a request the user made over HTTPS — and everything a framework builds from that
+    // header (OAuth redirect URIs, `Secure` cookies, HTTPS redirects) follows it. Peers outside
+    // this list, including anyone dialling port 80 directly, keep being rewritten.
+    ...(forwardingPeers.length > 0
+      ? [
+          "    forwardedHeaders:",
+          "      trustedIPs:",
+          ...forwardingPeers.map((peer) => `        - ${peer}`),
+        ]
+      : []),
+    // websecure is deliberately left untrusting: it terminates the customer's own certificate
+    // with the browser on the other end, so nothing forwards to it.
     "  websecure:",
     '    address: ":443"',
     `  ${TRAEFIK_API_ENTRYPOINT}:`,
@@ -767,7 +885,7 @@ export async function reconcileTraefikRuntime(
   await ensureTraefikState(paths);
   await docker.ensureNetwork(config.localTraefikNetwork);
 
-  const staticConfig = renderTraefikStaticConfig(paths);
+  const staticConfig = renderTraefikStaticConfig(paths, config.trustedForwardedPeers);
   await writeManagedFile(paths.staticConfigPath, staticConfig);
   const stateHash = createTraefikStateHash(staticConfig);
   const current = await docker.inspectContainer(TRAEFIK_CONTAINER_NAME);
@@ -1008,7 +1126,7 @@ export async function ensureTraefikRuntime(
   input: TraefikRuntimeInput,
   deps: TraefikRuntimeDeps = {}
 ): Promise<void> {
-  await reconcileTraefikRuntime(docker, buildTraefikRuntimeConfig(input.networkName), {
+  await reconcileTraefikRuntime(docker, buildTraefikRuntimeConfig(input), {
     dataVolume: input.dataVolume,
     labels: buildTraefikLabels(input),
     paths: deps.paths ?? getTraefikRuntimePaths(input.dataDir),

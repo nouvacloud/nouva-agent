@@ -352,6 +352,8 @@ export interface AgentRuntimeConfig {
   localRegistryPort: number;
   localTraefikNetwork: string;
   clientIngressPlaceholderUrl: string;
+  /** Edge peers whose forwarding headers the local proxy keeps. The control plane owns this list. */
+  trustedForwardedPeers: string[];
   observability: AgentObservabilityConfig;
   privateRegistry?: {
     host: string;
@@ -966,6 +968,10 @@ export function getAgentRuntimeConfig(): AgentRuntimeConfig {
     localTraefikNetwork: process.env.NOUVA_AGENT_INGRESS_NETWORK ?? "nouva-ingress",
     clientIngressPlaceholderUrl:
       process.env.NOUVA_CLIENT_INGRESS_PLACEHOLDER_URL ?? "https://nouva.sh/_nouva/domain-pending",
+    // Empty until the control plane names its edge on registration: only it knows which peer the
+    // provided-domain hop arrives from, and guessing here would trust an address on this server's
+    // public port 80 that nothing has confirmed.
+    trustedForwardedPeers: [],
     observability: {
       enabled: process.env.NOUVA_OBSERVABILITY_ENABLED === "true",
       organizationId: null,
