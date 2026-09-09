@@ -5,6 +5,13 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { AGENT_VOLUME_METRICS_INTERVAL_MS } from "@repo/runtime/agent-metrics";
+import {
+  EXTERNAL_BACKUP_IMPORT_HEADER_SAMPLE_BYTES,
+  type ExternalBackupImportFailureCategory,
+  type ExternalBackupImportProofV1,
+  type ImportExternalBackupPayload,
+  verifyExternalBackupArtifact,
+} from "@repo/runtime/external-backup-import";
 import { collectAgentWorkPayloadOperationalValues } from "@repo/runtime/logging";
 import { calculateBuildReserve } from "@repo/runtime/server-capacity";
 import agentPackageJson from "../package.json" with { type: "json" };
@@ -1430,6 +1437,8 @@ const AGENT_WORK_RESULT_PROTOCOL_KEYS = [
   "externalHost",
   "externalPort",
   "imageUrl",
+  "importFailure",
+  "importProof",
   "integrityProof",
   "internalHost",
   "internalPort",
@@ -1564,6 +1573,12 @@ function normalizeAgentProtocolValueForConflictCheck(
 ): unknown {
   if (key === "statusMessage") {
     return "[DIAGNOSTIC]";
+  }
+  if (key === "importFailure" && typeof value === "object" && value !== null) {
+    // Prose about a failure the customer's own bytes caused, diagnostic in exactly the way
+    // `statusMessage` is. Dropping the whole result over a redaction inside it would cost the
+    // control plane the failure category, which is the one thing the customer needs.
+    return { ...(value as Record<string, unknown>), message: "[DIAGNOSTIC]" };
   }
   if (key !== "job" || typeof value !== "object" || value === null || Array.isArray(value)) {
     return value;
@@ -4378,6 +4393,368 @@ export async function handleRestorePostgresPitr(
   };
 }
 
+/**
+ * A failure the control plane can classify.
+ *
+ * Import failures carry a category so the customer is told *what* was wrong with their artifact
+ * rather than that "the agent work failed". The category rides in `result.importFailure`, which
+ * the control plane re-reads into the `database_import` row.
+ */
+export class ExternalBackupImportError extends Error {
+  readonly result: Record<string, unknown>;
+
+  constructor(category: ExternalBackupImportFailureCategory, message: string) {
+    super(message);
+    this.name = "ExternalBackupImportError";
+    this.result = { importFailure: { category, message } };
+  }
+}
+
+const EXTERNAL_BACKUP_IMPORT_ARTIFACT_PATH = "/nouva-import/artifact.bin";
+const EXTERNAL_BACKUP_IMPORT_STAGE_TARGET = "/stage";
+/** Marker the restore scripts print once the bytes are in, before anything validates them. */
+const EXTERNAL_BACKUP_IMPORT_RESTORED_MARKER = "NOUVA_IMPORT_RESTORED:";
+
+/**
+ * A shell parameter expansion with a default, assembled rather than written literally.
+ *
+ * `"${NAME:-fallback}"` inside a TypeScript string reads as a template placeholder to the linter,
+ * so the `$` is contributed by an actual placeholder and the text stays shell-correct.
+ */
+function shellDefault(name: string, fallback: string): string {
+  const dollar = "$";
+  return `${dollar}{${name}:-${fallback}}`;
+}
+
+function buildImportStageVolumeLabels(input: {
+  importId: string;
+  serviceId: string;
+}): Record<string, string> {
+  // Not a "volume" resource, for the same reason backup staging volumes are not: this is scratch
+  // space that capacity accounting and reconciliation must never mistake for service data.
+  return {
+    "nouva.managed": "true",
+    "nouva.resource": "import-stage",
+    "nouva.import.id": input.importId,
+    "nouva.service.id": input.serviceId,
+  };
+}
+
+/**
+ * Downloads the artifact and reports what it actually is.
+ *
+ * The script measures and never judges: no `EXPECTED_SHA256` comparison happens here, because a
+ * shell `test` that is skipped when a variable is empty is the shape of a check that silently
+ * stops running. The digest, the byte count, and the header prefix all travel back out, and the
+ * decision is made once, in `verifyExternalBackupArtifact`.
+ */
+export function buildExternalBackupImportFetchScript(headerSampleBytes: number): string {
+  return [
+    "set -eu",
+    `remote="${buildArchiveRemoteExpression()}"`,
+    `artifact="${EXTERNAL_BACKUP_IMPORT_STAGE_TARGET}/artifact.bin"`,
+    'rclone copyto "$remote" "$artifact"',
+    'actual_sha256=$(sha256sum "$artifact" | cut -d " " -f 1)',
+    'actual_size=$(wc -c < "$artifact" | tr -d " ")',
+    `header=$(head -c ${headerSampleBytes} "$artifact" | base64 | tr -d "\\n")`,
+    'printf "NOUVA_SHA256:%s\\n" "$actual_sha256"',
+    'printf "NOUVA_SIZE_BYTES:%s\\n" "$actual_size"',
+    'printf "NOUVA_ARTIFACT_HEADER:%s\\n" "$header"',
+  ].join("\n");
+}
+
+/**
+ * Restores a verified custom-format archive into the staged volume and proves it opens.
+ *
+ * `--single-transaction` is what makes the outcome binary: an archive that errors part-way leaves
+ * the staged database empty rather than half-populated, so there is no state in which a partial
+ * import could be applied. `--no-owner --no-privileges` stops the archive reassigning ownership or
+ * granting to roles it names; everything lands owned by the destination's own role.
+ */
+export function buildPostgresExternalBackupImportScript(): string {
+  const socketDir = `"${shellDefault("POSTGRES_SOCKET_DIR", "/var/lib/postgresql/.sockets")}"`;
+  const password = shellDefault("POSTGRES_PASSWORD", "");
+  return [
+    "set -eu",
+    `mkdir -p "$NOUVA_DATA_PATH" ${socketDir} /var/run/postgresql`,
+    'chown -R 999:999 "$NOUVA_DATA_PATH" || true',
+    "/nouva/entrypoint.sh &",
+    'entrypoint_pid="$!"',
+    "cleanup() {",
+    '  if kill -0 "$entrypoint_pid" 2>/dev/null; then',
+    '    kill -TERM "$entrypoint_pid" || true',
+    '    wait "$entrypoint_pid" || true',
+    "  fi",
+    "}",
+    "trap cleanup EXIT INT TERM",
+    `export PGHOST=${socketDir}`,
+    `export PGPORT="${shellDefault("POSTGRES_PORT", "5433")}"`,
+    `export PGUSER="${shellDefault("POSTGRES_USER", "postgres")}"`,
+    `export PGDATABASE="${shellDefault("POSTGRES_DB", "postgres")}"`,
+    `if [ -n "${password}" ]; then export PGPASSWORD="${password}"; fi`,
+    "ready=0",
+    "for i in $(seq 1 300); do",
+    '  if pg_isready -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" >/dev/null 2>&1; then ready=1; break; fi',
+    '  if ! kill -0 "$entrypoint_pid" 2>/dev/null; then break; fi',
+    "  sleep 1",
+    "done",
+    'if [ "$ready" != 1 ]; then',
+    '  echo "The destination PostgreSQL server did not start for this import" >&2',
+    "  exit 1",
+    "fi",
+    // `pg_restore` does not read PGDATABASE: without an explicit target it writes SQL to stdout,
+    // and `--single-transaction` then aborts because there is no connection to open one on. The
+    // database has to be named on the command line for the archive to be replayed at all.
+    'pg_restore --single-transaction --exit-on-error --no-owner --no-privileges --dbname "$PGDATABASE" "$NOUVA_IMPORT_ARTIFACT"',
+    `printf "${EXTERNAL_BACKUP_IMPORT_RESTORED_MARKER}%s\\n" 1`,
+    "relations=$(psql -Atqc \"select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.relkind in ('r','p','m') and n.nspname not in ('pg_catalog','information_schema') and n.nspname !~ '^pg_toast'\")",
+    'psql -Atqc "checkpoint" >/dev/null',
+    'printf "NOUVA_IMPORT_RELATIONS:%s\\n" "$relations"',
+  ].join("\n");
+}
+
+/**
+ * Loads a verified RDB snapshot into the staged volume with the engine that will serve it.
+ *
+ * The snapshot is validated by the destination's own `redis-server`, not by whatever
+ * `redis-check-rdb` the agent image happens to ship: a snapshot the agent's binary accepts and the
+ * service's binary refuses is exactly the failure this step exists to catch. Redis loads the whole
+ * dataset at startup, so a `PONG` on the loopback port is proof the file parsed end to end.
+ */
+export function buildRedisExternalBackupImportScript(): string {
+  return [
+    "set -eu",
+    'mkdir -p "$NOUVA_DATA_PATH"',
+    'cp "$NOUVA_IMPORT_ARTIFACT" "$NOUVA_DATA_PATH/dump.rdb"',
+    `printf "${EXTERNAL_BACKUP_IMPORT_RESTORED_MARKER}%s\\n" 1`,
+    'redis-server --port 6380 --bind 127.0.0.1 --dir "$NOUVA_DATA_PATH" --dbfilename dump.rdb --appendonly no --daemonize yes',
+    "ready=0",
+    "for i in $(seq 1 120); do",
+    "  if redis-cli -h 127.0.0.1 -p 6380 PING 2>/dev/null | grep -q PONG; then ready=1; break; fi",
+    "  sleep 1",
+    "done",
+    'if [ "$ready" != 1 ]; then',
+    '  echo "The destination Redis server did not load the imported snapshot" >&2',
+    "  exit 1",
+    "fi",
+    'keyspace=$(redis-cli -h 127.0.0.1 -p 6380 INFO keyspace | tr -d "\\r")',
+    'keys=$(printf "%s\\n" "$keyspace" | grep "^db" | cut -d "=" -f 2 | cut -d "," -f 1 | awk \'{ total += $1 } END { printf "%d\\n", total }\')',
+    'volatile=$(printf "%s\\n" "$keyspace" | grep "^db" | cut -d "=" -f 3 | cut -d "," -f 1 | awk \'{ total += $1 } END { printf "%d\\n", total }\')',
+    "redis-cli -h 127.0.0.1 -p 6380 SHUTDOWN NOSAVE >/dev/null 2>&1 || true",
+    'printf "NOUVA_IMPORT_KEYS:%s\\n" "$keys"',
+    'printf "NOUVA_IMPORT_VOLATILE_KEYS:%s\\n" "$volatile"',
+  ].join("\n");
+}
+
+function readImportCount(logs: string, prefix: string): number | null {
+  const raw = extractPrefixedLogLine(logs, prefix)?.trim();
+  if (!raw || !/^[0-9]+$/.test(raw)) {
+    return null;
+  }
+
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
+/**
+ * Reads back what the fetch container measured.
+ *
+ * Anything missing or malformed is a hard failure: the verifier's guarantees rest on these three
+ * values, so "the agent did not report a digest" can never degrade into "skip the digest check".
+ */
+export function parseExternalBackupImportObservation(logs: string): {
+  sha256: string;
+  sizeBytes: number;
+  headerSample: Uint8Array;
+} {
+  const sha256 = extractPrefixedLogLine(logs, "NOUVA_SHA256:")?.trim() ?? "";
+  const sizeBytes = readImportCount(logs, "NOUVA_SIZE_BYTES:");
+  const headerBase64 = extractPrefixedLogLine(logs, "NOUVA_ARTIFACT_HEADER:")?.trim() ?? "";
+
+  if (!sha256 || sizeBytes === null || !headerBase64) {
+    throw new ExternalBackupImportError(
+      "integrity_mismatch",
+      "The artifact was downloaded without complete integrity evidence, so it cannot be verified"
+    );
+  }
+
+  return {
+    sha256,
+    sizeBytes,
+    headerSample: new Uint8Array(Buffer.from(headerBase64, "base64")),
+  };
+}
+
+export async function handleImportExternalBackup(
+  docker: DockerApiClient,
+  config: Pick<AgentRuntimeConfig, "privateRegistry">,
+  payload: ImportExternalBackupPayload
+) {
+  const spec = resolveHydratedHelperSpec({
+    imageUrl: payload.imageUrl,
+    envVars: payload.envVars,
+    containerArgs: payload.containerArgs,
+    mountPath: payload.targetMountPath,
+    dataPath: payload.dataPath,
+  });
+  const agentTaskImage = await resolveAgentTaskImage(docker);
+  const shortId = payload.importId.slice(0, 12);
+  const stageVolume = `nouva-import-stage-${shortId}`;
+
+  await docker.removeVolume(stageVolume, true);
+  await docker.createVolume(
+    stageVolume,
+    buildImportStageVolumeLabels({ importId: payload.importId, serviceId: payload.serviceId })
+  );
+
+  try {
+    let fetchLogs: string;
+    try {
+      ({ logs: fetchLogs } = await runTaskContainer(docker, config, {
+        name: `nouva-import-fetch-${shortId}`,
+        image: agentTaskImage,
+        env: buildArchiveDestinationEnv(payload.destination, payload.objectKey),
+        cmd: [
+          "sh",
+          "-c",
+          buildExternalBackupImportFetchScript(EXTERNAL_BACKUP_IMPORT_HEADER_SAMPLE_BYTES),
+        ],
+        mounts: [{ source: stageVolume, target: EXTERNAL_BACKUP_IMPORT_STAGE_TARGET }],
+        timeoutMs: 60 * 60_000,
+      }));
+    } catch (error) {
+      throw new ExternalBackupImportError(
+        "artifact_missing",
+        `The uploaded artifact could not be retrieved: ${
+          error instanceof Error ? error.message : "unknown error"
+        }`
+      );
+    }
+
+    const observed = parseExternalBackupImportObservation(fetchLogs);
+    const verification = verifyExternalBackupArtifact({
+      declared: {
+        format: payload.format,
+        sha256: payload.artifactSha256,
+        sizeBytes: payload.artifactSizeBytes,
+      },
+      observed,
+      destination: { variant: payload.variant, version: payload.version },
+    });
+    if (verification.outcome === "rejected") {
+      throw new ExternalBackupImportError(verification.category, verification.message);
+    }
+
+    await docker.createVolume(
+      payload.targetVolumeName,
+      buildManagedVolumeLabels({
+        volumeId: payload.targetVolumeId,
+        projectId: payload.projectId,
+        serviceId: payload.serviceId,
+      })
+    );
+
+    let restoreLogs: string;
+    try {
+      ({ logs: restoreLogs } = await runTaskContainer(docker, config, {
+        name: `nouva-import-restore-${shortId}`,
+        image: spec.image,
+        env: [
+          ...Object.entries(spec.envVars).map(([key, value]) => `${key}=${value}`),
+          "NOUVA_STAGED_RESTORE=1",
+          `NOUVA_DATA_PATH=${spec.dataPath}`,
+          `NOUVA_IMPORT_ARTIFACT=${EXTERNAL_BACKUP_IMPORT_ARTIFACT_PATH}`,
+        ],
+        entrypoint: ["sh", "-c"],
+        cmd: [
+          payload.variant === "postgres"
+            ? buildPostgresExternalBackupImportScript()
+            : buildRedisExternalBackupImportScript(),
+        ],
+        mounts: [
+          { source: payload.targetVolumeName, target: spec.mountPath },
+          {
+            source: stageVolume,
+            target: path.dirname(EXTERNAL_BACKUP_IMPORT_ARTIFACT_PATH),
+            readOnly: true,
+          },
+        ],
+        // A custom-format archive is arbitrary SQL replayed by the destination's own superuser, so
+        // the container that replays it gets no network at all: it can reach neither the internet
+        // nor the customer's other services, and it is destroyed when the import ends.
+        networkMode: "none",
+        timeoutMs: 6 * 60 * 60_000,
+      }));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "unknown error";
+      throw new ExternalBackupImportError(
+        message.includes(EXTERNAL_BACKUP_IMPORT_RESTORED_MARKER)
+          ? "validation_failed"
+          : "restore_failed",
+        message
+      );
+    }
+
+    const validatedAt = new Date().toISOString();
+    const importProof: ExternalBackupImportProofV1 = {
+      version: 1,
+      importId: payload.importId,
+      format: payload.format,
+      targetVolumeId: payload.targetVolumeId,
+      targetVolumeName: payload.targetVolumeName,
+      artifactSha256: observed.sha256,
+      artifactSizeBytes: observed.sizeBytes,
+      digestVerified: true,
+      headerVerified: true,
+      sourceEngineVersion: verification.sourceEngineVersion,
+      destinationVariant: payload.variant,
+      destinationVersion: payload.version,
+      validationMethod:
+        payload.variant === "postgres" ? "postgres-startup-sql-read" : "redis-load-ping",
+      isolatedDatabaseStarted: true,
+      ...(payload.variant === "postgres"
+        ? { relationCount: readImportCount(restoreLogs, "NOUVA_IMPORT_RELATIONS:") ?? 0 }
+        : {
+            keyCount: readImportCount(restoreLogs, "NOUVA_IMPORT_KEYS:") ?? 0,
+            volatileKeyCount: readImportCount(restoreLogs, "NOUVA_IMPORT_VOLATILE_KEYS:") ?? 0,
+          }),
+      validatedAt,
+    };
+
+    return {
+      volumeName: payload.targetVolumeName,
+      verifiedAt: validatedAt,
+      importProof,
+    };
+  } finally {
+    await docker.removeVolume(stageVolume, true);
+    // The artifact's life is exactly this work item: import work is queued with a single attempt,
+    // so nothing will ask for these bytes again whether it succeeded or failed. Deletion is
+    // best-effort — a stranded object costs storage, while throwing here would replace a real
+    // import outcome with a cleanup error.
+    await runTaskContainer(docker, config, {
+      name: `nouva-import-cleanup-${shortId}`,
+      image: agentTaskImage,
+      env: buildArchiveDestinationEnv(payload.destination, payload.objectKey),
+      cmd: [
+        "sh",
+        "-c",
+        [
+          "set -eu",
+          `remote="${buildArchiveRemoteExpression()}"`,
+          'rclone deletefile "$remote" || true',
+        ].join("\n"),
+      ],
+      timeoutMs: 10 * 60_000,
+    }).catch((error) => {
+      console.warn(
+        `[nouva-agent] failed to delete the import artifact for ${payload.importId}:`,
+        error
+      );
+    });
+  }
+}
+
 async function handleRestart(docker: DockerApiClient, payload: RestartServicePayload) {
   const identifier = resolveServiceContainerIdentifier(payload);
   if (!identifier) {
@@ -4800,6 +5177,13 @@ async function processWorkItem(
           payload as unknown as RestorePostgresPitrPayload
         );
         break;
+      case "import_external_backup":
+        result = await handleImportExternalBackup(
+          docker,
+          config,
+          payload as unknown as ImportExternalBackupPayload
+        );
+        break;
       case "expire_volume_backup_repository":
         result = await handleExpireVolumeBackupRepository(
           docker,
@@ -4852,7 +5236,11 @@ async function processWorkItem(
         throw new Error(`Unsupported work kind: ${workItem.kind}`);
     }
   } catch (err) {
-    if (err instanceof AppRolloutError || err instanceof WorkerRolloutError) {
+    if (
+      err instanceof AppRolloutError ||
+      err instanceof WorkerRolloutError ||
+      err instanceof ExternalBackupImportError
+    ) {
       failureResult = err.result;
     }
     workError = err instanceof Error ? err : new Error("Unknown agent work failure");

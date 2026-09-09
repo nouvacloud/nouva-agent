@@ -48,6 +48,7 @@ export const AGENT_WORK_KINDS = [
   "delete_volume_backup",
   "restore_volume_backup",
   "restore_postgres_pitr",
+  "import_external_backup",
   "expire_volume_backup_repository",
   "reconcile_service_resources",
   "sync_routing",
@@ -305,6 +306,7 @@ export type AgentCapabilities = {
   managedVolumeCapacityV1?: boolean;
   workerServicesV1?: boolean;
   workerVolumeRolloutV1?: boolean;
+  externalBackupImportV1?: boolean;
   [key: string]: boolean | undefined;
 };
 
@@ -889,6 +891,7 @@ export function getDefaultAgentCapabilities(): AgentCapabilities {
     managedVolumeCapacityV1: true,
     workerServicesV1: true,
     workerVolumeRolloutV1: true,
+    externalBackupImportV1: true,
   };
 }
 

@@ -13,6 +13,9 @@ import {
   buildAgentWorkFailureReport,
   buildAppContainerSpec,
   buildDatabaseContainerSpec,
+  buildExternalBackupImportFetchScript,
+  buildPostgresExternalBackupImportScript,
+  buildRedisExternalBackupImportScript,
   buildUpdateAgentRuntimeEnv,
   deployAppImageWithDependencies,
   handleApplyDatabaseVolume,
@@ -21,10 +24,12 @@ import {
   handleDeleteProject,
   handleDeleteService,
   handleDeleteVolume,
+  handleImportExternalBackup,
   handleRestorePostgresPitr,
   handleRestoreVolumeBackup,
   handleWipeVolume,
   isAgentWorkResultRejected,
+  parseExternalBackupImportObservation,
   preflightDatabasePublicPort,
   prepareAppBuildkitRuntime,
   readApiRequestErrorMessage,
@@ -3237,5 +3242,231 @@ describe("verified volume wipe", () => {
       previousVolume: { name: "nouva-vol-vol_1", absent: true },
       replacementVolume: { name: "nouva-vol-vol_1", present: true },
     });
+  });
+});
+
+describe("external backup import", () => {
+  const POSTGRES_HEADER_BASE64 =
+    "UEdETVABEAAECAEBADgAAAAAJwAAAAARAAAAAAkAAAAACAAAAAB+AAAAAAAAAAAABwAAAGZpeHR1cmUA" +
+    "HwAAADE2LjE1IChEZWJpYW4gMTYuMTUtMS5wZ2RnMTMrMikABAAAADE4LjQABwAAAABWDQAAAAAAAAAAAQAAADAAAQA=";
+  const POSTGRES_SHA256 = "fb2e454c51162909c3da786edb545027752cd2f3004887bef4a7421808d0ac1e";
+
+  function createImportPayload(overrides: Record<string, unknown> = {}) {
+    return {
+      projectId: "project_1",
+      serviceId: "service_1",
+      serviceName: "db",
+      variant: "postgres" as const,
+      version: "17",
+      importId: "import_abcdef123456",
+      format: "postgres-custom-dump-v1" as const,
+      artifactSha256: POSTGRES_SHA256,
+      artifactSizeBytes: 1024,
+      objectKey: "imports/v1/projects/project_1/services/service_1/import_abcdef123456.artifact",
+      sourceVolumeId: "volume_source",
+      sourceVolumeName: "nouva-vol-volume_source",
+      targetVolumeId: "volume_target",
+      targetVolumeName: "nouva-vol-volume_target",
+      targetMountPath: "/var/lib/postgresql",
+      destination: {
+        bucket: "nouva-backups",
+        endpoint: "https://s3.example.com",
+        region: "eu-west-1",
+        pathStyle: true,
+        verifyTls: true,
+        accessKeyId: "key",
+        secretAccessKey: "secret",
+      },
+      imageUrl: "registry.example.com/nouva/postgres:17",
+      envVars: { POSTGRES_USER: "app", POSTGRES_PASSWORD: "pw", POSTGRES_DB: "app" },
+      containerArgs: [],
+      dataPath: "/var/lib/postgresql/pgdata",
+      credentials: { username: "app", password: "pw", database: "app" },
+      ...overrides,
+    };
+  }
+
+  function fetchLogs(input: { sha256: string; sizeBytes: number; headerBase64: string }): string {
+    return [
+      `NOUVA_SHA256:${input.sha256}`,
+      `NOUVA_SIZE_BYTES:${input.sizeBytes}`,
+      `NOUVA_ARTIFACT_HEADER:${input.headerBase64}`,
+    ].join("\n");
+  }
+
+  test("measures the artifact without deciding anything about it", () => {
+    const script = buildExternalBackupImportFetchScript(8192);
+
+    expect(script).toContain('rclone copyto "$remote" "$artifact"');
+    expect(script).toContain('printf "NOUVA_SHA256:%s\\n" "$actual_sha256"');
+    expect(script).toContain('printf "NOUVA_SIZE_BYTES:%s\\n" "$actual_size"');
+    expect(script).toContain("head -c 8192");
+    // The managed-restore path guards its digest check with `if [ -n "$EXPECTED_SHA256" ]`, which
+    // silently passes when the digest is absent. An import must never grow that shape: the
+    // comparison belongs to the verifier, which has no way to skip it.
+    expect(script).not.toContain("EXPECTED_SHA256");
+  });
+
+  test("replays a Postgres archive atomically and strips its ownership claims", () => {
+    const script = buildPostgresExternalBackupImportScript();
+
+    expect(script).toContain("--single-transaction");
+    expect(script).toContain("--exit-on-error");
+    expect(script).toContain("--no-owner");
+    expect(script).toContain("--no-privileges");
+    // Every other client in this script reaches the destination through PGHOST/PGPORT/PGDATABASE,
+    // and `pg_restore` is the one that does not: given no `--dbname` it writes SQL to stdout and
+    // `--single-transaction` aborts for want of a connection, so the archive is never replayed.
+    const restoreCommand = script.split("\n").find((line) => line.startsWith("pg_restore "));
+    expect(restoreCommand).toContain('--dbname "$PGDATABASE"');
+    expect(script.indexOf("pg_restore")).toBeLessThan(script.indexOf("NOUVA_IMPORT_RESTORED:"));
+    expect(script.indexOf("NOUVA_IMPORT_RESTORED:")).toBeLessThan(
+      script.indexOf("NOUVA_IMPORT_RELATIONS:")
+    );
+  });
+
+  test("proves a Redis snapshot loads in the engine that will serve it", () => {
+    const script = buildRedisExternalBackupImportScript();
+
+    expect(script).toContain("redis-server --port 6380 --bind 127.0.0.1");
+    expect(script).toContain("redis-cli -h 127.0.0.1 -p 6380 PING");
+    expect(script).toContain("The destination Redis server did not load the imported snapshot");
+    expect(script).toContain('printf "NOUVA_IMPORT_VOLATILE_KEYS:%s\\n" "$volatile"');
+  });
+
+  test("refuses to proceed when the download reported incomplete evidence", () => {
+    expect(() =>
+      parseExternalBackupImportObservation(
+        `NOUVA_SIZE_BYTES:1024\nNOUVA_ARTIFACT_HEADER:${POSTGRES_HEADER_BASE64}`
+      )
+    ).toThrow(/complete integrity evidence/);
+    expect(() =>
+      parseExternalBackupImportObservation(
+        `NOUVA_SHA256:${POSTGRES_SHA256}\nNOUVA_ARTIFACT_HEADER:${POSTGRES_HEADER_BASE64}`
+      )
+    ).toThrow(/complete integrity evidence/);
+    expect(() =>
+      parseExternalBackupImportObservation(`NOUVA_SHA256:${POSTGRES_SHA256}\nNOUVA_SIZE_BYTES:1024`)
+    ).toThrow(/complete integrity evidence/);
+  });
+
+  test("stages a verified archive and returns a receipt bound to the work item", async () => {
+    const docker = createDockerMock();
+    docker.containerLogs
+      .mockResolvedValueOnce(
+        fetchLogs({
+          sha256: POSTGRES_SHA256,
+          sizeBytes: 1024,
+          headerBase64: POSTGRES_HEADER_BASE64,
+        })
+      )
+      .mockResolvedValueOnce("NOUVA_IMPORT_RESTORED:1\nNOUVA_IMPORT_RELATIONS:42");
+
+    const result = await handleImportExternalBackup(
+      docker as never,
+      {} as never,
+      createImportPayload() as never
+    );
+
+    expect(result.volumeName).toBe("nouva-vol-volume_target");
+    expect(result.importProof).toEqual(
+      expect.objectContaining({
+        version: 1,
+        importId: "import_abcdef123456",
+        format: "postgres-custom-dump-v1",
+        targetVolumeId: "volume_target",
+        artifactSha256: POSTGRES_SHA256,
+        artifactSizeBytes: 1024,
+        digestVerified: true,
+        headerVerified: true,
+        sourceEngineVersion: "16.15 (Debian 16.15-1.pgdg13+2)",
+        destinationVariant: "postgres",
+        destinationVersion: "17",
+        validationMethod: "postgres-startup-sql-read",
+        isolatedDatabaseStarted: true,
+        relationCount: 42,
+      })
+    );
+
+    const restoreSpec = docker.createContainer.mock.calls[1]?.[0];
+    expect(restoreSpec?.image).toBe("registry.example.com/nouva/postgres:17");
+    // Untrusted SQL runs as the destination superuser; the container that replays it must not be
+    // able to reach the internet or the customer's other services.
+    expect(restoreSpec?.hostConfig?.NetworkMode).toBe("none");
+    expect(
+      restoreSpec?.hostConfig?.Mounts?.find(
+        (mount: { Target: string }) => mount.Target === "/nouva-import"
+      )?.ReadOnly
+    ).toBe(true);
+  });
+
+  test("fails an artifact whose bytes do not match the registered digest", async () => {
+    const docker = createDockerMock();
+    docker.containerLogs.mockResolvedValueOnce(
+      fetchLogs({
+        sha256: "0".repeat(64),
+        sizeBytes: 1024,
+        headerBase64: POSTGRES_HEADER_BASE64,
+      })
+    );
+
+    const error = await handleImportExternalBackup(
+      docker as never,
+      {} as never,
+      createImportPayload() as never
+    ).catch((caught: unknown) => caught);
+
+    expect((error as { result: unknown }).result).toEqual({
+      importFailure: {
+        category: "integrity_mismatch",
+        message: "Uploaded artifact does not match the SHA-256 digest registered for this import",
+      },
+    });
+    // Nothing was staged: the target volume is never created for bytes that failed verification.
+    expect(
+      docker.createVolume.mock.calls.some((call) => call[0] === "nouva-vol-volume_target")
+    ).toBe(false);
+  });
+
+  test("fails an archive taken from a newer engine than the destination runs", async () => {
+    const docker = createDockerMock();
+    docker.containerLogs.mockResolvedValueOnce(
+      fetchLogs({
+        sha256: POSTGRES_SHA256,
+        sizeBytes: 1024,
+        headerBase64: POSTGRES_HEADER_BASE64,
+      })
+    );
+
+    const error = await handleImportExternalBackup(
+      docker as never,
+      {} as never,
+      createImportPayload({ version: "15" }) as never
+    ).catch((caught: unknown) => caught);
+
+    expect(
+      (error as { result: { importFailure: { category: string } } }).result.importFailure
+    ).toEqual(expect.objectContaining({ category: "engine_version_incompatible" }));
+  });
+
+  test("deletes the artifact whether the import succeeded or failed", async () => {
+    const docker = createDockerMock();
+    docker.containerLogs.mockResolvedValueOnce(
+      fetchLogs({
+        sha256: "0".repeat(64),
+        sizeBytes: 1024,
+        headerBase64: POSTGRES_HEADER_BASE64,
+      })
+    );
+
+    await handleImportExternalBackup(
+      docker as never,
+      {} as never,
+      createImportPayload() as never
+    ).catch(() => {});
+
+    const cleanupSpec = docker.createContainer.mock.calls.at(-1)?.[0];
+    expect(cleanupSpec?.name).toBe("nouva-import-cleanup-import_abcde");
+    expect(cleanupSpec?.cmd?.[2]).toContain('rclone deletefile "$remote" || true');
   });
 });
