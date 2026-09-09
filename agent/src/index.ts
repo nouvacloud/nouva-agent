@@ -1669,6 +1669,22 @@ export function buildAgentWorkFailureReport(input: {
   };
 }
 
+/**
+ * Every control-plane request the agent makes is awaited by a loop that only advances once the
+ * request settles. A socket that stalls rather than fails -- a connection held open across the
+ * Traefik cutover of a control-plane deploy, say -- therefore does not retry, it ends the loop:
+ * the heartbeat timer stops re-arming, a leased work item never reports, and the container goes on
+ * looking healthy. Give every request a deadline so a stall arrives as the rejection the loops
+ * already know how to handle. Every payload here is a small JSON document, so one bound fits all
+ * of them.
+ */
+export const AGENT_REQUEST_TIMEOUT_MS = 30_000;
+
+function requestDeadlineSignal(callerSignal?: AbortSignal): AbortSignal {
+  const deadline = AbortSignal.timeout(AGENT_REQUEST_TIMEOUT_MS);
+  return callerSignal ? AbortSignal.any([callerSignal, deadline]) : deadline;
+}
+
 async function apiRequest<T>(
   pathName: string,
   options: {
@@ -1685,7 +1701,7 @@ async function apiRequest<T>(
       ...(options.token ? { authorization: `Bearer ${options.token}` } : {}),
     },
     body: options.body ? JSON.stringify(options.body) : undefined,
-    signal: options.signal,
+    signal: requestDeadlineSignal(options.signal),
   });
 
   if (!response.ok) {
@@ -1825,7 +1841,8 @@ let registrationUsed = false;
 
 async function registerAgent(
   docker: DockerApiClient,
-  config: AgentRuntimeConfig
+  config: AgentRuntimeConfig,
+  signal?: AbortSignal
 ): Promise<{
   credentials: StoredCredentials;
   config: AgentRuntimeConfig;
@@ -1839,6 +1856,7 @@ async function registerAgent(
       agentVersion: AGENT_VERSION,
       ...snapshot,
     },
+    signal,
   });
 
   const credentials = {
@@ -1855,7 +1873,8 @@ async function registerAgent(
 async function sendHeartbeat(
   docker: DockerApiClient,
   credentials: StoredCredentials,
-  config: AgentRuntimeConfig
+  config: AgentRuntimeConfig,
+  signal?: AbortSignal
 ): Promise<AgentRuntimeConfig> {
   const snapshot = await collectValidationSnapshot(docker, config, credentials);
 
@@ -1870,6 +1889,7 @@ async function sendHeartbeat(
       agentVersion: AGENT_VERSION,
       ...snapshot,
     }),
+    signal: requestDeadlineSignal(signal),
   });
 
   if (response.status === 401) {
@@ -1877,7 +1897,7 @@ async function sendHeartbeat(
       throw new Error("Agent credentials were rejected. Reinstall the agent.");
     }
 
-    const next = await registerAgent(docker, config);
+    const next = await registerAgent(docker, config, signal);
     // Propagate the fresh token to every closure holding this credentials object; the next
     // heartbeat's validation snapshot reconciles Alloy with it as well.
     adoptReregisteredCredentials(credentials, next.credentials);
@@ -1909,6 +1929,175 @@ async function sendHeartbeat(
     }
   }
   return body.config;
+}
+
+type AgentHeartbeatTimer = unknown;
+
+export interface AgentHeartbeatLoopInput {
+  /** One heartbeat attempt. The signal is aborted when the attempt outlives its deadline. */
+  runTick: (signal: AbortSignal) => Promise<void>;
+  /** Read per tick, because the control plane can change the interval in its heartbeat response. */
+  nextDelayMs: () => number;
+  isStopped: () => boolean;
+  onFailure: (error: unknown, failures: number, limit: number) => void;
+  onFailureLimit: () => void;
+  tickTimeoutMs?: number;
+  maxConsecutiveFailures?: number;
+  schedule?: (callback: () => void, delayMs: number) => AgentHeartbeatTimer;
+  clearScheduled?: (timer: AgentHeartbeatTimer) => void;
+}
+
+export interface AgentHeartbeatLoop {
+  start(): void;
+  stop(): void;
+}
+
+/**
+ * A tick that outlives this is treated as failed. It is deliberately far longer than the request
+ * deadline: the only thing left that can hang once the request is bounded is the Docker socket the
+ * validation snapshot reads, and a slow-but-working host must not be counted as a failure. What
+ * matters is that no tick can hang *forever*, because the reschedule hangs with it.
+ */
+export const HEARTBEAT_TICK_TIMEOUT_MS = 90_000;
+const MAX_HEARTBEAT_FAILURES = 5;
+
+/**
+ * The heartbeat loop, with the one invariant its inline predecessor lacked: every tick settles, so
+ * every tick reschedules. Rescheduling used to hang off `.finally()` of an unbounded promise, so a
+ * single stalled request ended the loop for good -- and because the failure watchdog counts
+ * rejections, a loop that never gets a second attempt can never reach the limit that exists to
+ * restart the process. One wedged request left a live agent reporting nothing until someone noticed
+ * the server card said Offline.
+ */
+export function createAgentHeartbeatLoop(input: AgentHeartbeatLoopInput): AgentHeartbeatLoop {
+  const tickTimeoutMs = input.tickTimeoutMs ?? HEARTBEAT_TICK_TIMEOUT_MS;
+  const failureLimit = input.maxConsecutiveFailures ?? MAX_HEARTBEAT_FAILURES;
+  const schedule = input.schedule ?? ((callback, delayMs) => setTimeout(callback, delayMs));
+  const clearScheduled =
+    input.clearScheduled ?? ((timer) => clearTimeout(timer as ReturnType<typeof setTimeout>));
+
+  let failures = 0;
+  let skips = 0;
+  let stopped = false;
+  let inFlight = false;
+  let scheduled: AgentHeartbeatTimer | null = null;
+
+  const reschedule = () => {
+    if (stopped || input.isStopped()) {
+      return;
+    }
+    scheduled = schedule(() => {
+      scheduled = null;
+      void runTick();
+    }, input.nextDelayMs());
+  };
+
+  /** Returns whether the loop should keep going, so the watchdog decision lives in one place. */
+  const recordFailure = (error: unknown): boolean => {
+    failures++;
+    input.onFailure(error, failures, failureLimit);
+    if (failures >= failureLimit) {
+      stopped = true;
+      input.onFailureLimit();
+      return false;
+    }
+    return true;
+  };
+
+  /**
+   * A skip means the previous tick is still outstanding, not that anything new has gone wrong --
+   * so it is counted apart from `failures`. Merging the two meant a merely slow tick could rack
+   * up "skipped" ticks on the same counter as real failures and hit the limit before it ever got
+   * a chance to succeed, which is the opposite of what the limit exists to detect. Enough
+   * consecutive skips of the SAME still-stuck tick still walks this counter to the limit, which
+   * is what makes a genuine wedge exit.
+   */
+  const recordSkip = (): boolean => {
+    skips++;
+    input.onFailure(
+      new Error("Heartbeat skipped: the previous tick has not finished"),
+      skips,
+      failureLimit
+    );
+    if (skips >= failureLimit) {
+      stopped = true;
+      input.onFailureLimit();
+      return false;
+    }
+    return true;
+  };
+
+  const runTick = async (): Promise<void> => {
+    if (stopped || input.isStopped()) {
+      return;
+    }
+
+    // A tick that blew its deadline is abandoned, not cancelled: aborting the signal reaches the
+    // request, but not the validation snapshot the tick collects before it, and that snapshot
+    // reconciles fixed-name Docker resources. Two of those running at once is container churn, so
+    // an overrun tick is counted and waited out rather than overlapped.
+    if (inFlight) {
+      if (recordSkip()) {
+        reschedule();
+      }
+      return;
+    }
+
+    const controller = new AbortController();
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    inFlight = true;
+    const work = input.runTick(controller.signal);
+    // Whenever the stuck work finally settles -- however late -- its outcome is what actually
+    // matters, not how many skips piled up while waiting for it. A late success means the tick
+    // was merely slow, not broken, so both counters clear. A late failure only confirms what the
+    // deadline already reported, so just the skip count (no longer meaningful) clears.
+    void work.then(
+      () => {
+        inFlight = false;
+        skips = 0;
+        failures = 0;
+      },
+      () => {
+        inFlight = false;
+        skips = 0;
+      }
+    );
+
+    try {
+      await Promise.race([
+        work,
+        new Promise<never>((_, reject) => {
+          deadline = setTimeout(() => {
+            controller.abort();
+            reject(new Error(`Heartbeat exceeded its ${tickTimeoutMs}ms deadline`));
+          }, tickTimeoutMs);
+        }),
+      ]);
+      failures = 0;
+      skips = 0;
+    } catch (error) {
+      if (!recordFailure(error)) {
+        return;
+      }
+    } finally {
+      clearTimeout(deadline);
+    }
+
+    reschedule();
+  };
+
+  return {
+    start() {
+      reschedule();
+    },
+    stop() {
+      stopped = true;
+      if (scheduled !== null) {
+        clearScheduled(scheduled);
+        scheduled = null;
+      }
+    },
+  };
 }
 
 function buildProjectNetwork(projectId: string): string {
@@ -5580,36 +5769,24 @@ async function main() {
     void shutdown();
   });
 
-  let heartbeatFailures = 0;
-  const MAX_HEARTBEAT_FAILURES = 5;
-  const scheduleHeartbeat = () => {
-    const intervalSeconds = config.observability.enabled
-      ? Math.min(config.heartbeatIntervalSeconds, 30)
-      : config.heartbeatIntervalSeconds;
-    setTimeout(() => {
-      if (isShuttingDown) {
-        return;
-      }
-      void sendHeartbeat(docker, credentials!, config)
-        .then((nextConfig) => {
-          config = nextConfig;
-          heartbeatFailures = 0;
-        })
-        .catch((error) => {
-          heartbeatFailures++;
-          console.error(
-            `[nouva-agent] heartbeat failed (${heartbeatFailures}/${MAX_HEARTBEAT_FAILURES})`,
-            error
-          );
-          if (heartbeatFailures >= MAX_HEARTBEAT_FAILURES) {
-            console.error("[nouva-agent] too many heartbeat failures, exiting");
-            process.exit(1);
-          }
-        })
-        .finally(scheduleHeartbeat);
-    }, intervalSeconds * 1000);
-  };
-  scheduleHeartbeat();
+  const heartbeatLoop = createAgentHeartbeatLoop({
+    runTick: async (signal) => {
+      config = await sendHeartbeat(docker, credentials!, config, signal);
+    },
+    nextDelayMs: () =>
+      (config.observability.enabled
+        ? Math.min(config.heartbeatIntervalSeconds, 30)
+        : config.heartbeatIntervalSeconds) * 1000,
+    isStopped: () => isShuttingDown,
+    onFailure: (error, failures, limit) => {
+      console.error(`[nouva-agent] heartbeat failed (${failures}/${limit})`, error);
+    },
+    onFailureLimit: () => {
+      console.error("[nouva-agent] too many heartbeat failures, exiting");
+      process.exit(1);
+    },
+  });
+  heartbeatLoop.start();
 
   setInterval(() => {
     if (config.observability.enabled || isShuttingDown) {

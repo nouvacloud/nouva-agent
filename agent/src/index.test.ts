@@ -17,6 +17,7 @@ import {
   buildPostgresExternalBackupImportScript,
   buildRedisExternalBackupImportScript,
   buildUpdateAgentRuntimeEnv,
+  createAgentHeartbeatLoop,
   deployAppImageWithDependencies,
   handleApplyDatabaseVolume,
   handleCreateVolumeBackup,
@@ -1045,6 +1046,340 @@ describe("agent work lease renewal", () => {
     await controller.stop();
 
     expect(clearScheduled).toHaveBeenCalledWith(timer);
+  });
+});
+
+describe("agent heartbeat loop", () => {
+  const drainMicrotasks = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  test("re-arms after a heartbeat that never settles", async () => {
+    const scheduled: Array<() => void> = [];
+    const failures: number[] = [];
+    let ticks = 0;
+    let abortedFirstTick = false;
+    let reachedLimit = false;
+
+    const loop = createAgentHeartbeatLoop({
+      runTick: (signal) => {
+        ticks += 1;
+        if (ticks > 1) {
+          return Promise.resolve();
+        }
+        signal.addEventListener("abort", () => {
+          abortedFirstTick = true;
+        });
+        // The wedged request: it never settles and never rejects.
+        return new Promise<void>(() => {});
+      },
+      nextDelayMs: () => 0,
+      isStopped: () => false,
+      onFailure: (_error, count) => failures.push(count),
+      onFailureLimit: () => {
+        reachedLimit = true;
+      },
+      tickTimeoutMs: 20,
+      schedule: (callback) => {
+        scheduled.push(callback);
+        return scheduled.length;
+      },
+      clearScheduled: () => undefined,
+    });
+
+    loop.start();
+    expect(scheduled).toHaveLength(1);
+
+    scheduled.shift()?.();
+    await new Promise((resolve) => setTimeout(resolve, 60));
+
+    expect(failures).toEqual([1]);
+    expect(abortedFirstTick).toBe(true);
+    // The whole point: the stalled tick did not end the timer chain.
+    expect(scheduled).toHaveLength(1);
+
+    scheduled.shift()?.();
+    await drainMicrotasks();
+
+    // The abandoned tick is still running, so the next attempt is counted and waited out rather
+    // than started alongside it. The chain keeps re-arming, which is what walks the failure limit.
+    // The first entry is the real failure from the original tick's own deadline loss; the second
+    // is a skip on its own counter (restarting at 1, not continuing to 2).
+    expect(ticks).toBe(1);
+    expect(failures).toEqual([1, 1]);
+    expect(scheduled).toHaveLength(1);
+    expect(reachedLimit).toBe(false);
+    loop.stop();
+  });
+
+  test("a heartbeat that is genuinely wedged forever still hits the watchdog", async () => {
+    const scheduled: Array<() => void> = [];
+    const failures: number[] = [];
+    let reachedLimit = false;
+
+    const loop = createAgentHeartbeatLoop({
+      // The wedged request: it never settles and never rejects, on every attempt.
+      runTick: () => new Promise<void>(() => {}),
+      nextDelayMs: () => 0,
+      isStopped: () => false,
+      onFailure: (_error, count) => failures.push(count),
+      onFailureLimit: () => {
+        reachedLimit = true;
+      },
+      tickTimeoutMs: 20,
+      maxConsecutiveFailures: 5,
+      schedule: (callback) => {
+        scheduled.push(callback);
+        return scheduled.length;
+      },
+      clearScheduled: () => undefined,
+    });
+
+    loop.start();
+
+    // First attempt: its own deadline loses the race -- 1 real failure.
+    scheduled.shift()?.();
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(failures).toEqual([1]);
+
+    // The same stuck tick is still in flight for every subsequent attempt, so each one is a
+    // skip, counted on its own counter. Enough consecutive skips of the same still-stuck tick
+    // must still walk the loop to the limit -- a genuine wedge must still cause the agent to
+    // exit, even though skips no longer share a counter with real failures.
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      scheduled.shift()?.();
+      await drainMicrotasks();
+    }
+
+    expect(reachedLimit).toBe(true);
+    expect(scheduled).toHaveLength(0);
+    loop.stop();
+  });
+
+  test("a slow tick that eventually succeeds does not trip the watchdog", async () => {
+    const scheduled: Array<() => void> = [];
+    const failures: number[] = [];
+    let ticks = 0;
+    let reachedLimit = false;
+    let releaseFirstTick: (() => void) | undefined;
+
+    const loop = createAgentHeartbeatLoop({
+      runTick: () => {
+        ticks += 1;
+        if (ticks > 1) {
+          return Promise.resolve();
+        }
+        // Slow, not hung: it outlives the deadline, but eventually resolves on its own.
+        return new Promise<void>((resolve) => {
+          releaseFirstTick = resolve;
+        });
+      },
+      nextDelayMs: () => 0,
+      isStopped: () => false,
+      onFailure: (_error, count) => failures.push(count),
+      onFailureLimit: () => {
+        reachedLimit = true;
+      },
+      tickTimeoutMs: 20,
+      maxConsecutiveFailures: 5,
+      schedule: (callback) => {
+        scheduled.push(callback);
+        return scheduled.length;
+      },
+      clearScheduled: () => undefined,
+    });
+
+    loop.start();
+
+    // The first attempt's own deadline loses the race -- 1 real failure.
+    scheduled.shift()?.();
+    await new Promise((resolve) => setTimeout(resolve, 60));
+
+    // Four more reschedules land while the same slow tick is still outstanding. Under the
+    // regression, these skips shared the same counter as the real failure above and would have
+    // hit the default limit (5) and exited here, even though the tick was never actually stuck.
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      scheduled.shift()?.();
+      await drainMicrotasks();
+    }
+    expect(reachedLimit).toBe(false);
+
+    // The slow operation finally succeeds.
+    releaseFirstTick?.();
+    await drainMicrotasks();
+
+    scheduled.shift()?.();
+    await drainMicrotasks();
+
+    expect(ticks).toBe(2);
+    expect(reachedLimit).toBe(false);
+    loop.stop();
+  });
+
+  test("never runs two ticks at once, and resumes when the stalled one settles", async () => {
+    const scheduled: Array<() => void> = [];
+    const failures: number[] = [];
+    let concurrent = 0;
+    let peakConcurrent = 0;
+    let ticks = 0;
+    let releaseFirstTick: (() => void) | undefined;
+
+    const loop = createAgentHeartbeatLoop({
+      runTick: () => {
+        ticks += 1;
+        concurrent += 1;
+        peakConcurrent = Math.max(peakConcurrent, concurrent);
+        if (ticks > 1) {
+          concurrent -= 1;
+          return Promise.resolve();
+        }
+        // A tick that outlives its deadline: aborting reaches the request, but the Docker
+        // reconciliation it already started keeps going until it finishes on its own.
+        return new Promise<void>((resolve) => {
+          releaseFirstTick = () => {
+            concurrent -= 1;
+            resolve();
+          };
+        });
+      },
+      nextDelayMs: () => 0,
+      isStopped: () => false,
+      onFailure: (_error, count) => failures.push(count),
+      onFailureLimit: () => undefined,
+      tickTimeoutMs: 20,
+      schedule: (callback) => {
+        scheduled.push(callback);
+        return scheduled.length;
+      },
+      clearScheduled: () => undefined,
+    });
+
+    loop.start();
+    scheduled.shift()?.();
+    await new Promise((resolve) => setTimeout(resolve, 60));
+
+    // Two attempts land while the first tick is still in flight; neither may overlap it.
+    scheduled.shift()?.();
+    await drainMicrotasks();
+    scheduled.shift()?.();
+    await drainMicrotasks();
+
+    expect(ticks).toBe(1);
+    expect(peakConcurrent).toBe(1);
+    // The first entry is the real failure from the original tick losing its own deadline race;
+    // the next two are skip counts (1, 2) for the two reschedules that landed while it was still
+    // outstanding. They are tracked on separate counters, so the skip counts restart from 1
+    // rather than continuing the real-failure count to 2 and 3.
+    expect(failures).toEqual([1, 1, 2]);
+
+    releaseFirstTick?.();
+    await drainMicrotasks();
+
+    // Once the stalled work finally lets go, the loop takes its next turn normally.
+    scheduled.shift()?.();
+    await drainMicrotasks();
+
+    expect(ticks).toBe(2);
+    expect(peakConcurrent).toBe(1);
+    // The late success clears both counters; the next tick succeeds immediately too, so no new
+    // failures are ever recorded.
+    expect(failures).toEqual([1, 1, 2]);
+    loop.stop();
+  });
+
+  test("counts consecutive failures until the watchdog fires", async () => {
+    const scheduled: Array<() => void> = [];
+    const failures: number[] = [];
+    let reachedLimit = 0;
+
+    const loop = createAgentHeartbeatLoop({
+      runTick: () => Promise.reject(new Error("Heartbeat failed with status 502")),
+      nextDelayMs: () => 0,
+      isStopped: () => false,
+      onFailure: (_error, count) => failures.push(count),
+      onFailureLimit: () => {
+        reachedLimit += 1;
+      },
+      maxConsecutiveFailures: 3,
+      schedule: (callback) => {
+        scheduled.push(callback);
+        return scheduled.length;
+      },
+      clearScheduled: () => undefined,
+    });
+
+    loop.start();
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      scheduled.shift()?.();
+      await drainMicrotasks();
+    }
+
+    expect(failures).toEqual([1, 2, 3]);
+    expect(reachedLimit).toBe(1);
+    // At the limit the process is expected to exit; nothing further is scheduled.
+    expect(scheduled).toHaveLength(0);
+  });
+
+  test("a successful heartbeat clears earlier failures", async () => {
+    const scheduled: Array<() => void> = [];
+    const failures: number[] = [];
+    let attempts = 0;
+
+    const loop = createAgentHeartbeatLoop({
+      runTick: () => {
+        attempts += 1;
+        return attempts === 1 ? Promise.reject(new Error("transient")) : Promise.resolve();
+      },
+      nextDelayMs: () => 0,
+      isStopped: () => false,
+      onFailure: (_error, count) => failures.push(count),
+      onFailureLimit: () => undefined,
+      schedule: (callback) => {
+        scheduled.push(callback);
+        return scheduled.length;
+      },
+      clearScheduled: () => undefined,
+    });
+
+    loop.start();
+    scheduled.shift()?.();
+    await drainMicrotasks();
+    scheduled.shift()?.();
+    await drainMicrotasks();
+    scheduled.shift()?.();
+    await drainMicrotasks();
+
+    expect(failures).toEqual([1]);
+    expect(attempts).toBe(3);
+    loop.stop();
+  });
+
+  test("stops scheduling once the agent is shutting down", async () => {
+    const scheduled: Array<() => void> = [];
+    let shuttingDown = false;
+    let ticks = 0;
+
+    const loop = createAgentHeartbeatLoop({
+      runTick: () => {
+        ticks += 1;
+        return Promise.resolve();
+      },
+      nextDelayMs: () => 0,
+      isStopped: () => shuttingDown,
+      onFailure: () => undefined,
+      onFailureLimit: () => undefined,
+      schedule: (callback) => {
+        scheduled.push(callback);
+        return scheduled.length;
+      },
+      clearScheduled: () => undefined,
+    });
+
+    loop.start();
+    shuttingDown = true;
+    scheduled.shift()?.();
+    await drainMicrotasks();
+
+    expect(ticks).toBe(0);
+    expect(scheduled).toHaveLength(0);
   });
 });
 
