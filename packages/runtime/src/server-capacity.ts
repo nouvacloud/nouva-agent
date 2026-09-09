@@ -304,3 +304,143 @@ export function getServerCapacityLimits(
         : Math.max(0, Math.floor((diskBytesAvailable / GIBIBYTE) * SAFE_STORAGE_FREE_DISK_RATIO)),
   };
 }
+
+/**
+ * The smallest allocation the dashboard can express.
+ *
+ * Both resource-limit fields use `min="0.25"` and `step="0.25"`
+ * (`apps/web/components/service-resource-limits-section.tsx`), so below these values there is no
+ * number the user can type. Telling somebody to "choose a smaller limit" when less than one step is
+ * free is advice that cannot be followed, which is the whole complaint in #214.
+ */
+export const SMALLEST_SELECTABLE_CPU_MILLICORES = 250;
+export const SMALLEST_SELECTABLE_MEMORY_BYTES = RESOURCE_LIMIT_STEP_BYTES;
+
+/**
+ * The message's first sentence, kept stable on purpose.
+ *
+ * A worker schedule run that trips admission is recorded as `skipped` rather than `failed` by
+ * matching this prefix, in both the manual path (`@repo/trpc`) and the scheduler (`@repo/worker`).
+ * The sentence and the two classifiers therefore share one constant instead of three literals that
+ * happen to agree today.
+ */
+export const INSUFFICIENT_CAPACITY_PREFIX = "Insufficient server capacity.";
+
+export interface InsufficientCapacityFacts {
+  /** Limits the request asks for, per replica. */
+  requestedPerReplica: CapacityQuantity;
+  /** Replicas the request would start. One for everything that is not a scaled worker. */
+  replicaCount: number;
+  /** Headroom left after the platform and build reserves and everything already committed. */
+  available: CapacityQuantity;
+  /** Held back for the control plane and for the BuildKit daemon a deploy starts. */
+  reserved: CapacityQuantity;
+  /** Already held by the services on this server. */
+  committed: CapacityQuantity;
+}
+
+function formatCapacityDecimal(value: number): string {
+  return value
+    .toFixed(2)
+    .replace(/\.00$/, "")
+    .replace(/(\.\d)0$/, "$1");
+}
+
+/** Renders millicores the way the resource-limit fields and service cards do: "0.25 vCPU". */
+export function formatCpuAmount(millicores: number): string {
+  return `${formatCapacityDecimal(millicores / 1000)} vCPU`;
+}
+
+/**
+ * Renders bytes the way the resource-limit fields and service cards do.
+ *
+ * The dashboard labels gibibyte-derived values "GB" throughout, so this matches it rather than
+ * introducing a second unit vocabulary in the one place a user meets an error.
+ */
+export function formatMemoryAmount(bytes: number): string {
+  if (bytes < GIBIBYTE) {
+    return `${Math.round(bytes / MEBIBYTE)} MB RAM`;
+  }
+
+  return `${formatCapacityDecimal(bytes / GIBIBYTE)} GB RAM`;
+}
+
+function roundDownToStep(value: number, step: number): number {
+  return Math.max(0, Math.floor(value / step) * step);
+}
+
+function joinResourceNames(names: string[]): string {
+  return names.length === 2 ? `${names[0]} and ${names[1]}` : (names[0] ?? "");
+}
+
+function describeLargestFit(input: {
+  shortNames: string[];
+  available: CapacityQuantity;
+  replicaCount: number;
+}): string {
+  const parts: string[] = [];
+
+  if (input.shortNames.includes("CPU")) {
+    const perReplica = roundDownToStep(
+      input.available.cpuMillicores / input.replicaCount,
+      SMALLEST_SELECTABLE_CPU_MILLICORES
+    );
+    parts.push(formatCpuAmount(perReplica));
+  }
+
+  if (input.shortNames.includes("memory")) {
+    const perReplica = roundDownToStep(
+      input.available.memoryBytes / input.replicaCount,
+      SMALLEST_SELECTABLE_MEMORY_BYTES
+    );
+    parts.push(formatMemoryAmount(perReplica));
+  }
+
+  const suffix = input.replicaCount > 1 ? " per replica" : "";
+  return `${joinResourceNames(parts)}${suffix}`;
+}
+
+/**
+ * The rejection a user can act on.
+ *
+ * Two things were wrong with the raw string this replaces (#214): it printed millicores and byte
+ * counts nobody converts in their head, and it invited the user to retry with a smaller value even
+ * when the exhausted resource had no room for any value the form accepts. Which resource is short
+ * is therefore decided per dimension, and the advice changes shape when nothing smaller can fit.
+ */
+export function describeInsufficientCapacity(facts: InsufficientCapacityFacts): string {
+  const replicaCount = Math.max(1, Math.trunc(facts.replicaCount));
+  const requestedTotal: CapacityQuantity = {
+    cpuMillicores: facts.requestedPerReplica.cpuMillicores * replicaCount,
+    memoryBytes: facts.requestedPerReplica.memoryBytes * replicaCount,
+  };
+
+  const cpuShort = requestedTotal.cpuMillicores > facts.available.cpuMillicores;
+  const memoryShort = requestedTotal.memoryBytes > facts.available.memoryBytes;
+  // The caller only builds this when the request does not fit, so a request that looks like it fits
+  // in both dimensions got here through replaced or in-flight commitments. Naming both is the
+  // honest answer there rather than silently naming neither.
+  const shortNames =
+    !cpuShort && !memoryShort
+      ? ["CPU", "memory"]
+      : [...(cpuShort ? ["CPU"] : []), ...(memoryShort ? ["memory"] : [])];
+
+  const cpuExhausted = facts.available.cpuMillicores < SMALLEST_SELECTABLE_CPU_MILLICORES;
+  const memoryExhausted = facts.available.memoryBytes < SMALLEST_SELECTABLE_MEMORY_BYTES;
+  const exhaustedNames = [
+    ...(shortNames.includes("CPU") && cpuExhausted ? ["CPU"] : []),
+    ...(shortNames.includes("memory") && memoryExhausted ? ["memory"] : []),
+  ];
+
+  const acrossReplicas = replicaCount > 1 ? ` across ${replicaCount} replicas` : "";
+  const requestSentence = `This needs ${formatCpuAmount(requestedTotal.cpuMillicores)} and ${formatMemoryAmount(requestedTotal.memoryBytes)}${acrossReplicas}, but only ${formatCpuAmount(facts.available.cpuMillicores)} and ${formatMemoryAmount(facts.available.memoryBytes)} are free.`;
+
+  const guidance =
+    exhaustedNames.length > 0
+      ? `${joinResourceNames(exhaustedNames)} on this server ${exhaustedNames.length === 2 ? "are" : "is"} fully allocated, so no smaller limit will fit. Free capacity first: lower the limits on an existing service, delete a service you no longer need, or connect a larger server.`
+      : `Lower this service to at most ${describeLargestFit({ shortNames, available: facts.available, replicaCount })}, or free capacity by lowering the limits on an existing service or deleting one you no longer need.`;
+
+  const accounting = `Nouva keeps ${formatCpuAmount(facts.reserved.cpuMillicores)} and ${formatMemoryAmount(facts.reserved.memoryBytes)} reserved for the platform and builds, and the services already on this server hold ${formatCpuAmount(facts.committed.cpuMillicores)} and ${formatMemoryAmount(facts.committed.memoryBytes)}.`;
+
+  return `${INSUFFICIENT_CAPACITY_PREFIX} ${requestSentence} ${guidance} ${accounting}`;
+}
