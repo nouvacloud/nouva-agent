@@ -211,6 +211,43 @@ describe("worker container specs", () => {
     });
   });
 
+  test("keeps the no-swap default when no allowance is stored", () => {
+    const result = buildWorkerContainerSpec({
+      environment,
+      payload: workerPayload,
+      image: workerImage,
+      replicaIndex: 0,
+    });
+
+    expect(result.spec.hostConfig).toEqual(
+      expect.objectContaining({
+        Memory: 512 * 1024 * 1024,
+        MemorySwap: 512 * 1024 * 1024,
+      })
+    );
+  });
+
+  test("carries a bounded swap allowance into every worker replica", () => {
+    const result = buildWorkerContainerSpec({
+      environment,
+      payload: {
+        ...workerPayload,
+        resourceLimits: { ...resourceLimits, memoryAndSwapBytes: 1024 * 1024 * 1024 },
+      },
+      image: workerImage,
+      replicaIndex: 3,
+    });
+
+    expect(result.spec.hostConfig).toEqual(
+      expect.objectContaining({
+        NanoCpus: 250_000_000,
+        Memory: 512 * 1024 * 1024,
+        MemorySwap: 1024 * 1024 * 1024,
+        PidsLimit: 256,
+      })
+    );
+  });
+
   test("fails before creating a worker with no override or image default command", () => {
     expect(() =>
       buildWorkerContainerSpec({
@@ -414,6 +451,41 @@ describe("scheduled worker job receipts", () => {
   afterEach(async () => {
     await Promise.all(
       tempDirs.splice(0).map((directory) => rm(directory, { recursive: true, force: true }))
+    );
+  });
+
+  test("carries a bounded swap allowance into the scheduled job container", async () => {
+    const dataDir = await mkdtemp(path.join(os.tmpdir(), "nouva-worker-job-"));
+    tempDirs.push(dataDir);
+    const { docker } = createRuntimeDocker();
+    const payload: WorkerJobPayload = {
+      projectId: "proj_1",
+      environmentId: "env_1",
+      serviceId: "svc_1",
+      deploymentId: "dep_1",
+      redactionContextVersion: "hmac-sha256:redaction-context:v1:job",
+      scheduleId: "schedule_1",
+      scheduleRunId: "run_swap",
+      occurrenceKey: "2026-07-27T12:00:00.000Z",
+      jobName: "hourly-sync",
+      imageUrl: workerPayload.imageUrl,
+      envVars: {},
+      command: "node dist/sync.js",
+      timeoutSeconds: 1800,
+      volume: null,
+      resourceLimits: { ...resourceLimits, memoryAndSwapBytes: 1024 * 1024 * 1024 },
+    };
+
+    await startWorkerJob(docker as never, { ...environment, dataDir }, payload);
+
+    expect(docker.createContainer).toHaveBeenCalledWith(
+      expect.objectContaining({
+        hostConfig: expect.objectContaining({
+          Memory: 512 * 1024 * 1024,
+          MemorySwap: 1024 * 1024 * 1024,
+          PidsLimit: 256,
+        }),
+      })
     );
   });
 

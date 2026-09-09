@@ -25,6 +25,7 @@ import {
   handleDeleteService,
   handleDeleteVolume,
   handleImportExternalBackup,
+  handleReconcileServiceResources,
   handleRestorePostgresPitr,
   handleRestoreVolumeBackup,
   handleWipeVolume,
@@ -1300,6 +1301,33 @@ describe("buildAppContainerSpec", () => {
     );
   });
 
+  test("keeps the no-swap default when no allowance is stored", () => {
+    const spec = buildAppContainerSpec(runtimeConfig, appRuntimePayload);
+
+    expect(spec.spec.hostConfig).toEqual(
+      expect.objectContaining({
+        Memory: 2 * 1024 * 1024 * 1024,
+        MemorySwap: 2 * 1024 * 1024 * 1024,
+      })
+    );
+  });
+
+  test("carries a bounded swap allowance into the candidate container", () => {
+    const spec = buildAppContainerSpec(runtimeConfig, {
+      ...appRuntimePayload,
+      resourceLimits: { ...resourceLimits, memoryAndSwapBytes: 3 * 1024 * 1024 * 1024 },
+    });
+
+    expect(spec.spec.hostConfig).toEqual(
+      expect.objectContaining({
+        NanoCpus: 1_500_000_000,
+        Memory: 2 * 1024 * 1024 * 1024,
+        MemorySwap: 3 * 1024 * 1024 * 1024,
+        PidsLimit: 256,
+      })
+    );
+  });
+
   test("mounts managed app volumes when they are provided", () => {
     const spec = buildAppContainerSpec(runtimeConfig, appRuntimePayload);
 
@@ -2225,6 +2253,26 @@ describe("buildDatabaseContainerSpec", () => {
         NanoCpus: 500_000_000,
         Memory: 1024 * 1024 * 1024,
         MemorySwap: 1024 * 1024 * 1024,
+        PidsLimit: 512,
+      })
+    );
+  });
+
+  test("carries a bounded swap allowance into the database container", () => {
+    const spec = buildDatabaseContainerSpec({
+      ...databasePayload,
+      resourceLimits: {
+        cpuMillicores: 500,
+        memoryBytes: 1024 * 1024 * 1024,
+        memoryAndSwapBytes: 2 * 1024 * 1024 * 1024,
+      },
+    });
+
+    expect(spec.spec.hostConfig).toEqual(
+      expect.objectContaining({
+        NanoCpus: 500_000_000,
+        Memory: 1024 * 1024 * 1024,
+        MemorySwap: 2 * 1024 * 1024 * 1024,
         PidsLimit: 512,
       })
     );
@@ -3242,6 +3290,76 @@ describe("verified volume wipe", () => {
       previousVolume: { name: "nouva-vol-vol_1", absent: true },
       replacementVolume: { name: "nouva-vol-vol_1", present: true },
     });
+  });
+});
+
+describe("handleReconcileServiceResources", () => {
+  const reconcilePayload = {
+    serviceId: "svc_1",
+    containerName: "nouva-app-svc_1",
+    runtimeMetadata: null,
+    resourceLimits: {
+      cpuMillicores: 250,
+      memoryBytes: 128 * 1024 * 1024,
+      memoryAndSwapBytes: 512 * 1024 * 1024,
+      pidsLimit: 256,
+      policyVersion: 1,
+    },
+  };
+
+  function createReconcileDocker(hostConfig: Record<string, number>) {
+    const docker = createDockerMock();
+    docker.updateContainer = mock(async () => {});
+    docker.inspectContainer = mock(async () => ({
+      Id: "ctr_1",
+      Name: "nouva-app-svc_1",
+      HostConfig: hostConfig,
+    })) as never;
+    return docker;
+  }
+
+  test("updates the running container with the stored swap allowance", async () => {
+    const docker = createReconcileDocker({
+      NanoCpus: 250_000_000,
+      Memory: 128 * 1024 * 1024,
+      MemorySwap: 512 * 1024 * 1024,
+      PidsLimit: 256,
+    });
+
+    await expect(
+      handleReconcileServiceResources(docker as never, reconcilePayload as never)
+    ).resolves.toEqual({
+      serviceId: "svc_1",
+      containerId: "ctr_1",
+      applied: {
+        nanoCpus: 250_000_000,
+        memory: 128 * 1024 * 1024,
+        memorySwap: 512 * 1024 * 1024,
+        pidsLimit: 256,
+        policyVersion: 1,
+      },
+    });
+    expect(docker.updateContainer).toHaveBeenCalledWith("nouva-app-svc_1", {
+      NanoCpus: 250_000_000,
+      Memory: 128 * 1024 * 1024,
+      MemorySwap: 512 * 1024 * 1024,
+      PidsLimit: 256,
+    });
+  });
+
+  test("fails when the daemon silently dropped the allowance", async () => {
+    const docker = createReconcileDocker({
+      NanoCpus: 250_000_000,
+      Memory: 128 * 1024 * 1024,
+      MemorySwap: 128 * 1024 * 1024,
+      PidsLimit: 256,
+    });
+
+    await expect(
+      handleReconcileServiceResources(docker as never, reconcilePayload as never)
+    ).rejects.toThrow(
+      "Container ctr_1 did not apply the requested resource limits: MemorySwap 134217728 (expected 536870912)"
+    );
   });
 });
 

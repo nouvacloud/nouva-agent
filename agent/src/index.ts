@@ -46,7 +46,10 @@ import {
   REDACTION_CONTEXT_VERSION_DOCKER_LABEL,
   type RegistryAuth,
 } from "./docker-api.js";
-import { toDockerResourceSettings } from "./docker-resource-limits.js";
+import {
+  assertAppliedDockerResourceSettings,
+  toDockerResourceSettings,
+} from "./docker-resource-limits.js";
 import { ensureHostKernelSettings, HOST_INOTIFY_MAX_USER_WATCHES } from "./host-tuning.js";
 import { collectPostgresObservabilitySamples } from "./postgres-observability.js";
 import {
@@ -1931,6 +1934,12 @@ function resolveRuntimeResourceLimits(
     cpuMillicores:
       typeof record.cpuMillicores === "number" ? record.cpuMillicores : defaults.cpuMillicores,
     memoryBytes: typeof record.memoryBytes === "number" ? record.memoryBytes : defaults.memoryBytes,
+    // Numbers are carried through untouched so an out-of-range allowance is rejected by name in
+    // toDockerResourceSettings rather than quietly repaired into a different policy here. Anything
+    // else means a control plane that predates the setting, whose policy is no swap.
+    ...(typeof record.memoryAndSwapBytes === "number"
+      ? { memoryAndSwapBytes: record.memoryAndSwapBytes }
+      : {}),
     pidsLimit: defaults.pidsLimit,
     policyVersion: 1,
   };
@@ -2160,6 +2169,8 @@ function getBuildkitResourceLimits(): EffectiveServiceResourceLimits {
   return {
     cpuMillicores: reserve.cpuMillicores,
     memoryBytes: reserve.memoryBytes,
+    // No swap allowance: the build reserve is a physical-RAM reserve the control plane hands out,
+    // so letting a builder spill past it would overcommit memory the capacity maths already spent.
     pidsLimit: 512,
     policyVersion: 1,
   };
@@ -4805,6 +4816,63 @@ async function handleRemove(
   };
 }
 
+/**
+ * Applies a stored resource policy to a container that is already running.
+ *
+ * `docker update` answers success without promising the daemon kept every field, so the container
+ * is read back and compared: a swap allowance that never reached the cgroup would otherwise be
+ * reported as applied, leaving the stored policy and the running container silently disagreeing.
+ */
+export async function handleReconcileServiceResources(
+  docker: DockerApiClient,
+  payload: ReconcileServiceResourcesPayload
+): Promise<{
+  serviceId: string;
+  containerId: string;
+  applied: {
+    nanoCpus: number;
+    memory: number;
+    memorySwap: number;
+    pidsLimit: number;
+    policyVersion: number;
+  };
+}> {
+  const container =
+    payload.containerName ??
+    payload.runtimeMetadata?.containerName ??
+    payload.runtimeMetadata?.containerId;
+  if (!container) {
+    throw new Error(`Service ${payload.serviceId} has no runtime container to reconcile`);
+  }
+
+  const resources = toDockerResourceSettings(payload.resourceLimits);
+  await docker.updateContainer(container, resources);
+  const inspection = await docker.inspectContainer(container);
+  if (!inspection) {
+    throw new Error(
+      `Service ${payload.serviceId} container disappeared after resource reconciliation`
+    );
+  }
+
+  assertAppliedDockerResourceSettings({
+    containerId: inspection.Id,
+    requested: resources,
+    applied: inspection.HostConfig,
+  });
+
+  return {
+    serviceId: payload.serviceId,
+    containerId: inspection.Id,
+    applied: {
+      nanoCpus: resources.NanoCpus,
+      memory: resources.Memory,
+      memorySwap: resources.MemorySwap,
+      pidsLimit: resources.PidsLimit,
+      policyVersion: payload.resourceLimits.policyVersion,
+    },
+  };
+}
+
 export async function handleDeleteService(docker: DockerApiClient, payload: RemoveServicePayload) {
   // The build cache outlives any single deployment, so nothing else reclaims it when the service
   // it belongs to goes away (#184). Removing a volume that was never created is a no-op.
@@ -5191,38 +5259,12 @@ async function processWorkItem(
           payload as unknown as ExpireVolumeBackupRepositoryPayload
         );
         break;
-      case "reconcile_service_resources": {
-        const reconcilePayload = payload as unknown as ReconcileServiceResourcesPayload;
-        const container =
-          reconcilePayload.containerName ??
-          reconcilePayload.runtimeMetadata?.containerName ??
-          reconcilePayload.runtimeMetadata?.containerId;
-        if (!container) {
-          throw new Error(
-            `Service ${reconcilePayload.serviceId} has no runtime container to reconcile`
-          );
-        }
-        const resources = toDockerResourceSettings(reconcilePayload.resourceLimits);
-        await docker.updateContainer(container, resources);
-        const inspection = await docker.inspectContainer(container);
-        if (!inspection) {
-          throw new Error(
-            `Service ${reconcilePayload.serviceId} container disappeared after resource reconciliation`
-          );
-        }
-        result = {
-          serviceId: reconcilePayload.serviceId,
-          containerId: inspection.Id,
-          applied: {
-            nanoCpus: inspection.HostConfig?.NanoCpus ?? resources.NanoCpus,
-            memory: inspection.HostConfig?.Memory ?? resources.Memory,
-            memorySwap: inspection.HostConfig?.MemorySwap ?? resources.MemorySwap,
-            pidsLimit: inspection.HostConfig?.PidsLimit ?? resources.PidsLimit,
-            policyVersion: reconcilePayload.resourceLimits.policyVersion,
-          },
-        };
+      case "reconcile_service_resources":
+        result = await handleReconcileServiceResources(
+          docker,
+          payload as unknown as ReconcileServiceResourcesPayload
+        );
         break;
-      }
       case "sync_routing":
         result = await handleSyncRouting(docker, config, {
           ...(payload as unknown as SyncRoutingPayload),

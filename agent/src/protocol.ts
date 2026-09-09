@@ -252,11 +252,18 @@ export function resolveAppRolloutConfig(config?: AppRolloutConfig | null): AppRo
 export interface ServiceResourceLimits {
   cpuMillicores?: number;
   memoryBytes?: number;
+  /** Combined RAM-and-swap ceiling in bytes, in Docker's `MemorySwap` units. */
+  memoryAndSwapBytes?: number;
 }
 
 export interface EffectiveServiceResourceLimits {
   cpuMillicores: number;
   memoryBytes: number;
+  /**
+   * Combined RAM-and-swap ceiling. Always >= `memoryBytes`; equal means no swap allowance. Older
+   * control planes omit it, which `toDockerResourceSettings` reads as the same no-swap policy.
+   */
+  memoryAndSwapBytes?: number;
   pidsLimit: number;
   policyVersion: number;
 }
