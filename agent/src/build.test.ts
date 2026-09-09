@@ -10,6 +10,7 @@ import {
   buildStaticRuntimeDockerfile,
   detectDockerfileExposedPort,
   normalizeAppBuildSettings,
+  resolveDetectedFramework,
   stripRepositoryGitMetadata,
   toSafeBuildctlExecutionError,
 } from "./build.js";
@@ -247,5 +248,65 @@ describe("stripRepositoryGitMetadata", () => {
       expect(await readdir(path.join(repoDir, "checkout"))).toEqual([]);
       expect(await readdir(outside)).toEqual(["keep.txt"]);
     });
+  });
+});
+
+// The payloads below are the shape railpack 0.23.0 writes to `--info-out`: a single entry in
+// `detectedProviders` plus flat string metadata, with boolean flags present only when true.
+describe("resolveDetectedFramework", () => {
+  test("uses the python runtime rather than repeating the provider", () => {
+    expect(
+      resolveDetectedFramework(["python"], {
+        pythonRuntime: "fastapi",
+        pythonPackageManager: "pip",
+      })
+    ).toBe("fastapi");
+  });
+
+  test("reports no framework for a plain python app", () => {
+    expect(
+      resolveDetectedFramework(["python"], {
+        pythonRuntime: "python",
+        pythonPackageManager: "pip",
+      })
+    ).toBeNull();
+  });
+
+  test("reports no framework when railpack supplies no framework signal", () => {
+    expect(resolveDetectedFramework(["golang"], { goMod: "true", goRootFile: "true" })).toBeNull();
+  });
+
+  test("keeps node framework identity distinct from the provider", () => {
+    expect(
+      resolveDetectedFramework(["node"], {
+        nodeRuntime: "next",
+        nodePackageManager: "npm",
+      })
+    ).toBe("next");
+  });
+
+  test("does not treat a package manager runtime as a framework", () => {
+    expect(
+      resolveDetectedFramework(["node"], {
+        nodeRuntime: "bun",
+        nodePackageManager: "bun",
+      })
+    ).toBeNull();
+  });
+
+  test("does not treat an unattributed static build as a framework", () => {
+    expect(
+      resolveDetectedFramework(["node"], { nodeRuntime: "static", nodeIsSPA: "true" })
+    ).toBeNull();
+  });
+
+  test("reads framework flags for providers that report booleans", () => {
+    expect(resolveDetectedFramework(["golang"], { goMod: "true", goGin: "true" })).toBe("gin");
+    expect(resolveDetectedFramework(["php"], { phpLaravel: "true" })).toBe("laravel");
+    expect(resolveDetectedFramework(["ruby"], { rubyRails: "true" })).toBe("rails");
+  });
+
+  test("ignores metadata values that are not strings", () => {
+    expect(resolveDetectedFramework(["python"], { pythonRuntime: 42, goGin: true })).toBeNull();
   });
 });

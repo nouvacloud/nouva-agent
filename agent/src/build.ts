@@ -269,6 +269,71 @@ export async function stripRepositoryGitMetadata(repoDir: string): Promise<void>
   await rm(path.join(repoDir, ".git"), { recursive: true, force: true });
 }
 
+/**
+ * Railpack metadata keys whose value names the framework, in provider order.
+ *
+ * Railpack plans with exactly one language provider per build, so at most one of these is ever
+ * present in a single info payload; the order only settles a hypothetical tie.
+ */
+const RAILPACK_FRAMEWORK_RUNTIME_KEYS = ["pythonRuntime", "nodeRuntime", "javaFramework"] as const;
+
+/**
+ * Railpack framework flags, which are only emitted when true, mapped to the framework they mean.
+ */
+const RAILPACK_FRAMEWORK_FLAGS: ReadonlyArray<readonly [key: string, framework: string]> = [
+  ["goGin", "gin"],
+  ["phpLaravel", "laravel"],
+  ["rubyRails", "rails"],
+];
+
+/**
+ * Runtime values that name a packaging choice rather than a framework. Railpack falls back to the
+ * provider name (`python`, `node`) when it recognizes no framework, reports `bun` when Bun is
+ * merely the package manager, and reports `static` for a single-page app it could not attribute.
+ */
+const RAILPACK_NON_FRAMEWORK_RUNTIMES = new Set(["bun", "static"]);
+
+/**
+ * Resolve the framework Railpack detected, or null when it detected none.
+ *
+ * A provider is not a framework. Railpack reports exactly one entry in `detectedProviders` (its
+ * `BuildResult` is built from a single detected provider name), so the previous
+ * `providers[1] ?? providers[0]` fallback could never do anything but repeat the language — every
+ * Railpack deployment rendered as `python / python`, `node / node` and so on. The framework is
+ * carried separately in `metadata`, either as a runtime string or as a boolean flag.
+ */
+export function resolveDetectedFramework(
+  providers: readonly string[],
+  metadata: Record<string, unknown>
+): string | null {
+  for (const key of RAILPACK_FRAMEWORK_RUNTIME_KEYS) {
+    const runtime = metadata[key];
+    if (typeof runtime !== "string") {
+      continue;
+    }
+
+    const framework = runtime.trim();
+    const normalized = framework.toLowerCase();
+    if (!framework || RAILPACK_NON_FRAMEWORK_RUNTIMES.has(normalized)) {
+      continue;
+    }
+
+    if (providers.some((provider) => provider.toLowerCase() === normalized)) {
+      continue;
+    }
+
+    return framework;
+  }
+
+  for (const [key, framework] of RAILPACK_FRAMEWORK_FLAGS) {
+    if (metadata[key] === "true") {
+      return framework;
+    }
+  }
+
+  return null;
+}
+
 function inferBuildMetadata(info: Record<string, unknown>): {
   detectedLanguage: string | null;
   detectedFramework: string | null;
@@ -288,7 +353,7 @@ function inferBuildMetadata(info: Record<string, unknown>): {
 
   return {
     detectedLanguage: providers[0] ?? null,
-    detectedFramework: providers[1] ?? providers[0] ?? null,
+    detectedFramework: resolveDetectedFramework(providers, metadata),
     languageVersion:
       metadata.NODE_VERSION ??
       metadata.PYTHON_VERSION ??
