@@ -1077,7 +1077,7 @@ describe("buildAndDeployAppWithDependencies", () => {
       {} as never,
       runtimeConfig,
       appPayload,
-      "tcp://127.0.0.1:1234"
+      { address: "tcp://127.0.0.1:1234", memoryBytes: 585 * 1024 * 1024 }
     );
 
     expect(calls).toEqual(["ensure", "build", "deploy"]);
@@ -1087,6 +1087,9 @@ describe("buildAndDeployAppWithDependencies", () => {
         appBuildConfig: appPayload.appBuildConfig,
         imageStoreMode: "docker-local",
         resourceLimits: appPayload.resourceLimits,
+        buildkitAddress: "tcp://127.0.0.1:1234",
+        // A failed build can only name the builder's budget if the deploy path hands it over (#215).
+        builderMemoryBytes: 585 * 1024 * 1024,
       })
     );
     expect(deployAppImage.mock.calls[0]?.[2]).toEqual(
@@ -1151,6 +1154,12 @@ describe("prepareAppBuildkitRuntime", () => {
       true
     );
     expect(waitUntilReady).toHaveBeenCalledWith("tcp://127.0.0.1:4567");
+
+    // The budget a failed build names has to be the one the daemon actually got (#215).
+    const [spec] = docker.ensureContainer.mock.calls[0] as unknown as [
+      { hostConfig: { Memory: number } },
+    ];
+    expect(runtime.memoryBytes).toBe(spec.hostConfig.Memory);
 
     await runtime.cleanup();
 

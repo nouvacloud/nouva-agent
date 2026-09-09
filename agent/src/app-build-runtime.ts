@@ -29,6 +29,12 @@ export interface DeployAppImageInput {
   clientIngressConfigHash?: string;
 }
 
+/** The scoped BuildKit daemon a deploy builds against, and the memory it was capped at. */
+export interface AppBuildkitRuntime {
+  address: string;
+  memoryBytes: number;
+}
+
 export interface BuildAndDeployAppDependencies {
   ensureBaseRuntime: (docker: DockerApiClient, config: AgentRuntimeConfig) => Promise<void>;
   buildApp: (options: {
@@ -42,6 +48,7 @@ export interface BuildAndDeployAppDependencies {
     localRegistryHost: string;
     localRegistryPort: number;
     buildkitAddress: string;
+    builderMemoryBytes: number | null;
     appBuildType?: AppDeployPayload["appBuildType"];
     appBuildConfig?: AppDeployPayload["appBuildConfig"];
     onBuildLog?: BuildLogEmitter;
@@ -58,7 +65,7 @@ export async function buildAndDeployAppWithDependencies(
   docker: DockerApiClient,
   config: AgentRuntimeConfig,
   payload: AppDeployPayload,
-  buildkitAddress: string,
+  buildkit: AppBuildkitRuntime,
   onBuildLog?: BuildLogEmitter
 ) {
   await dependencies.ensureBaseRuntime(docker, config);
@@ -73,7 +80,8 @@ export async function buildAndDeployAppWithDependencies(
     imageStoreMode: config.imageStoreMode,
     localRegistryHost: config.localRegistryHost,
     localRegistryPort: config.localRegistryPort,
-    buildkitAddress,
+    buildkitAddress: buildkit.address,
+    builderMemoryBytes: buildkit.memoryBytes,
     appBuildType: payload.appBuildType ?? null,
     appBuildConfig: payload.appBuildConfig ?? null,
     ...(onBuildLog ? { onBuildLog } : {}),

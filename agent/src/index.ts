@@ -17,6 +17,7 @@ import {
   redactionContextScopeVersionsEqual,
 } from "./alloy-runtime.js";
 import {
+  type AppBuildkitRuntime,
   buildAndDeployAppWithDependencies,
   type DeployAppImageInput,
 } from "./app-build-runtime.js";
@@ -2194,8 +2195,7 @@ async function ensureLocalRegistryRuntime(
   await waitForLocalRegistryAvailability(config);
 }
 
-export interface PreparedAppBuildkitRuntime {
-  address: string;
+export interface PreparedAppBuildkitRuntime extends AppBuildkitRuntime {
   cleanup: () => Promise<void>;
 }
 
@@ -2211,6 +2211,7 @@ export async function prepareAppBuildkitRuntime(
   const containerName = buildScopedBuildkitContainerName(payload.deploymentId);
   const cacheVolumeName = buildBuildkitCacheVolumeName(payload.serviceId);
   const address = createBuildkitAddress(port);
+  const resourceLimits = getBuildkitResourceLimits();
 
   // The cache outlives the container that fills it, so it is a named volume the container-scoped
   // sweep below cannot touch. It is deliberately not labelled `nouva.volume.id`: it is agent
@@ -2225,7 +2226,7 @@ export async function prepareAppBuildkitRuntime(
       buildBuildkitContainerSpec({
         name: containerName,
         port,
-        resourceLimits: getBuildkitResourceLimits(),
+        resourceLimits,
         restartPolicyName: "no",
         deploymentId: payload.deploymentId,
         serviceId: payload.serviceId,
@@ -2244,6 +2245,7 @@ export async function prepareAppBuildkitRuntime(
 
   return {
     address,
+    memoryBytes: resourceLimits.memoryBytes,
     cleanup: async () => {
       await docker.removeContainer(containerName, true);
     },
@@ -3069,7 +3071,7 @@ async function handleBuildAndDeployApp(
       docker,
       config,
       payload,
-      buildkitRuntime.address,
+      buildkitRuntime,
       onBuildLog
     );
   } finally {
@@ -3124,6 +3126,7 @@ async function handleBuildAndDeployWorker(
       localRegistryHost: config.localRegistryHost,
       localRegistryPort: config.localRegistryPort,
       buildkitAddress: buildkitRuntime.address,
+      builderMemoryBytes: buildkitRuntime.memoryBytes,
       appBuildType: payload.appBuildType ?? null,
       appBuildConfig: payload.appBuildConfig ?? null,
       ...(onBuildLog ? { onBuildLog } : {}),

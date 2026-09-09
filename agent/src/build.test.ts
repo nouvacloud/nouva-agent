@@ -8,11 +8,13 @@ import {
   buildRailpackBuildctlArgs,
   buildStaticNginxConfig,
   buildStaticRuntimeDockerfile,
+  classifyBuildFailure,
   detectDockerfileExposedPort,
   normalizeAppBuildSettings,
   resolveDetectedFramework,
   stripRepositoryGitMetadata,
   toSafeBuildctlExecutionError,
+  withBuildMemoryBudget,
 } from "./build.js";
 
 describe("build helpers", () => {
@@ -180,6 +182,188 @@ describe("build helpers", () => {
         EXPOSE 3000
       `)
     ).toBe(3000);
+  });
+});
+
+// #215: on a 4 GB server the build reserve gives the scoped builder ~571 MiB, which a default
+// Next.js build goes over. The deployment only ever said "BuildKit build failed", so nothing told
+// the user they had run out of build memory or what they could do about it.
+describe("build failure classification", () => {
+  // 15% of a 3,900,644 KiB host: the reserve the agent applied to the builder in the report.
+  const builderMemoryBytes = 599_138_919;
+
+  test("classifies the memory kill BuildKit reported on a constrained server", () => {
+    expect(
+      classifyBuildFailure({
+        exitCode: 1,
+        signal: null,
+        output: [
+          '#18 102.4 error: script "build" was terminated by signal SIGKILL (Forced quit)',
+          'process "bun run build" did not complete successfully: cannot allocate memory',
+          "ResourceExhausted",
+        ].join("\n"),
+      })
+    ).toBe("out-of-memory");
+  });
+
+  test("classifies the other shapes a memory kill reaches the agent in", () => {
+    const outputs = [
+      'process "/bin/sh -c npm run build" did not complete successfully: exit code: 137',
+      "runc run failed: unable to start container process: cannot allocate memory",
+      "container for step exited: OOMKilled",
+      "FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory",
+      "Memory cgroup out of memory: Killed process 14026 (node)",
+    ];
+
+    for (const output of outputs) {
+      expect(classifyBuildFailure({ exitCode: 1, signal: null, output })).toBe("out-of-memory");
+    }
+  });
+
+  test("classifies a build process the kernel killed outright", () => {
+    expect(classifyBuildFailure({ exitCode: -1, signal: "SIGKILL", output: "" })).toBe(
+      "out-of-memory"
+    );
+  });
+
+  // `ResourceExhausted` is a plain gRPC status name, so a build step that calls a cloud API and
+  // logs a quota refusal must not be sent off to buy a bigger server.
+  test("leaves a build that merely logs a resource-exhausted status unclassified", () => {
+    expect(
+      classifyBuildFailure({
+        exitCode: 1,
+        signal: null,
+        output: [
+          "uploading assets: rpc error: code = ResourceExhausted desc = quota exceeded",
+          'process "npm run build" did not complete successfully: exit code: 1',
+        ].join("\n"),
+      })
+    ).toBe("unknown");
+  });
+
+  // A nested runner reporting its own timeout kill is not the builder running out of memory.
+  test("leaves a build that merely reports killing a process unclassified", () => {
+    expect(
+      classifyBuildFailure({
+        exitCode: 1,
+        signal: null,
+        output: [
+          "test timed out after 30s, sending SIGKILL to the worker",
+          "  teardown: child exited with signal: killed",
+          'process "npm test" did not complete successfully: exit code: 1',
+        ].join("\n"),
+      })
+    ).toBe("unknown");
+  });
+
+  // Two unrelated lines must not vouch for each other: this build failed on a registry quota and
+  // separately killed a hung test, and neither has anything to do with the builder's memory.
+  test("leaves a quota refusal and an unrelated kill in one build unclassified", () => {
+    expect(
+      classifyBuildFailure({
+        exitCode: 1,
+        signal: null,
+        output: [
+          "#7 [3/8] RUN npm test",
+          "#7 41.2 test timed out after 30s, sending SIGKILL to the worker",
+          "#7 DONE 41.4s",
+          "#9 [5/8] RUN npm publish --registry https://registry.example.com",
+          "#9 12.7 npm ERR! 429 rpc error: code = ResourceExhausted desc = quota exceeded",
+          'error: failed to solve: process "/bin/sh -c npm publish" did not complete successfully: exit code: 1',
+        ].join("\n"),
+      })
+    ).toBe("unknown");
+  });
+
+  // Measured on BuildKit v0.17.0 against a daemon capped at 256 MiB, for both an allocation the
+  // kernel refused (`dd bs=1G`) and a step it OOM-killed (`tail /dev/zero`, confirmed by
+  // `oom-kill:constraint=CONSTRAINT_MEMCG` in dmesg). Both report this, and buildctl exits 1.
+  test("classifies the output a memory-capped BuildKit daemon actually produces", () => {
+    expect(
+      classifyBuildFailure({
+        exitCode: 1,
+        signal: null,
+        output: [
+          "#5 [2/2] RUN tail /dev/zero",
+          '#5 ERROR: process "/bin/sh -c tail /dev/zero" did not complete successfully: cannot allocate memory',
+          "------",
+          " > [2/2] RUN tail /dev/zero:",
+          "------",
+          'error: failed to solve: ResourceExhausted: process "/bin/sh -c tail /dev/zero" did not complete successfully: cannot allocate memory',
+        ].join("\n"),
+      })
+    ).toBe("out-of-memory");
+  });
+
+  test("classifies a build whose own process was killed, whatever it logged", () => {
+    expect(
+      classifyBuildFailure({
+        exitCode: 137,
+        signal: null,
+        output: "npm ERR! 429 ResourceExhausted desc = quota exceeded",
+      })
+    ).toBe("out-of-memory");
+  });
+
+  test("leaves a compile error that merely mentions memory unclassified", () => {
+    expect(
+      classifyBuildFailure({
+        exitCode: 1,
+        signal: null,
+        output: [
+          "app/page.tsx(12,7): error TS2322: Type 'MemoryUsage' is not assignable to type 'string'.",
+          "  The memory report is out of date and out of scope.",
+          'process "npm run build" did not complete successfully: exit code: 1',
+        ].join("\n"),
+      })
+    ).toBe("unknown");
+  });
+
+  test("reports an out-of-memory build with the builder's budget and a way out", () => {
+    const error = withBuildMemoryBudget(
+      new BuildctlExecutionError("out-of-memory"),
+      builderMemoryBytes
+    );
+
+    expect(error).toBeInstanceOf(BuildctlExecutionError);
+    const message = (error as BuildctlExecutionError).message;
+    expect(message).toContain("ran out of memory");
+    expect(message).toContain("571 MiB");
+    // Raising the service's memory cannot raise the builder's, so the message must not imply it.
+    expect(message).toContain("service's own memory limit");
+    expect(message).toContain("server with more memory");
+  });
+
+  test("never quotes the build output in the failure it reports", () => {
+    const output = [
+      "#18 12.0 DATABASE_URL=postgres://app:hunter2@db:5432/app",
+      'process "bun run build" did not complete successfully: cannot allocate memory',
+    ].join("\n");
+
+    const error = withBuildMemoryBudget(
+      new BuildctlExecutionError(classifyBuildFailure({ exitCode: 1, signal: null, output })),
+      builderMemoryBytes
+    ) as BuildctlExecutionError;
+
+    expect(error.kind).toBe("out-of-memory");
+    expect(error.message).not.toContain("hunter2");
+    expect(error.message).not.toContain("DATABASE_URL");
+  });
+
+  test("leaves an unrelated failure exactly as it was", () => {
+    const buildFailure = new BuildctlExecutionError();
+    const cloneFailure = new Error("Failed to clone the repository");
+
+    expect(withBuildMemoryBudget(buildFailure, builderMemoryBytes)).toBe(buildFailure);
+    expect(buildFailure.message).toBe("BuildKit build failed");
+    expect(withBuildMemoryBudget(cloneFailure, builderMemoryBytes)).toBe(cloneFailure);
+  });
+
+  test("still names the failure when the builder's budget is unknown", () => {
+    const error = new BuildctlExecutionError("out-of-memory");
+
+    expect(error.message).toContain("ran out of memory");
+    expect(error.message).not.toContain("MiB");
   });
 });
 

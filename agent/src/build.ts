@@ -44,6 +44,8 @@ export interface BuildAppOptions {
   localRegistryHost: string;
   localRegistryPort: number;
   buildkitAddress: string;
+  /** Memory cap applied to this deployment's scoped BuildKit daemon, named when a build runs out. */
+  builderMemoryBytes: number | null;
   appBuildType?: AppBuildType | null;
   appBuildConfig?: AppBuildConfig | null;
   /** Receives clone, analyze and BuildKit output as it is produced. */
@@ -86,10 +88,81 @@ interface BuildImageOutput {
   imageUrl: string;
 }
 
+const MEBIBYTE = 1024 * 1024;
+
+export type BuildFailureKind = "out-of-memory" | "unknown";
+
+/** How a build step ended: everything the failure classification is allowed to look at. */
+export interface BuildProcessOutcome {
+  exitCode: number;
+  signal: NodeJS.Signals | null;
+  output: string;
+}
+
+/**
+ * Output that only a memory kill produces: runc reports the refused allocation as `cannot allocate
+ * memory`, a step killed by the cgroup surfaces as `exit code: 137` (128 + SIGKILL), Docker and the
+ * kernel name the kill outright, and V8 reports the heap ceiling it derives from the same cgroup
+ * limit as `JavaScript heap out of memory`. Matching these literals rather than the word "memory"
+ * is what keeps a compile error that merely mentions memory out of this class.
+ */
+const OUT_OF_MEMORY_SIGNATURES: readonly RegExp[] = [
+  /cannot allocate memory/i,
+  /\bexit (?:code|status):? 137\b/i,
+  /\bOOMKilled\b/i,
+  /\boom-kill\b/i,
+  /out of memory: killed process/i,
+  /JavaScript heap out of memory/i,
+];
+
+/**
+ * `ResourceExhausted` and a bare `SIGKILL` are deliberately absent above, and are not combined into
+ * a weaker rule either. Both are ambiguous — the first is the gRPC status a registry or cloud API
+ * returns for a quota refusal, the second is how a test runner reports its own timeout kill — and
+ * an output-wide "both appear" rule lets two unrelated lines vouch for each other, turning a quota
+ * failure into memory remediation. They also buy nothing: measured against BuildKit v0.17.0 on a
+ * memory-capped daemon, both an allocation refused (`dd bs=1G`) and a step the kernel OOM-killed
+ * (`tail /dev/zero`, `oom-kill:constraint=CONSTRAINT_MEMCG`) report the same decisive line —
+ * `process "..." did not complete successfully: cannot allocate memory` — with `ResourceExhausted`
+ * only ever appearing as a prefix on that same line, no `SIGKILL` anywhere, and buildctl itself
+ * exiting 1. A real builder OOM is always caught by a signature above.
+ */
+export function classifyBuildFailure(outcome: BuildProcessOutcome): BuildFailureKind {
+  // Nothing in the agent kills a build process, so a SIGKILL on the one it spawned came from the
+  // kernel reclaiming memory; exit code 137 is that same kill seen through an exit status.
+  if (outcome.signal === "SIGKILL" || outcome.exitCode === 137) {
+    return "out-of-memory";
+  }
+
+  return OUT_OF_MEMORY_SIGNATURES.some((signature) => signature.test(outcome.output))
+    ? "out-of-memory"
+    : "unknown";
+}
+
+/**
+ * The message is derived from the classification alone and never quotes the build output, because
+ * this string is the deployment's failure summary and the output can carry build secrets.
+ */
+function describeBuildFailure(kind: BuildFailureKind, builderMemoryBytes: number | null): string {
+  if (kind !== "out-of-memory") {
+    return "BuildKit build failed";
+  }
+
+  const budget =
+    builderMemoryBytes !== null && builderMemoryBytes > 0
+      ? ` Its builder is limited to ${Math.round(builderMemoryBytes / MEBIBYTE)} MiB, a fixed share of the server's memory that the service's own memory limit does not change.`
+      : "";
+
+  return `The build ran out of memory.${budget} Lower what the build needs (for example reduce build parallelism or disable source maps) or run it on a server with more memory.`;
+}
+
 export class BuildctlExecutionError extends Error {
-  constructor() {
-    super("BuildKit build failed");
+  readonly kind: BuildFailureKind;
+
+  constructor(kind: BuildFailureKind = "unknown", builderMemoryBytes: number | null = null) {
+    super(describeBuildFailure(kind, builderMemoryBytes));
     this.name = "BuildctlExecutionError";
+    this.kind = kind;
   }
 }
 
@@ -101,6 +174,19 @@ export function toSafeBuildctlExecutionError(error: unknown): BuildctlExecutionE
   return new BuildctlExecutionError();
 }
 
+/**
+ * Restates an out-of-memory build failure with the budget its builder was actually given. The step
+ * that fails is several layers below the option carrying that budget, so the classification travels
+ * up on the error and the number is filled in once, at the boundary that knows it.
+ */
+export function withBuildMemoryBudget(error: unknown, builderMemoryBytes: number | null): unknown {
+  if (!(error instanceof BuildctlExecutionError) || error.kind !== "out-of-memory") {
+    return error;
+  }
+
+  return new BuildctlExecutionError(error.kind, builderMemoryBytes);
+}
+
 interface StreamedBuildCommandOptions {
   command: string;
   args: string[];
@@ -108,6 +194,11 @@ interface StreamedBuildCommandOptions {
   env: NodeJS.ProcessEnv;
   stage: BuildLogStage;
   envVars: Record<string, string>;
+  /**
+   * Whether the step's work happens inside the deployment's scoped BuildKit daemon, and so under
+   * its memory cap. Only those failures may be blamed on, and reported against, that budget.
+   */
+  runsInBuilder: boolean;
   onBuildLog?: BuildLogEmitter;
 }
 
@@ -146,7 +237,15 @@ async function runStreamedBuildCommand(
       timestamp: Date.now(),
       stage: options.stage,
     });
-    throw new BuildctlExecutionError();
+    throw new BuildctlExecutionError(
+      options.runsInBuilder
+        ? classifyBuildFailure({
+            exitCode: result.exitCode,
+            signal: result.signal,
+            output: `${result.stdout}\n${result.stderr}`,
+          })
+        : "unknown"
+    );
   }
 
   return { stdout: result.stdout, stderr: result.stderr };
@@ -521,6 +620,7 @@ async function runBuildctlBuild(
       env,
       stage: "building",
       envVars: logging.envVars ?? {},
+      runsInBuilder: true,
       ...(logging.onBuildLog ? { onBuildLog: logging.onBuildLog } : {}),
     });
 
@@ -576,6 +676,9 @@ async function prepareRailpackPlan(
     env: childEnv,
     stage: "analyzing",
     envVars,
+    // railpack's analysis runs on the agent host, outside the builder's cgroup, so a failure here
+    // is never the builder's budget.
+    runsInBuilder: false,
     ...(onBuildLog ? { onBuildLog } : {}),
   });
 
@@ -613,6 +716,7 @@ async function runRailpackBuildctl(options: {
       env: options.childEnv,
       stage: "building",
       envVars: options.envVars,
+      runsInBuilder: true,
       ...(options.onBuildLog ? { onBuildLog: options.onBuildLog } : {}),
     });
 
@@ -1015,6 +1119,8 @@ export async function buildApp(options: BuildAppOptions): Promise<BuildAppResult
       buildDuration: Date.now() - buildStart,
       ...result,
     };
+  } catch (error) {
+    throw withBuildMemoryBudget(error, options.builderMemoryBytes);
   } finally {
     await rm(tempRoot, { recursive: true, force: true });
   }
