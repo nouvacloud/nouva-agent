@@ -20,6 +20,10 @@ import {
   buildAndDeployAppWithDependencies,
   type DeployAppImageInput,
 } from "./app-build-runtime.js";
+import {
+  assessCandidateReadiness,
+  NO_CANDIDATE_RUNTIME_EVIDENCE,
+} from "./app-candidate-readiness.js";
 import { buildApp, hashProjectNetwork } from "./build.js";
 import {
   type BuildLogEmitter,
@@ -621,21 +625,6 @@ function resolveAppRuntimePort(
     : fallback;
 }
 
-function resolveContainerIpAddress(inspection: DockerContainerInspection | null): string | null {
-  const networks = inspection?.NetworkSettings?.Networks;
-  if (!networks) {
-    return null;
-  }
-
-  for (const network of Object.values(networks)) {
-    if (typeof network?.IPAddress === "string" && network.IPAddress.length > 0) {
-      return network.IPAddress;
-    }
-  }
-
-  return null;
-}
-
 function buildAppRolloutResult(input: {
   strategy?: AppRolloutResult["strategy"];
   outcome: AppRolloutResult["outcome"];
@@ -698,6 +687,7 @@ async function waitForAppCandidateReadiness(
   rollout: AppRolloutConfig
 ): Promise<void> {
   const deadline = Date.now() + rollout.readiness.timeoutMs;
+  let evidence = NO_CANDIDATE_RUNTIME_EVIDENCE;
   let lastError = "candidate container did not become ready";
 
   while (Date.now() <= deadline) {
@@ -706,41 +696,41 @@ async function waitForAppCandidateReadiness(
       throw new Error(`Candidate container ${containerName} is missing`);
     }
 
-    const state = inspection.State;
-    const status = state?.Status?.toLowerCase();
-    if (status === "exited" || status === "dead" || status === "removing") {
-      throw new Error(`Candidate container ${containerName} is not running (${status})`);
+    const assessment = assessCandidateReadiness({
+      containerName,
+      appPort,
+      inspection,
+      evidence,
+    });
+    evidence = assessment.evidence;
+    const step = assessment.step;
+
+    if (step.kind === "ready") {
+      return;
     }
 
-    const health = state?.Health;
-    if (health) {
-      const healthStatus = health.Status?.toLowerCase() || "unknown";
-      if (healthStatus === "healthy") {
-        return;
-      }
-
-      if (healthStatus === "unhealthy") {
-        throw new Error(`Candidate container ${containerName} became unhealthy`);
-      }
-
-      lastError = `Candidate container ${containerName} health status is ${healthStatus}`;
-      await sleep(rollout.readiness.intervalMs);
-      continue;
+    if (step.kind === "failed") {
+      console.warn("[nouva-agent] app candidate readiness failed", {
+        cause: step.cause,
+        containerName,
+        outOfMemory: evidence.outOfMemory,
+        restarts: evidence.restarts,
+      });
+      throw new Error(step.message);
     }
 
-    const ipAddress = resolveContainerIpAddress(inspection);
-    if (ipAddress) {
+    if (step.kind === "probe") {
       const reachable = await dependencies.checkTcpConnect(
-        ipAddress,
+        step.ipAddress,
         appPort,
         rollout.readiness.tcpConnectTimeoutMs
       );
       if (reachable) {
         return;
       }
-      lastError = `Candidate container ${containerName} is not accepting TCP traffic on ${appPort}`;
+      lastError = step.unreachableMessage;
     } else {
-      lastError = `Candidate container ${containerName} has no routable IP address yet`;
+      lastError = step.message;
     }
 
     await sleep(rollout.readiness.intervalMs);
