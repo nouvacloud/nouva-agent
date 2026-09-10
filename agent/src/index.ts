@@ -38,6 +38,7 @@ import {
   type BuildLogPublisher,
   createBuildLogPublisher,
 } from "./build-logs.js";
+import { detectHostClockSync, evaluateClockSync } from "./clock-sync.js";
 import { collectManagedContainerLogConfigValidationCheck } from "./container-log-reconciliation.js";
 import {
   DockerApiClient,
@@ -1216,27 +1217,39 @@ async function collectValidationSnapshot(
     );
   }
 
+  // Short-lived privileged helpers (the clock probe and the inotify tuner) run the agent's own
+  // image, so its reference is resolved once per snapshot.
+  let agentHelperImage: string | null = null;
+  let agentHelperImageError: string | null = null;
+  if (dockerVersion !== null) {
+    try {
+      agentHelperImage = await resolveAgentTaskImage(docker);
+    } catch (error) {
+      agentHelperImageError =
+        error instanceof Error ? error.message : "Unable to resolve the agent image";
+    }
+  }
+
   // Clock synchronisation — drift breaks TLS, ACME challenges, and pgBackRest PITR
   {
-    let clockSynced = false;
-    try {
-      await readFile("/hostfs/run/chrony/chrony.sock");
-      clockSynced = true;
-    } catch {}
-    if (!clockSynced) {
-      try {
-        await readFile("/hostfs/run/systemd/timesync/synchronized");
-        clockSynced = true;
-      } catch {}
-    }
+    const clockSync = evaluateClockSync(
+      await detectHostClockSync(
+        agentHelperImage === null
+          ? {
+              kind: "unavailable",
+              reason: agentHelperImageError ?? "Docker Engine is unavailable",
+            }
+          : { kind: "available", docker, image: agentHelperImage },
+        { labels: buildLabels({ kind: "clock-probe" }) }
+      )
+    );
     checks.push(
       buildCheck(
         "clock-sync",
         "Clock synchronisation",
-        clockSynced ? "pass" : "warn",
-        clockSynced
-          ? "Time synchronisation daemon is active"
-          : "No active NTP/chrony sync detected — clock drift may break TLS certificates and PITR timestamps"
+        clockSync.status,
+        clockSync.message,
+        clockSync.value
       )
     );
   }
@@ -1282,11 +1295,11 @@ async function collectValidationSnapshot(
 
   // inotify watch limit — Traefik file watching silently stops when the host limit is exhausted.
   // The agent raises the limit itself (see host-tuning.ts) before reporting on it.
-  let hostTuningMessage: string | null = null;
-  if (dockerVersion !== null) {
+  let hostTuningMessage: string | null = agentHelperImageError;
+  if (agentHelperImage !== null) {
     try {
       const tuning = await ensureHostKernelSettings(docker, {
-        image: await resolveAgentTaskImage(docker),
+        image: agentHelperImage,
         labels: buildLabels({ kind: "host-tuning" }),
       });
       if (tuning.status === "applied") {
