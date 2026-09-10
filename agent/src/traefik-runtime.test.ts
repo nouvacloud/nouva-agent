@@ -629,7 +629,13 @@ describe("traefik forwarded headers", () => {
       "010.0.0.1",
       "10.0.0.01",
       "::ffff:010.0.0.1",
-      "010.0.0.0/8",
+      "010.0.0.0/24",
+      // A dotted quad only stands in for the last two hextets, so a compression cannot follow it.
+      "1.2.3.4::",
+      // A zone names an interface on whoever wrote the entry, not a peer that can dial in, and Go
+      // drops zoned addresses on the floor.
+      "fe80::1%eth0",
+      "2604:2dc0:101:200::310e%eth0",
     ]) {
       expect(renderTraefikStaticConfig(paths, [peer])).not.toContain("forwardedHeaders");
     }
@@ -642,15 +648,64 @@ describe("traefik forwarded headers", () => {
       "::ffff:192.0.2.1",
       "2001:0db8:0000:0000:0000:0000:0000:0001",
       // A bare zero octet is not a leading zero, and Traefik loads it.
-      "10.0.0.0/8",
+      "10.0.0.0/24",
       "0.0.0.1",
     ]) {
       expect(renderTraefikStaticConfig(paths, [peer])).toContain(`        - ${peer}`);
     }
 
     expect(
-      renderTraefikStaticConfig(paths, ["203.0.113.7", "  203.0.113.7  ", "10.0.0.0/8"])
-    ).toContain(["      trustedIPs:", "        - 203.0.113.7", "        - 10.0.0.0/8"].join("\n"));
+      renderTraefikStaticConfig(paths, ["203.0.113.7", "  203.0.113.7  ", "10.0.0.0/24"])
+    ).toContain(["      trustedIPs:", "        - 203.0.113.7", "        - 10.0.0.0/24"].join("\n"));
+  });
+
+  test("should drop a prefix wider than the one edge host an entry is meant to name", async () => {
+    tempDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-traefik-"));
+    const paths = getTraefikRuntimePaths(tempDir);
+    await ensureTraefikState(paths);
+
+    for (const peer of [
+      // `/1` is a typo for `/32` as easily as `/0` is, and it trusts half the IPv4 internet.
+      "0.0.0.0/0",
+      "0.0.0.0/1",
+      "203.0.113.0/1",
+      "10.0.0.0/8",
+      // One step wider than the bound: 512 hosts is already more than an edge egress set.
+      "203.0.113.0/23",
+      "::/0",
+      "2604:2dc0:101:200::/1",
+      "2604:2dc0:101:200::/47",
+      // Out of range on the narrow side, and prefixes Go will not read as a number at all.
+      "40.160.2.8/33",
+      "2604:2dc0:101:200::310e/129",
+      "40.160.2.8/033",
+      "2604:2dc0:101:200::310e/0128",
+      "40.160.2.8/abc",
+      "40.160.2.8/1/2",
+      "40.160.2.8/",
+      "40.160.2.8/-24",
+      "40.160.2.8/ 24",
+    ]) {
+      expect(renderTraefikStaticConfig(paths, [peer])).not.toContain("forwardedHeaders");
+    }
+
+    for (const peer of [
+      "203.0.113.0/24",
+      "40.160.2.8/32",
+      "40.160.2.8",
+      "2604:2dc0:101:200::/48",
+      "2604:2dc0:101:200::310e/128",
+      "2604:2dc0:101:200::310e",
+    ]) {
+      expect(renderTraefikStaticConfig(paths, [peer])).toContain(`        - ${peer}`);
+    }
+
+    // `DEFAULT_EDGE_FORWARDED_PEERS`, the only value the control plane ships, has to survive the
+    // bound: a dropped entry leaves the edge untrusted, and every app behind a provided hostname
+    // then sees the proxy's address instead of the client's.
+    expect(renderTraefikStaticConfig(paths, ["40.160.2.8/32"])).toContain(
+      "        - 40.160.2.8/32"
+    );
   });
 
   test("should cut Traefik over when the trusted edge changes", async () => {

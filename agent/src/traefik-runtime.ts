@@ -11,6 +11,7 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
+import { isIP } from "node:net";
 import path from "node:path";
 
 import {
@@ -172,80 +173,62 @@ function formatMode(mode: number): string {
 }
 
 /**
- * Go's address parser, which is what Traefik ultimately uses, rejects a leading zero in an octet
- * rather than reading it as octal. Verified on traefik:v3.5: `010.0.0.1` and `::ffff:010.0.0.1`
- * both abort the process with `invalid CIDR address`, so accepting them here would write a static
- * config the proxy refuses to start with.
+ * How wide a network a single entry may name, per address family.
+ *
+ * Every peer here is one hosted-edge egress host — the control plane sends a single `/32` (see
+ * `DEFAULT_EDGE_FORWARDED_PEERS`), and nothing between the edge and the customer proxy widens that
+ * into a range. So the prefix is only ever a host mask, and a broad one is a slip of the keyboard
+ * rather than a peer: `/1` is as easy to type in place of `/32` as `/0` is, and it hands the right
+ * to forge `X-Forwarded-For` to half the IPv4 internet. Rejecting only `/0` catches one spelling
+ * of the same mistake.
+ *
+ * `/24` is where the line sits: it is the smallest block the global routing table carries, so it
+ * is also the smallest piece of IPv4 space anyone is allocated. One whole allocation already spans
+ * 256 hosts, far more than an edge's egress set, and anything wider is more address space than a
+ * peer list can mean. `/48` is the IPv6 equivalent, the smallest allocation a site is handed.
  */
-function isIpv4Address(value: string): boolean {
-  const octets = value.split(".");
-  return (
-    octets.length === 4 &&
-    octets.every((octet) => /^(?:0|[1-9]\d{0,2})$/.test(octet) && Number.parseInt(octet, 10) <= 255)
-  );
-}
+const FORWARDING_PREFIX_BOUNDS: Readonly<Record<number, { min: number; max: number }>> = {
+  4: { min: 24, max: 32 },
+  6: { min: 48, max: 128 },
+};
 
 /**
- * Recognizes exactly what Traefik will accept, because anything looser defeats the reason these
- * entries are filtered at all: a half-address like `1:2` that survives this check is written into
- * the static config, and Traefik then refuses to start with it.
+ * Anything looser than what Traefik itself accepts defeats the reason these entries are filtered
+ * at all: a half-address that survives this check is written into the static config, and Traefik
+ * then refuses to start with it. `node:net` draws the same line Go does, down to reading a leading
+ * zero in an octet as an error rather than as octal — verified on traefik:v3.5, where `010.0.0.1`
+ * aborts the process with `invalid CIDR address`. The one place the two part company is a zone id,
+ * handled below.
  */
-function isIpv6Address(value: string): boolean {
-  const compressionParts = value.split("::");
-  if (compressionParts.length > 2) {
-    return false;
-  }
-
-  const isCompressed = compressionParts.length === 2;
-  const head = compressionParts[0] ?? "";
-  const tail = isCompressed ? (compressionParts[1] ?? "") : "";
-  const groups = [
-    ...(head.length > 0 ? head.split(":") : []),
-    ...(tail.length > 0 ? tail.split(":") : []),
-  ];
-
-  // An empty group here is a stray colon: `:`, `:::1`, `1:2:3:4:5:6:7:` and friends.
-  if (groups.some((group) => group.length === 0)) {
-    return false;
-  }
-
-  // A trailing dotted-quad stands in for the last two hextets, as in `::ffff:192.0.2.1`.
-  const lastGroup = groups.at(-1);
-  const ipv4Tail = lastGroup?.includes(".") ? lastGroup : null;
-  const hextets = ipv4Tail === null ? groups : groups.slice(0, -1);
-
-  if (ipv4Tail !== null && !isIpv4Address(ipv4Tail)) {
-    return false;
-  }
-
-  if (!hextets.every((hextet) => /^[0-9a-fA-F]{1,4}$/.test(hextet))) {
-    return false;
-  }
-
-  // `::` stands for at least one zero hextet, so a compressed address spells out at most seven.
-  const hextetCount = hextets.length + (ipv4Tail === null ? 0 : 2);
-  return isCompressed ? hextetCount <= 7 : hextetCount === 8;
-}
-
 function isForwardingPeer(value: string): boolean {
   const parts = value.split("/");
   const address = parts[0] ?? "";
   const prefix = parts[1];
 
-  if (parts.length > 2 || address.length === 0) {
+  if (parts.length > 2) {
     return false;
   }
 
-  const maxPrefixLength = address.includes(":") ? 128 : 32;
-  if (prefix !== undefined) {
-    const prefixLength = /^\d{1,3}$/.test(prefix) ? Number.parseInt(prefix, 10) : Number.NaN;
-    // A `/0` prefix would trust every peer, which is the one thing this list must never do.
-    if (!(prefixLength >= 1 && prefixLength <= maxPrefixLength)) {
-      return false;
-    }
+  // `isIP` accepts a scoped address like `fe80::1%eth0`, but a zone names an interface on the host
+  // that wrote it, so it can never identify a peer dialling in from somewhere else — and Go's
+  // `net.ParseIP`, which Traefik parses `trustedIPs` with, discards zoned addresses outright.
+  if (address.includes("%")) {
+    return false;
   }
 
-  return address.includes(":") ? isIpv6Address(address) : isIpv4Address(address);
+  const bounds = FORWARDING_PREFIX_BOUNDS[isIP(address)];
+  if (!bounds) {
+    return false;
+  }
+
+  if (prefix === undefined) {
+    return true;
+  }
+
+  // Go reads the mask with plain decimal parsing, so `/024` is the same network as `/24` there and
+  // stays accepted here; only the width it resolves to decides the entry.
+  const prefixLength = /^\d{1,3}$/.test(prefix) ? Number.parseInt(prefix, 10) : Number.NaN;
+  return prefixLength >= bounds.min && prefixLength <= bounds.max;
 }
 
 /**
