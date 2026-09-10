@@ -5,6 +5,7 @@
   "private": true,
   "exports": {
     "./agent-metrics": "./src/agent-metrics.ts",
+    "./external-backup-import": "./src/external-backup-import.ts",
     "./logging": "./src/logging.ts",
     "./server-capacity": "./src/server-capacity.ts"
   }
