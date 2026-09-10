@@ -103,7 +103,8 @@ const appPayload: AppDeployPayload = {
   serviceId: "svc_1",
   deploymentId: "dep_1",
   environmentId: "env_1",
-  envVars: {},
+  envVars: { PGSSLMODE: "require" },
+  platformGeneratedValues: ["require"],
   appBuildType: "dockerfile",
   appBuildConfig: {
     buildRoot: "apps/web",
@@ -1431,6 +1432,9 @@ describe("buildAndDeployAppWithDependencies", () => {
         buildkitAddress: "tcp://127.0.0.1:1234",
         // A failed build can only name the builder's budget if the deploy path hands it over (#215).
         builderMemoryBytes: 585 * 1024 * 1024,
+        // Without this the build log redactor cannot tell `require` from `PGSSLMODE` apart from a
+        // customer value, and masks it inside `requirements.txt` (#245).
+        platformGeneratedValues: appPayload.platformGeneratedValues ?? [],
       })
     );
     expect(deployAppImage.mock.calls[0]?.[2]).toEqual(

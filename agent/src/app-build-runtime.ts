@@ -51,6 +51,7 @@ export interface BuildAndDeployAppDependencies {
     builderMemoryBytes: number | null;
     appBuildType?: AppDeployPayload["appBuildType"];
     appBuildConfig?: AppDeployPayload["appBuildConfig"];
+    platformGeneratedValues?: readonly string[];
     onBuildLog?: BuildLogEmitter;
   }) => Promise<BuildAppResult>;
   deployAppImage: (
@@ -84,6 +85,7 @@ export async function buildAndDeployAppWithDependencies(
     builderMemoryBytes: buildkit.memoryBytes,
     appBuildType: payload.appBuildType ?? null,
     appBuildConfig: payload.appBuildConfig ?? null,
+    platformGeneratedValues: payload.platformGeneratedValues ?? [],
     ...(onBuildLog ? { onBuildLog } : {}),
   });
 

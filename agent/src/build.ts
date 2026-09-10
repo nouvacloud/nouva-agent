@@ -16,7 +16,7 @@ import type {
   BuildLogStage,
   ServiceResourceLimits,
 } from "./protocol.js";
-import { redactSensitiveText } from "./security.js";
+import { createBuildLogRedactor, redactSensitiveText } from "./security.js";
 
 const execFile = promisify(execFileCallback);
 
@@ -48,6 +48,8 @@ export interface BuildAppOptions {
   builderMemoryBytes: number | null;
   appBuildType?: AppBuildType | null;
   appBuildConfig?: AppBuildConfig | null;
+  /** Which of `envVars` the platform generated. See `createBuildLogRedactor`. */
+  platformGeneratedValues?: readonly string[];
   /** Receives clone, analyze and BuildKit output as it is produced. */
   onBuildLog?: BuildLogEmitter;
 }
@@ -193,7 +195,6 @@ interface StreamedBuildCommandOptions {
   cwd: string;
   env: NodeJS.ProcessEnv;
   stage: BuildLogStage;
-  envVars: Record<string, string>;
   /**
    * Whether the step's work happens inside the deployment's scoped BuildKit daemon, and so under
    * its memory cap. Only those failures may be blamed on, and reported against, that budget.
@@ -204,7 +205,8 @@ interface StreamedBuildCommandOptions {
 
 /**
  * Runs one step of a build, forwarding its output to the deployment's build log as it is produced.
- * Every line is redacted against the service's own variables before it leaves the agent; the
+ * The emitter `buildApp` hands down is already wrapped in this build's redactor, so every line —
+ * including the ones this function writes itself — is redacted before it leaves the agent; the
  * control plane redacts again on ingest.
  */
 async function runStreamedBuildCommand(
@@ -220,7 +222,7 @@ async function runStreamedBuildCommand(
       ? (line, stream) => {
           onBuildLog({
             type: stream,
-            line: redactSensitiveText(line, options.envVars),
+            line,
             timestamp: Date.now(),
             stage: options.stage,
           });
@@ -610,7 +612,7 @@ export function buildDockerfileBuildctlArgs(options: BuildctlImageBuildOptions):
 async function runBuildctlBuild(
   options: BuildctlImageBuildOptions,
   env: NodeJS.ProcessEnv = process.env,
-  logging: { onBuildLog?: BuildLogEmitter; envVars?: Record<string, string> } = {}
+  logging: { onBuildLog?: BuildLogEmitter } = {}
 ): Promise<string | null> {
   try {
     const { stdout, stderr } = await runStreamedBuildCommand({
@@ -619,7 +621,6 @@ async function runBuildctlBuild(
       cwd: options.contextDir,
       env,
       stage: "building",
-      envVars: logging.envVars ?? {},
       runsInBuilder: true,
       ...(logging.onBuildLog ? { onBuildLog: logging.onBuildLog } : {}),
     });
@@ -675,7 +676,6 @@ async function prepareRailpackPlan(
     cwd: buildRootDir,
     env: childEnv,
     stage: "analyzing",
-    envVars,
     // railpack's analysis runs on the agent host, outside the builder's cgroup, so a failure here
     // is never the builder's budget.
     runsInBuilder: false,
@@ -695,7 +695,6 @@ async function runRailpackBuildctl(options: {
   planDir: string;
   buildkitAddress: string;
   childEnv: NodeJS.ProcessEnv;
-  envVars: Record<string, string>;
   envVarKeys: string[];
   output: string;
   planFileName: string;
@@ -715,7 +714,6 @@ async function runRailpackBuildctl(options: {
       cwd: options.buildRootDir,
       env: options.childEnv,
       stage: "building",
-      envVars: options.envVars,
       runsInBuilder: true,
       ...(options.onBuildLog ? { onBuildLog: options.onBuildLog } : {}),
     });
@@ -749,7 +747,6 @@ async function runRailpackBuild(options: {
       planDir,
       buildkitAddress: options.buildkitAddress,
       childEnv: prepared.childEnv,
-      envVars: options.envVars,
       envVarKeys: Object.keys(options.envVars),
       output: options.output,
       planFileName: prepared.planFileName,
@@ -842,10 +839,7 @@ async function buildDockerfileApplication(options: {
       targetStage: options.dockerBuildStage ?? null,
     },
     buildEnvVars(options.envVars),
-    {
-      envVars: options.envVars,
-      ...(options.onBuildLog ? { onBuildLog: options.onBuildLog } : {}),
-    }
+    options.onBuildLog ? { onBuildLog: options.onBuildLog } : {}
   );
   const imageId = await loadBuiltImageIfNeeded(options.docker, options.output);
 
@@ -1014,10 +1008,7 @@ async function buildStaticApplication(options: {
       output: options.output.buildctlOutput,
     },
     process.env,
-    {
-      envVars: options.envVars,
-      ...(options.onBuildLog ? { onBuildLog: options.onBuildLog } : {}),
-    }
+    options.onBuildLog ? { onBuildLog: options.onBuildLog } : {}
   );
   const imageId = await loadBuiltImageIfNeeded(options.docker, options.output);
 
@@ -1031,11 +1022,41 @@ async function buildStaticApplication(options: {
   };
 }
 
+/**
+ * The emitter a build writes every line through, redacted.
+ *
+ * Redaction sits here, at the one boundary the lines leave by, rather than at each of the places
+ * that produce one: `[nouva]` notices and progress messages are written by the agent itself and
+ * used to bypass it entirely. The matcher is compiled once because a source build emits tens of
+ * thousands of lines through it.
+ */
+export function createBuildLogEmitter(
+  onBuildLog: BuildLogEmitter | undefined,
+  envVars: Record<string, string>,
+  platformGeneratedValues: readonly string[] = []
+): BuildLogEmitter | undefined {
+  if (!onBuildLog) {
+    return undefined;
+  }
+  const redact = createBuildLogRedactor(envVars, platformGeneratedValues);
+  return (entry) => {
+    onBuildLog({
+      ...entry,
+      ...(typeof entry.line === "string" ? { line: redact(entry.line) } : {}),
+      ...(typeof entry.message === "string" ? { message: redact(entry.message) } : {}),
+    });
+  };
+}
+
 export async function buildApp(options: BuildAppOptions): Promise<BuildAppResult> {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), `nouva-agent-${options.deploymentId}-`));
   const repoDir = path.join(tempRoot, "repo");
   const buildStart = Date.now();
-  const onBuildLog = options.onBuildLog;
+  const onBuildLog = createBuildLogEmitter(
+    options.onBuildLog,
+    options.envVars,
+    options.platformGeneratedValues ?? []
+  );
 
   try {
     onBuildLog?.(buildProgressEntry("cloning", "Cloning the repository", 5));

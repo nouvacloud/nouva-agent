@@ -497,6 +497,13 @@ export interface AppDeployPayload {
   redactionContextVersion?: string;
   // Added by the control plane during lease hydration, never stored in queued work.
   envVars: Record<string, string>;
+  /**
+   * The subset of `envVars` the platform generated rather than the customer typing it. The build
+   * log redactor masks one of these only where it stands as its own word, so `require` from
+   * `PGSSLMODE` stops eating the word inside `requirements.txt` (#219, #245). Absent on a payload
+   * from a control plane older than the field, which keeps the previous, stricter rule.
+   */
+  platformGeneratedValues?: string[];
   appBuildType?: AppBuildType | null;
   appBuildConfig?: AppBuildConfig | null;
   volume?: AppVolumeIdentity | null;
@@ -548,6 +555,13 @@ export interface WorkerDeployPayload {
   redactionContextVersion?: string;
   // Added by the control plane during lease hydration, never stored in queued work.
   envVars: Record<string, string>;
+  /**
+   * The subset of `envVars` the platform generated rather than the customer typing it. The build
+   * log redactor masks one of these only where it stands as its own word, so `require` from
+   * `PGSSLMODE` stops eating the word inside `requirements.txt` (#219, #245). Absent on a payload
+   * from a control plane older than the field, which keeps the previous, stricter rule.
+   */
+  platformGeneratedValues?: string[];
   appBuildType?: Exclude<AppBuildType, "static"> | null;
   appBuildConfig?: AppBuildConfig | null;
   startCommand: string | null;

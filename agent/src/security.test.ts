@@ -1,10 +1,58 @@
 // @ts-expect-error Bun provides the test module at runtime in this workspace.
 import { describe, expect, test } from "bun:test";
 import {
+  createBuildLogRedactor,
   redactSensitiveText,
   sanitizeSensitiveProtocolValue,
   sanitizeSensitiveValue,
 } from "./security.js";
+
+describe("createBuildLogRedactor", () => {
+  // The build map the agent receives is the customer's own map laid over the generated catalog of
+  // every resource it references, so a service referencing only `${{db.DATABASE_URL}}` still has
+  // `PGSSLMODE=require` in it. The agent redacts before the line leaves the server, so getting the
+  // rule wrong here is not something the control plane can undo (#219, #245).
+  const buildEnvVars = {
+    DATABASE_URL: "postgres://nouva:zzgeneratedzz@db.internal/app",
+    PGDATABASE: "nouva_suite_db",
+    PGSSLMODE: "require",
+    PROBE_SECRET: "zzsecretvaluezz",
+  };
+
+  test("keeps an ordinary filename that contains a platform-generated word", () => {
+    const redact = createBuildLogRedactor(buildEnvVars, ["require", "nouva_suite_db"]);
+
+    expect(redact("pip install -r requirements.txt")).toBe("pip install -r requirements.txt");
+    expect(redact("2 packages required, 0 satisfied")).toBe("2 packages required, 0 satisfied");
+  });
+
+  test("keeps variable names legible", () => {
+    const redact = createBuildLogRedactor(buildEnvVars, ["require", "nouva_suite_db"]);
+
+    expect(redact("reading PGSSLMODE and DATABASE_URL from the environment")).toBe(
+      "reading PGSSLMODE and DATABASE_URL from the environment"
+    );
+  });
+
+  test("still masks a platform-generated word standing on its own", () => {
+    const redact = createBuildLogRedactor(buildEnvVars, ["require", "nouva_suite_db"]);
+
+    expect(redact("sslmode=require")).toBe("sslmode=[REDACTED]");
+  });
+
+  test("masks a customer value wherever it appears, including inside a longer run", () => {
+    const redact = createBuildLogRedactor(buildEnvVars, ["require", "nouva_suite_db"]);
+
+    expect(redact("prefixzzsecretvaluezzsuffix")).toBe("prefix[REDACTED]suffix");
+    expect(redact(buildEnvVars.DATABASE_URL)).toBe("[REDACTED]");
+  });
+
+  test("masks a word-shaped value the platform did not generate", () => {
+    const redact = createBuildLogRedactor({ APP_PASSWORD: "changeme" }, []);
+
+    expect(redact("tried changemenow")).toBe("tried [REDACTED]now");
+  });
+});
 
 describe("redactSensitiveText", () => {
   test("redacts clone credentials from command failures", () => {

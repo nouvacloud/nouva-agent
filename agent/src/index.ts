@@ -3345,6 +3345,7 @@ async function handleBuildAndDeployWorker(
       builderMemoryBytes: buildkitRuntime.memoryBytes,
       appBuildType: payload.appBuildType ?? null,
       appBuildConfig: payload.appBuildConfig ?? null,
+      platformGeneratedValues: payload.platformGeneratedValues ?? [],
       ...(onBuildLog ? { onBuildLog } : {}),
     });
     const result = await deployWorkerRuntime(docker, getWorkerRuntimeEnvironment(config), {

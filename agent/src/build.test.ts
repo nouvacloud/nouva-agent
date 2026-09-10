@@ -9,6 +9,7 @@ import {
   buildStaticNginxConfig,
   buildStaticRuntimeDockerfile,
   classifyBuildFailure,
+  createBuildLogEmitter,
   detectDockerfileExposedPort,
   normalizeAppBuildSettings,
   resolveDetectedFramework,
@@ -16,6 +17,60 @@ import {
   toSafeBuildctlExecutionError,
   withBuildMemoryBudget,
 } from "./build.js";
+import type { BuildLogMessage } from "./protocol.js";
+
+describe("createBuildLogEmitter", () => {
+  // The agent redacts a build log before it leaves the customer's server, so this is the last
+  // chance to get the rule right: nothing downstream can put back a word the agent masked. Before
+  // this emitter existed each producer redacted its own lines against names *and* values by plain
+  // substring, which is what shipped `pip install -r [REDACTED]ments.txt` to the dashboard (#245).
+  const envVars = { PGSSLMODE: "require", PROBE_SECRET: "zzsecretvaluezz" };
+
+  function collect(platformGeneratedValues: readonly string[]) {
+    const entries: BuildLogMessage[] = [];
+    const emit = createBuildLogEmitter(
+      (entry) => entries.push(entry),
+      envVars,
+      platformGeneratedValues
+    );
+    return { emit: emit!, entries };
+  }
+
+  test("redacts the lines a build streams through it", () => {
+    const { emit, entries } = collect(["require"]);
+
+    emit({
+      type: "stdout",
+      line: "reading PGSSLMODE; pip install -r requirements.txt; prefixzzsecretvaluezzsuffix",
+      timestamp: 1,
+      stage: "building",
+    });
+
+    expect(entries[0]?.line).toBe(
+      "reading PGSSLMODE; pip install -r requirements.txt; prefix[REDACTED]suffix"
+    );
+  });
+
+  test("redacts a progress entry's message as well as a line", () => {
+    const { emit, entries } = collect([]);
+
+    emit({ type: "progress", message: "using zzsecretvaluezz", percent: 40, timestamp: 1 });
+
+    expect(entries[0]?.message).toBe("using [REDACTED]");
+  });
+
+  test("leaves entries that carry no text alone", () => {
+    const { emit, entries } = collect([]);
+
+    emit({ type: "exit", exitCode: 0, success: true, timestamp: 1 });
+
+    expect(entries[0]).toEqual({ type: "exit", exitCode: 0, success: true, timestamp: 1 });
+  });
+
+  test("has nothing to wrap when the build publishes no logs", () => {
+    expect(createBuildLogEmitter(undefined, envVars, ["require"])).toBeUndefined();
+  });
+});
 
 describe("build helpers", () => {
   test("defaults missing build settings to railpack at repo root", () => {

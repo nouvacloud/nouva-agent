@@ -1,6 +1,7 @@
 import {
   collectConfiguredSecretValues,
   collectEnvironmentMapValues,
+  createLogTextRedactor,
   redactLogText,
   sanitizeLogValue,
 } from "@repo/runtime/logging";
@@ -23,6 +24,37 @@ export function redactSensitiveText(
   return redactLogText(value, {
     ...(environmentVariables ? { environmentVariables } : {}),
     operationalValues,
+  });
+}
+
+/**
+ * Redactor for one build's log, compiled once and reused for every line it emits.
+ *
+ * It differs from `redactSensitiveText` in the two ways a build log needs, and both come from the
+ * same over-matching family as #125, #187 and #219:
+ *
+ * - It protects environment *values* only. A variable name is already visible to anyone who can
+ *   read the log, and treating names as protected material is what reduced an explanatory line to
+ *   `reading [REDACTED] and [REDACTED] from the environment`.
+ * - It honours `platformGeneratedValues`, so a fixed literal the platform emits for every service
+ *   of a kind — `require` from `PGSSLMODE`, `postgres` from `PGDATABASE` — is masked only where it
+ *   stands as its own word. Without it the agent turned `requirements.txt` into
+ *   `[REDACTED]ments.txt` before the line ever left the server, which the control plane's own fix
+ *   for the same rule (#245) could not undo.
+ *
+ * A customer's value keeps matching anywhere it appears, however ordinary it looks, and the
+ * agent's own configured secrets are never relaxed.
+ */
+export function createBuildLogRedactor(
+  environmentVariables: EnvironmentVariableMap,
+  platformGeneratedValues: readonly string[] = []
+): (value: string) => string {
+  return createLogTextRedactor({
+    platformGeneratedValues,
+    secretValues: [
+      ...collectConfiguredSecretValues(),
+      ...collectEnvironmentMapValues(environmentVariables),
+    ],
   });
 }
 
