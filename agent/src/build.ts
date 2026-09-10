@@ -92,7 +92,7 @@ interface BuildImageOutput {
 
 const MEBIBYTE = 1024 * 1024;
 
-export type BuildFailureKind = "out-of-memory" | "unknown";
+export type BuildFailureKind = "out-of-memory" | "host-process-killed" | "unknown";
 
 /** How a build step ended: everything the failure classification is allowed to look at. */
 export interface BuildProcessOutcome {
@@ -130,15 +130,23 @@ const OUT_OF_MEMORY_SIGNATURES: readonly RegExp[] = [
  * exiting 1. A real builder OOM is always caught by a signature above.
  */
 export function classifyBuildFailure(outcome: BuildProcessOutcome): BuildFailureKind {
-  // Nothing in the agent kills a build process, so a SIGKILL on the one it spawned came from the
-  // kernel reclaiming memory; exit code 137 is that same kill seen through an exit status.
-  if (outcome.signal === "SIGKILL" || outcome.exitCode === 137) {
+  if (OUT_OF_MEMORY_SIGNATURES.some((signature) => signature.test(outcome.output))) {
     return "out-of-memory";
   }
 
-  return OUT_OF_MEMORY_SIGNATURES.some((signature) => signature.test(outcome.output))
-    ? "out-of-memory"
-    : "unknown";
+  // The process this outcome describes is `buildctl`, which runs on the agent host and drives the
+  // scoped daemon over TCP — never inside the memory-capped builder, and streaming its output
+  // rather than buffering it. So the builder's cgroup has no way to kill it, and a builder OOM
+  // reaches it as the output matched above. Nothing in the agent kills a build process either
+  // (`streamCommand` has no timeout, abort or kill path), so a SIGKILL on the client itself — exit
+  // code 137 being that same kill seen through an exit status — came from outside the build:
+  // host-wide memory pressure, or an operator. That is a real failure worth naming, but it is not
+  // the service's builder budget and must never be reported as it (#255).
+  if (outcome.signal === "SIGKILL" || outcome.exitCode === 137) {
+    return "host-process-killed";
+  }
+
+  return "unknown";
 }
 
 /**
@@ -146,16 +154,22 @@ export function classifyBuildFailure(outcome: BuildProcessOutcome): BuildFailure
  * this string is the deployment's failure summary and the output can carry build secrets.
  */
 function describeBuildFailure(kind: BuildFailureKind, builderMemoryBytes: number | null): string {
-  if (kind !== "out-of-memory") {
-    return "BuildKit build failed";
+  switch (kind) {
+    case "out-of-memory": {
+      const budget =
+        builderMemoryBytes !== null && builderMemoryBytes > 0
+          ? ` Its builder is limited to ${Math.round(builderMemoryBytes / MEBIBYTE)} MiB, a fixed share of the server's memory that the service's own memory limit does not change.`
+          : "";
+
+      return `The build ran out of memory.${budget} Lower what the build needs (for example reduce build parallelism or disable source maps) or run it on a server with more memory.`;
+    }
+    // Says only what the kill proves: it came from the server, not from this build's own limits.
+    // Naming a budget here would be the misattribution the kind exists to avoid.
+    case "host-process-killed":
+      return "The build was stopped by the server: something outside the build killed its process, most often the host reclaiming memory while other work ran alongside it. Retry the deployment, and if it keeps happening check what else the server is running while builds are in flight.";
+    case "unknown":
+      return "BuildKit build failed";
   }
-
-  const budget =
-    builderMemoryBytes !== null && builderMemoryBytes > 0
-      ? ` Its builder is limited to ${Math.round(builderMemoryBytes / MEBIBYTE)} MiB, a fixed share of the server's memory that the service's own memory limit does not change.`
-      : "";
-
-  return `The build ran out of memory.${budget} Lower what the build needs (for example reduce build parallelism or disable source maps) or run it on a server with more memory.`;
 }
 
 export class BuildctlExecutionError extends Error {
@@ -180,6 +194,9 @@ export function toSafeBuildctlExecutionError(error: unknown): BuildctlExecutionE
  * Restates an out-of-memory build failure with the budget its builder was actually given. The step
  * that fails is several layers below the option carrying that budget, so the classification travels
  * up on the error and the number is filled in once, at the boundary that knows it.
+ *
+ * Only that one kind is restated. Every other failure — a host-level kill above all — is returned
+ * untouched, because the builder's budget is not what it ran into.
  */
 export function withBuildMemoryBudget(error: unknown, builderMemoryBytes: number | null): unknown {
   if (!(error instanceof BuildctlExecutionError) || error.kind !== "out-of-memory") {

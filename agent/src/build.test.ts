@@ -275,9 +275,11 @@ describe("build failure classification", () => {
     }
   });
 
-  test("classifies a build process the kernel killed outright", () => {
+  // #255: buildctl runs on the host against the scoped daemon over TCP, so the builder's cgroup
+  // cannot reach it. A SIGKILL on the client came from the host, not from this build's budget.
+  test("classifies a build client the host killed as a host-level kill", () => {
     expect(classifyBuildFailure({ exitCode: -1, signal: "SIGKILL", output: "" })).toBe(
-      "out-of-memory"
+      "host-process-killed"
     );
   });
 
@@ -350,12 +352,24 @@ describe("build failure classification", () => {
     ).toBe("out-of-memory");
   });
 
-  test("classifies a build whose own process was killed, whatever it logged", () => {
+  test("classifies a build client that exited on a kill as a host-level kill", () => {
     expect(
       classifyBuildFailure({
         exitCode: 137,
         signal: null,
         output: "npm ERR! 429 ResourceExhausted desc = quota exceeded",
+      })
+    ).toBe("host-process-killed");
+  });
+
+  // The builder's own OOM is decided by the output, so it outranks the shape of the client's exit:
+  // a host that kills the client mid-build must not erase evidence the build itself ran out.
+  test("still classifies a builder memory kill when the client was killed too", () => {
+    expect(
+      classifyBuildFailure({
+        exitCode: -1,
+        signal: "SIGKILL",
+        output: 'process "bun run build" did not complete successfully: cannot allocate memory',
       })
     ).toBe("out-of-memory");
   });
@@ -389,6 +403,46 @@ describe("build failure classification", () => {
     expect(message).toContain("server with more memory");
   });
 
+  // The whole path a real builder OOM takes, from the line BuildKit prints to what the deployment
+  // ends up saying: the budget sentence belongs here, and only here.
+  test("reports the builder's budget for a builder memory kill end to end", () => {
+    const error = withBuildMemoryBudget(
+      new BuildctlExecutionError(
+        classifyBuildFailure({
+          exitCode: 1,
+          signal: null,
+          output:
+            'error: failed to solve: ResourceExhausted: process "/bin/sh -c npm run build" did not complete successfully: cannot allocate memory',
+        })
+      ),
+      builderMemoryBytes
+    ) as BuildctlExecutionError;
+
+    expect(error.kind).toBe("out-of-memory");
+    expect(error.message).toContain("ran out of memory");
+    expect(error.message).toContain("571 MiB");
+  });
+
+  // #255: the host killing the build client is not the service's builder running out. Telling the
+  // customer to shrink a build that never hit its own cap is the misattribution #215 removed.
+  test("never blames the builder's budget for a host-level kill", () => {
+    for (const outcome of [
+      { exitCode: -1, signal: "SIGKILL" as const, output: "" },
+      { exitCode: 137, signal: null, output: "#12 [4/8] RUN npm run build" },
+    ]) {
+      const killed = new BuildctlExecutionError(classifyBuildFailure(outcome));
+      const reported = withBuildMemoryBudget(killed, builderMemoryBytes);
+
+      // Nothing restates a host kill, so the budget can never reach its message.
+      expect(reported).toBe(killed);
+      expect(killed.kind).toBe("host-process-killed");
+      expect(killed.message).not.toContain("MiB");
+      expect(killed.message).not.toContain("ran out of memory");
+      expect(killed.message).not.toContain("Lower what the build needs");
+      expect(killed.message).toContain("stopped by the server");
+    }
+  });
+
   test("never quotes the build output in the failure it reports", () => {
     const output = [
       "#18 12.0 DATABASE_URL=postgres://app:hunter2@db:5432/app",
@@ -403,6 +457,21 @@ describe("build failure classification", () => {
     expect(error.kind).toBe("out-of-memory");
     expect(error.message).not.toContain("hunter2");
     expect(error.message).not.toContain("DATABASE_URL");
+  });
+
+  // The kind a plain compile error lands in, and what the deployment says about it, are exactly
+  // what they were before host kills were split out.
+  test("still reports an unclassified build failure as it always did", () => {
+    const error = new BuildctlExecutionError(
+      classifyBuildFailure({
+        exitCode: 1,
+        signal: null,
+        output: 'process "npm run build" did not complete successfully: exit code: 1',
+      })
+    );
+
+    expect(error.kind).toBe("unknown");
+    expect(error.message).toBe("BuildKit build failed");
   });
 
   test("leaves an unrelated failure exactly as it was", () => {
