@@ -1083,10 +1083,6 @@ ${rules}
   ].join("\n\n");
 }
 
-export function renderAlloyConfig(input: AlloyRuntimeInput): string {
-  return [renderAlloyStaticConfig(input), renderAlloyDynamicConfig(input)].join("\n");
-}
-
 export function createAlloyStateHash(configContents: string): string {
   return createHash("sha256").update(configContents).digest("hex");
 }

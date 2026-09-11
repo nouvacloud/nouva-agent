@@ -211,15 +211,6 @@ export const DEFAULT_APP_ROLLOUT_CONFIG: AppRolloutConfig = {
   },
 };
 
-export function getDefaultAppRolloutConfig(): AppRolloutConfig {
-  return {
-    strategy: DEFAULT_APP_ROLLOUT_CONFIG.strategy,
-    readiness: { ...DEFAULT_APP_ROLLOUT_CONFIG.readiness },
-    cutover: { ...DEFAULT_APP_ROLLOUT_CONFIG.cutover },
-    drain: { ...DEFAULT_APP_ROLLOUT_CONFIG.drain },
-  };
-}
-
 export function resolveAppRolloutConfig(config?: AppRolloutConfig | null): AppRolloutConfig {
   return {
     strategy: config?.strategy ?? DEFAULT_APP_ROLLOUT_CONFIG.strategy,

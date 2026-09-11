@@ -1,4 +1,4 @@
-import { type BuildAppResult, buildApp } from "./build.js";
+import type { BuildAppResult } from "./build.js";
 import type { BuildLogEmitter } from "./build-logs.js";
 import type { DockerApiClient } from "./docker-api.js";
 import type { AgentRuntimeConfig, AppDeployPayload, RuntimeMetadata } from "./protocol.js";
@@ -108,7 +108,3 @@ export async function buildAndDeployAppWithDependencies(
     internalPort: buildResult.internalPort,
   });
 }
-
-export const defaultBuildAndDeployAppDependencies = {
-  buildApp,
-};
