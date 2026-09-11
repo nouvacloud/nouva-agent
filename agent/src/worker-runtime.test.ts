@@ -407,6 +407,7 @@ describe("worker convergence and cleanup", () => {
     expect(result.cleanupProof).toEqual({
       version: 1,
       kind: "delete_worker",
+      serviceContainers: { serviceId: "svc_1", remainingContainerIds: [] },
       containers: [
         { identifier: "ctr_worker_1", absent: true },
         { identifier: "ctr_worker_2", absent: true },

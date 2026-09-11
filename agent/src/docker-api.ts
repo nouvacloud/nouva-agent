@@ -44,6 +44,7 @@ export const REDACTION_CONTEXT_VERSION_DOCKER_LABEL = "nouva.redaction.context.v
 export interface DockerContainerInspection {
   Id: string;
   Name: string;
+  Image?: string;
   RestartCount?: number;
   State?: {
     Running?: boolean;
@@ -64,6 +65,8 @@ export interface DockerContainerInspection {
     PidsLimit?: number;
     NetworkMode?: string;
     Binds?: string[];
+    VolumesFrom?: string[];
+    Mounts?: Array<{ Type?: string; Source?: string; Target?: string }>;
     Privileged?: boolean;
     RestartPolicy?: {
       Name?: string;
@@ -109,6 +112,7 @@ export interface DockerImageInspection {
   RepoTags?: string[];
   RepoDigests?: string[];
   Config?: {
+    Volumes?: Record<string, Record<string, never>> | null;
     Entrypoint?: string[] | null;
     Cmd?: string[] | null;
     Healthcheck?: {

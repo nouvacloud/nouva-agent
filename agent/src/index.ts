@@ -15,6 +15,12 @@ import {
 import { collectAgentWorkPayloadOperationalValues } from "@repo/runtime/logging";
 import { calculateBuildReserve } from "@repo/runtime/server-capacity";
 import agentPackageJson from "../package.json" with { type: "json" };
+import { sendAgentHeartbeat } from "./agent-heartbeat.js";
+import {
+  type AgentTerminalReport,
+  ApiRequestError,
+  executeAndReportAgentWork,
+} from "./agent-work-reporting.js";
 import {
   type AlloyRuntimeInput,
   buildUnavailableAlloyChecks,
@@ -58,7 +64,6 @@ import {
   type AgentBuildLogsResponse,
   type AgentCapabilities,
   type AgentCleanupProof,
-  type AgentHeartbeatResponse,
   type AgentImageStoreMode,
   type AgentLeaseRenewRequest,
   type AgentLeaseRenewResponse,
@@ -108,6 +113,7 @@ import {
   sanitizeSensitiveValue,
 } from "./security.js";
 import { createSerializedTaskRunner } from "./serialized-task.js";
+import { removeManagedServiceContainers } from "./service-container-cleanup.js";
 import { resolveDatabaseProvisionSpec } from "./service-runtime.js";
 import {
   calculateDiskSafetyReserveBytes,
@@ -137,6 +143,8 @@ import {
   stopWorkerJob,
   WorkerRolloutError,
 } from "./worker-runtime.js";
+
+export { ApiRequestError } from "./agent-work-reporting.js";
 
 const execFile = promisify(execFileCallback);
 
@@ -638,6 +646,7 @@ function resolveAppRuntimePort(
 }
 
 function buildAppRolloutResult(input: {
+  reusedCandidate?: boolean;
   strategy?: AppRolloutResult["strategy"];
   outcome: AppRolloutResult["outcome"];
   currentPhase: AppRolloutResult["currentPhase"];
@@ -656,6 +665,7 @@ function buildAppRolloutResult(input: {
     rollbackCompleted: input.rollbackCompleted,
     drainDurationMs: input.drainDurationMs,
     previousContainerRetirement: input.previousContainerRetirement ?? null,
+    reusedCandidate: input.reusedCandidate ?? false,
     activeContainerName: input.activeContainerName ?? null,
     candidateContainerName: input.candidateContainerName ?? null,
   };
@@ -758,6 +768,32 @@ function getRetirementErrorType(error: unknown): string {
 }
 
 async function retirePreviousAppContainer(
+  dependencies: Pick<DeployAppImageDependencies, "sleep">,
+  docker: Pick<DockerApiClient, "removeContainer" | "stopContainer">,
+  containerName: string,
+  serviceId: string,
+  deploymentId: string,
+  rollout: AppRolloutConfig,
+  drainDurationMs: number
+): Promise<PreviousContainerRetirement> {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (attempt > 0) await (dependencies.sleep ?? sleep)(1000 * attempt);
+    const outcome = await retirePreviousAppContainerAttempt(
+      dependencies,
+      docker,
+      containerName,
+      serviceId,
+      deploymentId,
+      rollout,
+      attempt === 0 ? drainDurationMs : 0
+    );
+    if (outcome !== "deferred") return outcome;
+  }
+  // Keep the healthy candidate. The completion warning is durable; deletion later sweeps leftovers.
+  return "deferred";
+}
+
+async function retirePreviousAppContainerAttempt(
   dependencies: Pick<DeployAppImageDependencies, "sleep">,
   docker: Pick<DockerApiClient, "removeContainer" | "stopContainer">,
   containerName: string,
@@ -1378,27 +1414,6 @@ async function collectValidationSnapshot(
   };
 }
 
-export class ApiRequestError extends Error {
-  public readonly status: number;
-  public readonly method: string;
-  public readonly pathName: string;
-  public readonly responseBody: string;
-
-  constructor(input: {
-    method: string;
-    pathName: string;
-    status: number;
-    message: string;
-  }) {
-    super(`${input.method} ${input.pathName} failed (${input.status}): ${input.message}`);
-    this.name = "ApiRequestError";
-    this.status = input.status;
-    this.method = input.method;
-    this.pathName = input.pathName;
-    this.responseBody = input.message;
-  }
-}
-
 export function shouldStopRetryingAgentWorkMutation(error: unknown): boolean {
   return (
     error instanceof ApiRequestError &&
@@ -1551,6 +1566,14 @@ export async function rollbackUnreportableWorkResult(
   if (!CONTAINER_STARTING_WORK_KINDS.has(input.kind) || !input.result) {
     return [];
   }
+
+  // Only the original local result is used here. An adopted candidate may already be committed,
+  // even when this re-lease's payload still names an older runtime.
+  if (
+    ["deploy_app", "redeploy_app", "rollback_app"].includes(input.kind) &&
+    toObject(input.result.rollout).reusedCandidate === true
+  )
+    return [];
 
   const started = new Set<string>();
   collectResultContainerIdentifiers(input.result, started);
@@ -1889,59 +1912,65 @@ async function sendHeartbeat(
   config: AgentRuntimeConfig,
   signal?: AbortSignal
 ): Promise<AgentRuntimeConfig> {
-  const snapshot = await collectValidationSnapshot(docker, config, credentials);
+  return sendAgentHeartbeat(
+    {
+      collectSnapshot: (currentConfig) =>
+        collectValidationSnapshot(docker, currentConfig, credentials),
+      reconcileTraefik: (nextConfig) =>
+        ensureTraefikRuntimeSerialized(docker, getTraefikRuntimeInput(nextConfig)),
+      request: (snapshot, requestSignal) => {
+        return fetch(`${API_URL}/api/agent/heartbeat`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${credentials.agentToken}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            serverId: SERVER_ID!,
+            agentVersion: AGENT_VERSION,
+            ...snapshot,
+          }),
+          signal: requestDeadlineSignal(requestSignal),
+        });
+      },
+      reregister: async (currentConfig, requestSignal) => {
+        if (!REGISTRATION_TOKEN || registrationUsed) {
+          throw new Error("Agent credentials were rejected. Reinstall the agent.");
+        }
 
-  const response = await fetch(`${API_URL}/api/agent/heartbeat`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${credentials.agentToken}`,
-      "content-type": "application/json",
+        const next = await registerAgent(docker, currentConfig, requestSignal);
+        // Propagate the fresh token to every closure holding this credentials object; the next
+        // heartbeat's validation snapshot reconciles Alloy with it as well.
+        adoptReregisteredCredentials(credentials, next.credentials);
+        return next.config;
+      },
+      reloadRedactionContext: async (nextConfig, previousConfig) => {
+        const previousScopeVersions = latestRedactionContextScopeVersions;
+        rememberRedactionContextScopeVersions(nextConfig);
+        if (
+          nextConfig.observability.enabled &&
+          (nextConfig.observability.redactionContextVersion !==
+            previousConfig.observability.redactionContextVersion ||
+            !redactionContextScopeVersionsEqual(
+              previousScopeVersions,
+              latestRedactionContextScopeVersions
+            ))
+        ) {
+          try {
+            await ensureAlloyRuntime(docker, getAlloyRuntimeInput(credentials, nextConfig), {
+              paths: ALLOY_PATHS,
+            });
+          } catch {
+            console.error(
+              "[nouva-agent] Alloy redaction context reload failed; validation will retry"
+            );
+          }
+        }
+      },
     },
-    body: JSON.stringify({
-      serverId: SERVER_ID!,
-      agentVersion: AGENT_VERSION,
-      ...snapshot,
-    }),
-    signal: requestDeadlineSignal(signal),
-  });
-
-  if (response.status === 401) {
-    if (!REGISTRATION_TOKEN || registrationUsed) {
-      throw new Error("Agent credentials were rejected. Reinstall the agent.");
-    }
-
-    const next = await registerAgent(docker, config, signal);
-    // Propagate the fresh token to every closure holding this credentials object; the next
-    // heartbeat's validation snapshot reconciles Alloy with it as well.
-    adoptReregisteredCredentials(credentials, next.credentials);
-    return next.config;
-  }
-
-  if (!response.ok) {
-    throw new Error(`Heartbeat failed with status ${response.status}`);
-  }
-
-  const body = (await response.json()) as AgentHeartbeatResponse;
-  const previousScopeVersions = latestRedactionContextScopeVersions;
-  rememberRedactionContextScopeVersions(body.config);
-  if (
-    body.config.observability.enabled &&
-    (body.config.observability.redactionContextVersion !==
-      config.observability.redactionContextVersion ||
-      !redactionContextScopeVersionsEqual(
-        previousScopeVersions,
-        latestRedactionContextScopeVersions
-      ))
-  ) {
-    try {
-      await ensureAlloyRuntime(docker, getAlloyRuntimeInput(credentials, body.config), {
-        paths: ALLOY_PATHS,
-      });
-    } catch {
-      console.error("[nouva-agent] Alloy redaction context reload failed; validation will retry");
-    }
-  }
-  return body.config;
+    config,
+    signal
+  );
 }
 
 type AgentHeartbeatTimer = unknown;
@@ -2903,6 +2932,62 @@ async function deleteAppVolumeSnapshotBestEffort(
   }
 }
 
+async function appCandidateMountsMatch(
+  docker: DockerApiClient,
+  candidate: DockerContainerInspection,
+  volume: DeployAppImageInput["volume"]
+): Promise<boolean> {
+  const mounts = candidate.Mounts ?? [];
+  const isPlatformVolume = (mount: (typeof mounts)[number]) =>
+    Boolean(
+      volume &&
+        mount.Type === "volume" &&
+        mount.Name === volume.volumeName &&
+        mount.Destination === volume.mountPath
+    );
+  if (volume && !mounts.some(isPlatformVolume)) return false;
+  const extraMounts = mounts.filter((mount) => !isPlatformVolume(mount));
+  if (extraMounts.length === 0) return true;
+
+  // Docker materializes image VOLUME declarations without HostConfig mounts. Use the
+  // candidate's immutable image, not a tag that may have moved since its first attempt.
+  // Fail closed without this evidence; a generated-looking name alone proves nothing.
+  const image = candidate.Image ? await docker.inspectImage(candidate.Image) : null;
+  const declaredVolumes = image?.Config?.Volumes;
+  if (
+    !declaredVolumes ||
+    !candidate.HostConfig ||
+    candidate.HostConfig.Binds?.length ||
+    candidate.HostConfig.VolumesFrom?.length
+  )
+    return false;
+  for (const mount of extraMounts) {
+    if (
+      mount.Type !== "volume" ||
+      !mount.Name ||
+      !/^[a-f0-9]{64}$/.test(mount.Name) ||
+      !mount.Destination ||
+      !Object.hasOwn(declaredVolumes, mount.Destination) ||
+      mount.Destination === volume?.mountPath ||
+      candidate.HostConfig?.Mounts?.some((configured) => configured.Target === mount.Destination)
+    )
+      return false;
+    const inspectedVolume = await docker.inspectVolume(mount.Name);
+    const labels = inspectedVolume?.Labels;
+    if (
+      !inspectedVolume ||
+      inspectedVolume.Name !== mount.Name ||
+      (labels !== null &&
+        labels !== undefined &&
+        (typeof labels !== "object" ||
+          Object.hasOwn(labels, "nouva.managed") ||
+          Object.hasOwn(labels, "nouva.volume.id")))
+    )
+      return false;
+  }
+  return true;
+}
+
 export async function deployAppImageWithDependencies(
   dependencies: DeployAppImageDependencies,
   docker: DockerApiClient,
@@ -2921,9 +3006,54 @@ export async function deployAppImageWithDependencies(
 
   const currentRuntimeImage = resolveCurrentRuntimeImage(payload.runtimeMetadata);
   const retainedPreviousImage = resolvePreviousRuntimeImage(payload.runtimeMetadata);
-  const previousContainer =
+  let previousContainer =
     payload.runtimeMetadata?.containerName ?? payload.runtimeMetadata?.containerId ?? null;
   const { containerName, appPort, spec } = buildAppContainerSpec(config, payload);
+  // A prior process may have finished Docker cutover without delivering its completion.
+  // Check all names, not only ownership labels: never replace a conflicting unmanaged container.
+  const existingCandidate = (await docker.listContainersByLabels({})).find(
+    (container) => container.Name.replace(/^\//, "") === containerName
+  );
+  if (existingCandidate) {
+    const labels = existingCandidate.Config?.Labels;
+    if (
+      labels?.["nouva.managed"] !== "true" ||
+      labels["nouva.service.id"] !== payload.serviceId ||
+      labels["nouva.deployment.id"] !== payload.deploymentId ||
+      existingCandidate.Config?.Image !== payload.imageUrl ||
+      !(await appCandidateMountsMatch(docker, existingCandidate, payload.volume))
+    ) {
+      throw new Error(
+        "Existing app candidate does not match deployment ownership or configuration"
+      );
+    }
+    if (
+      previousContainer === containerName ||
+      previousContainer === existingCandidate.Id ||
+      previousContainer === existingCandidate.Name
+    )
+      previousContainer = null;
+    if (previousContainer && !(await docker.inspectContainer(previousContainer)))
+      previousContainer = null;
+    if (existingCandidate.State?.Running) {
+      if (payload.volume)
+        await assertSingleRunningVolumeConsumer(
+          docker,
+          payload.volume.volumeName,
+          existingCandidate.Id
+        );
+    } else {
+      await docker.removeContainer(existingCandidate.Id, true);
+      await verifyContainerAbsent(docker, existingCandidate.Id);
+      if (payload.volume)
+        await assertSingleRunningVolumeConsumer(
+          docker,
+          payload.volume.volumeName,
+          previousContainer
+        );
+    }
+  }
+  const adoptedCandidate = existingCandidate?.State?.Running ? existingCandidate : null;
   const previousServiceUrl = previousContainer
     ? `http://${previousContainer}:${resolveAppRuntimePort(payload.runtimeMetadata, appPort)}`
     : null;
@@ -2940,7 +3070,7 @@ export async function deployAppImageWithDependencies(
     resolvedImageId = (await docker.inspectImage(payload.imageUrl))?.Id ?? null;
   }
 
-  if (payload.volume) {
+  if (payload.volume && !adoptedCandidate) {
     await docker.createVolume(
       payload.volume.volumeName,
       buildManagedVolumeLabels({
@@ -2961,6 +3091,7 @@ export async function deployAppImageWithDependencies(
       let liveRuntimePreserved = false;
       if (previousContainer) {
         try {
+          await assertSingleRunningVolumeConsumer(docker, payload.volume.volumeName, null);
           await docker.startContainer(previousContainer);
           await waitForAppCandidateReadiness(
             dependencies,
@@ -3002,13 +3133,19 @@ export async function deployAppImageWithDependencies(
     }
   }
 
-  const containerId = await docker.ensureContainer(spec, true, {
-    pull: !dockerLocalImages,
-  });
+  const containerId =
+    adoptedCandidate?.Id ??
+    (await docker.ensureContainer(spec, true, {
+      pull: !dockerLocalImages,
+    }));
   try {
     await waitForAppCandidateReadiness(dependencies, docker, containerName, appPort, rollout);
   } catch (error) {
+    // This candidate can already be serving an accepted deployment; failed revalidation is not
+    // permission to roll it back or restore an older volume snapshot.
+    if (adoptedCandidate) throw error;
     await docker.removeContainer(containerName, true);
+    if (payload.volume) await verifyContainerAbsent(docker, containerName);
     if (payload.volume && snapshotName) {
       try {
         await assertSingleRunningVolumeConsumer(docker, payload.volume.volumeName, null);
@@ -3096,7 +3233,11 @@ export async function deployAppImageWithDependencies(
       rollout
     );
   } catch (error) {
+    // This candidate can already be serving an accepted deployment; failed revalidation is not
+    // permission to roll it back or restore an older volume snapshot.
+    if (adoptedCandidate) throw error;
     await docker.removeContainer(containerName, true);
+    if (payload.volume) await verifyContainerAbsent(docker, containerName);
     let rollbackCompleted = true;
     let liveRuntimePreserved = Boolean(previousContainer);
     if (payload.volume && snapshotName) {
@@ -3248,6 +3389,7 @@ export async function deployAppImageWithDependencies(
       rollbackCompleted: false,
       drainDurationMs: previousContainer ? drainDurationMs : 0,
       previousContainerRetirement,
+      reusedCandidate: adoptedCandidate !== null,
       activeContainerName: containerName,
       candidateContainerName: containerName,
     }),
@@ -4999,12 +5141,11 @@ export function resolveServiceContainerIdentifier(input: {
 async function handleRemove(
   docker: DockerApiClient,
   serviceId: string,
-  runtimeMetadata: RuntimeMetadata | null
+  runtimeMetadata: RuntimeMetadata | null,
+  deploymentId: string
 ) {
-  const identifier = runtimeMetadata?.containerId ?? runtimeMetadata?.containerName;
-  if (identifier) {
-    await docker.removeContainer(identifier, true);
-  }
+  if (!deploymentId) throw new Error("App removal requires a deployment ID");
+  await removeManagedServiceContainers(docker, serviceId, deploymentId);
   if (runtimeMetadata?.imageStoreMode === "docker-local") {
     await removeRetainedRuntimeImages(docker, runtimeMetadata);
   }
@@ -5089,9 +5230,7 @@ export async function handleDeleteService(docker: DockerApiClient, payload: Remo
   }
 
   const identifier = resolveServiceContainerIdentifier(payload);
-  if (identifier) {
-    await docker.removeContainer(identifier, true);
-  }
+  await removeManagedServiceContainers(docker, payload.serviceId);
 
   const retainedImageReferences =
     payload.serviceType === "app" && payload.runtimeMetadata?.imageStoreMode === "docker-local"
@@ -5120,6 +5259,7 @@ export async function handleDeleteService(docker: DockerApiClient, payload: Remo
       version: 1,
       kind: "delete_service",
       container: { identifier, absent: true },
+      serviceContainers: { serviceId: payload.serviceId, remainingContainerIds: [] },
       retainedImages: retainedImageReferences.map((reference) => ({
         reference,
         absent: true as const,
@@ -5273,18 +5413,31 @@ async function processWorkItem(
 ) {
   console.log(`[nouva-agent] processing work ${workItem.id} (${workItem.kind})`);
   if (!workItem.leaseId) {
-    console.error(`[nouva-agent] refusing work ${workItem.id} without a lease ID`);
+    console.error(`[nouva-agent] work ${workItem.id} (${workItem.kind}) failed: missing lease ID`);
     return;
   }
+
+  const payload = toObject(workItem.payload);
+  const operationalValues = collectAgentWorkPayloadOperationalValues(payload);
+  const redactError = (error: unknown) =>
+    redactSensitiveText(
+      error instanceof Error ? error.message : "Unknown agent reporting failure",
+      toRecord(payload.envVars),
+      operationalValues
+    );
 
   const leaseRenewal = startAgentWorkLeaseRenewal({
     leaseTtlSeconds: config.leaseTtlSeconds,
     renewLease: (signal) => renewAgentWorkLease(credentials, workItem, signal),
     onLeaseLost: (error) => {
-      console.warn(`[nouva-agent] lease for work ${workItem.id} is no longer active:`, error);
+      console.warn(
+        `[nouva-agent] work ${workItem.id} (${workItem.kind}) lease lost: ${redactError(error)}`
+      );
     },
     onTransientError: (error) => {
-      console.error(`[nouva-agent] failed to renew lease for work ${workItem.id}:`, error);
+      console.error(
+        `[nouva-agent] work ${workItem.id} (${workItem.kind}) lease renewal failed: ${redactError(error)}`
+      );
     },
   });
   const leaseIsActive = await leaseRenewal.ready;
@@ -5293,331 +5446,281 @@ async function processWorkItem(
     return;
   }
 
-  const payload = toObject(workItem.payload);
-  const operationalValues = collectAgentWorkPayloadOperationalValues(payload);
-  const buildLogPublisher = createWorkItemBuildLogPublisher(credentials, workItem, payload);
-
   let result: Record<string, unknown> | undefined;
-  let failureResult: Record<string, unknown> | undefined;
-  let workError: Error | null = null;
-
-  try {
-    switch (workItem.kind) {
-      case "deploy_app":
-      case "redeploy_app":
-        // App deploy payloads are hydrated at lease time with the live service runtime metadata.
-        result = await handleBuildAndDeployApp(
-          docker,
-          config,
-          payload as unknown as AppDeployPayload,
-          buildLogPublisher?.emit
-        );
-        break;
-      case "rollback_app":
-        result = await handleDeployOnlyApp(docker, config, payload as unknown as DeployOnlyPayload);
-        break;
-      case "deploy_worker":
-      case "redeploy_worker":
-        result = await handleBuildAndDeployWorker(
-          docker,
-          config,
-          payload as unknown as WorkerDeployPayload,
-          buildLogPublisher?.emit
-        );
-        break;
-      case "rollback_worker":
-      case "scale_worker":
-        result = await handleDeployOnlyWorker(docker, config, {
-          ...(payload as unknown as WorkerDeployOnlyPayload),
-          runtimeMetadata: toRuntimeMetadata(payload.runtimeMetadata),
-        });
-        break;
-      case "restart_app":
-      case "restart_database":
-        result = await handleRestart(docker, {
-          ...(payload as unknown as RestartServicePayload),
-          runtimeMetadata: toRuntimeMetadata(payload.runtimeMetadata),
-        });
-        break;
-      case "restart_worker":
-        result = await restartWorkerServiceRuntime(docker, String(payload.serviceId));
-        break;
-      case "remove_app":
-        result = await handleRemove(
-          docker,
-          String(payload.serviceId),
-          toRuntimeMetadata(payload.runtimeMetadata)
-        );
-        break;
-      case "remove_worker":
-        result = await removeWorkerServiceRuntime(docker, {
-          serviceId: String(payload.serviceId),
-          runtimeMetadata: toRuntimeMetadata(payload.runtimeMetadata),
-        });
-        break;
-      case "start_worker_job":
-        result = await startWorkerJob(
-          docker,
-          getWorkerRuntimeEnvironment(config),
-          payload as unknown as WorkerJobPayload
-        );
-        break;
-      case "inspect_worker_job":
-        result = await inspectWorkerJob(
-          docker,
-          getWorkerRuntimeEnvironment(config),
-          payload as unknown as WorkerJobLifecyclePayload
-        );
-        break;
-      case "stop_worker_job":
-        result = await stopWorkerJob(
-          docker,
-          getWorkerRuntimeEnvironment(config),
-          payload as unknown as WorkerJobLifecyclePayload
-        );
-        break;
-      case "cleanup_worker_job":
-        result = await cleanupWorkerJob(
-          docker,
-          getWorkerRuntimeEnvironment(config),
-          payload as unknown as WorkerJobLifecyclePayload
-        );
-        break;
-      case "provision_database":
-        result = await handleDatabaseProvision(
-          docker,
-          config,
-          payload as unknown as DatabaseProvisionPayload
-        );
-        break;
-      case "apply_database_volume":
-        result = await handleApplyDatabaseVolume(docker, config, {
-          ...(payload as unknown as DatabaseProvisionPayload),
-          runtimeMetadata: toRuntimeMetadata(payload.runtimeMetadata),
-        });
-        break;
-      case "delete_service":
-        result = await handleDeleteService(docker, {
-          ...(payload as unknown as RemoveServicePayload),
-          runtimeMetadata: toRuntimeMetadata(payload.runtimeMetadata),
-        });
-        break;
-      case "delete_volume":
-        result = await handleDeleteVolume(docker, payload as unknown as DeleteVolumePayload);
-        break;
-      case "delete_project":
-        result = await handleDeleteProject(docker, payload as unknown as DeleteProjectPayload);
-        break;
-      case "wipe_volume":
-        result = await handleWipeVolume(
-          docker,
-          config,
-          "serviceId" in payload
-            ? {
-                ...(payload as unknown as DatabaseProvisionPayload),
-                runtimeMetadata: toRuntimeMetadata(payload.runtimeMetadata),
-              }
-            : (payload as unknown as DeleteVolumePayload)
-        );
-        break;
-      case "create_volume_backup":
-        result = await handleCreateVolumeBackup(
-          docker,
-          config,
-          payload as unknown as CreateVolumeBackupPayload
-        );
-        break;
-      case "delete_volume_backup":
-        result = await handleDeleteVolumeBackup(
-          docker,
-          config,
-          payload as unknown as DeleteVolumeBackupPayload
-        );
-        break;
-      case "restore_volume_backup":
-        result = await handleRestoreVolumeBackup(
-          docker,
-          config,
-          payload as unknown as RestoreVolumeBackupPayload
-        );
-        break;
-      case "restore_postgres_pitr":
-        result = await handleRestorePostgresPitr(
-          docker,
-          config,
-          payload as unknown as RestorePostgresPitrPayload
-        );
-        break;
-      case "import_external_backup":
-        result = await handleImportExternalBackup(
-          docker,
-          config,
-          payload as unknown as ImportExternalBackupPayload
-        );
-        break;
-      case "expire_volume_backup_repository":
-        result = await handleExpireVolumeBackupRepository(
-          docker,
-          config,
-          payload as unknown as ExpireVolumeBackupRepositoryPayload
-        );
-        break;
-      case "reconcile_service_resources":
-        result = await handleReconcileServiceResources(
-          docker,
-          payload as unknown as ReconcileServiceResourcesPayload
-        );
-        break;
-      case "sync_routing":
-        result = await handleSyncRouting(docker, config, {
-          ...(payload as unknown as SyncRoutingPayload),
-          runtimeMetadata: toRuntimeMetadata(payload.runtimeMetadata),
-        });
-        break;
-      case "update_agent":
-        result = await handleUpdateAgent(docker, toUpdateAgentPayload(payload));
-        break;
-      default:
-        throw new Error(`Unsupported work kind: ${workItem.kind}`);
-    }
-  } catch (err) {
-    if (
-      err instanceof AppRolloutError ||
-      err instanceof WorkerRolloutError ||
-      err instanceof ExternalBackupImportError
-    ) {
-      failureResult = err.result;
-    }
-    workError = err instanceof Error ? err : new Error("Unknown agent work failure");
-  } finally {
-    await leaseRenewal.stop();
-  }
-
-  if (buildLogPublisher) {
-    buildLogPublisher.emit({
-      type: "exit",
-      timestamp: Date.now(),
-      success: workError === null,
-      exitCode: workError === null ? 0 : 1,
-      message: workError
-        ? redactSensitiveText(workError.message, toRecord(payload.envVars), operationalValues)
-        : "Deployment finished",
-    });
-    await buildLogPublisher.close();
-  }
-
-  if (leaseRenewal.leaseLost()) {
-    // The work is finished either way, and the control plane now accepts a terminal report from a
-    // lease nothing else has claimed (#186). Report it and let the control plane decide: if the
-    // lease is genuinely gone the report answers 409 and the branches below drop it, which costs
-    // one request instead of discarding a build that has already run to completion.
-    console.warn(
-      `[nouva-agent] work ${workItem.id} finished locally after a lease renewal failed; ` +
-        "reporting anyway"
-    );
-  }
-
-  if (workError) {
-    const failureReport = buildAgentWorkFailureReport({
-      environmentVariables: toRecord(payload.envVars),
-      errorMessage: workError.message,
-      operationalValues,
-      result: failureResult ?? null,
-    });
-    try {
-      await apiRequest(`/api/agent/work/${workItem.id}/fail`, {
-        method: "POST",
-        token: credentials.agentToken,
-        body: {
-          serverId: SERVER_ID!,
-          leaseId: workItem.leaseId,
-          result: failureReport.result,
-          errorMessage: failureReport.errorMessage,
-        },
-      });
-    } catch (reportErr) {
-      if (shouldStopRetryingAgentWorkMutation(reportErr)) {
-        console.warn(
-          `[nouva-agent] failure report for work ${workItem.id} was already superseded:`,
-          reportErr
-        );
-        return;
-      }
-      console.error(`[nouva-agent] failed to report failure for work ${workItem.id}:`, reportErr);
-    }
-    return;
-  }
-
-  const reportUnreportableResult = async (errorMessage: string): Promise<void> => {
+  const reportUnreportableResult = async (errorMessage: string): Promise<AgentTerminalReport> => {
     await rollbackUnreportableWorkResult(docker, {
       kind: workItem.kind,
       workItemId: workItem.id,
       payload,
       result,
     });
-    try {
-      await apiRequest(`/api/agent/work/${workItem.id}/fail`, {
+    return { kind: "fail", result: null, errorMessage: redactError(new Error(errorMessage)) };
+  };
+  await executeAndReportAgentWork({
+    work: workItem,
+    stopLease: () => leaseRenewal.stop(),
+    redactError,
+    send: async (report) => {
+      await apiRequest(`/api/agent/work/${workItem.id}/${report.kind}`, {
         method: "POST",
         token: credentials.agentToken,
         body: {
           serverId: SERVER_ID!,
           leaseId: workItem.leaseId,
-          result: null,
-          errorMessage,
+          result: report.result,
+          ...(report.kind === "fail" ? { errorMessage: report.errorMessage } : {}),
         },
       });
-    } catch (reportError) {
-      if (!shouldStopRetryingAgentWorkMutation(reportError)) {
-        console.error(
-          `[nouva-agent] failed to report unsafe result for work ${workItem.id}:`,
-          reportError
+    },
+    rejectResult: (error) =>
+      reportUnreportableResult(
+        readApiRequestErrorMessage(error, "Agent work result was rejected by the control plane")
+      ),
+    prepare: async () => {
+      const buildLogPublisher = createWorkItemBuildLogPublisher(credentials, workItem, payload);
+
+      let failureResult: Record<string, unknown> | undefined;
+      let workError: Error | null = null;
+
+      try {
+        switch (workItem.kind) {
+          case "deploy_app":
+          case "redeploy_app":
+            // App deploy payloads are hydrated at lease time with the live service runtime metadata.
+            result = await handleBuildAndDeployApp(
+              docker,
+              config,
+              payload as unknown as AppDeployPayload,
+              buildLogPublisher?.emit
+            );
+            break;
+          case "rollback_app":
+            result = await handleDeployOnlyApp(
+              docker,
+              config,
+              payload as unknown as DeployOnlyPayload
+            );
+            break;
+          case "deploy_worker":
+          case "redeploy_worker":
+            result = await handleBuildAndDeployWorker(
+              docker,
+              config,
+              payload as unknown as WorkerDeployPayload,
+              buildLogPublisher?.emit
+            );
+            break;
+          case "rollback_worker":
+          case "scale_worker":
+            result = await handleDeployOnlyWorker(docker, config, {
+              ...(payload as unknown as WorkerDeployOnlyPayload),
+              runtimeMetadata: toRuntimeMetadata(payload.runtimeMetadata),
+            });
+            break;
+          case "restart_app":
+          case "restart_database":
+            result = await handleRestart(docker, {
+              ...(payload as unknown as RestartServicePayload),
+              runtimeMetadata: toRuntimeMetadata(payload.runtimeMetadata),
+            });
+            break;
+          case "restart_worker":
+            result = await restartWorkerServiceRuntime(docker, String(payload.serviceId));
+            break;
+          case "remove_app":
+            result = await handleRemove(
+              docker,
+              String(payload.serviceId),
+              toRuntimeMetadata(payload.runtimeMetadata),
+              String(payload.deploymentId ?? "")
+            );
+            break;
+          case "remove_worker":
+            result = await removeWorkerServiceRuntime(docker, {
+              serviceId: String(payload.serviceId),
+              runtimeMetadata: toRuntimeMetadata(payload.runtimeMetadata),
+            });
+            break;
+          case "start_worker_job":
+            result = await startWorkerJob(
+              docker,
+              getWorkerRuntimeEnvironment(config),
+              payload as unknown as WorkerJobPayload
+            );
+            break;
+          case "inspect_worker_job":
+            result = await inspectWorkerJob(
+              docker,
+              getWorkerRuntimeEnvironment(config),
+              payload as unknown as WorkerJobLifecyclePayload
+            );
+            break;
+          case "stop_worker_job":
+            result = await stopWorkerJob(
+              docker,
+              getWorkerRuntimeEnvironment(config),
+              payload as unknown as WorkerJobLifecyclePayload
+            );
+            break;
+          case "cleanup_worker_job":
+            result = await cleanupWorkerJob(
+              docker,
+              getWorkerRuntimeEnvironment(config),
+              payload as unknown as WorkerJobLifecyclePayload
+            );
+            break;
+          case "provision_database":
+            result = await handleDatabaseProvision(
+              docker,
+              config,
+              payload as unknown as DatabaseProvisionPayload
+            );
+            break;
+          case "apply_database_volume":
+            result = await handleApplyDatabaseVolume(docker, config, {
+              ...(payload as unknown as DatabaseProvisionPayload),
+              runtimeMetadata: toRuntimeMetadata(payload.runtimeMetadata),
+            });
+            break;
+          case "delete_service":
+            result = await handleDeleteService(docker, {
+              ...(payload as unknown as RemoveServicePayload),
+              runtimeMetadata: toRuntimeMetadata(payload.runtimeMetadata),
+            });
+            break;
+          case "delete_volume":
+            result = await handleDeleteVolume(docker, payload as unknown as DeleteVolumePayload);
+            break;
+          case "delete_project":
+            result = await handleDeleteProject(docker, payload as unknown as DeleteProjectPayload);
+            break;
+          case "wipe_volume":
+            result = await handleWipeVolume(
+              docker,
+              config,
+              "serviceId" in payload
+                ? {
+                    ...(payload as unknown as DatabaseProvisionPayload),
+                    runtimeMetadata: toRuntimeMetadata(payload.runtimeMetadata),
+                  }
+                : (payload as unknown as DeleteVolumePayload)
+            );
+            break;
+          case "create_volume_backup":
+            result = await handleCreateVolumeBackup(
+              docker,
+              config,
+              payload as unknown as CreateVolumeBackupPayload
+            );
+            break;
+          case "delete_volume_backup":
+            result = await handleDeleteVolumeBackup(
+              docker,
+              config,
+              payload as unknown as DeleteVolumeBackupPayload
+            );
+            break;
+          case "restore_volume_backup":
+            result = await handleRestoreVolumeBackup(
+              docker,
+              config,
+              payload as unknown as RestoreVolumeBackupPayload
+            );
+            break;
+          case "restore_postgres_pitr":
+            result = await handleRestorePostgresPitr(
+              docker,
+              config,
+              payload as unknown as RestorePostgresPitrPayload
+            );
+            break;
+          case "import_external_backup":
+            result = await handleImportExternalBackup(
+              docker,
+              config,
+              payload as unknown as ImportExternalBackupPayload
+            );
+            break;
+          case "expire_volume_backup_repository":
+            result = await handleExpireVolumeBackupRepository(
+              docker,
+              config,
+              payload as unknown as ExpireVolumeBackupRepositoryPayload
+            );
+            break;
+          case "reconcile_service_resources":
+            result = await handleReconcileServiceResources(
+              docker,
+              payload as unknown as ReconcileServiceResourcesPayload
+            );
+            break;
+          case "sync_routing":
+            result = await handleSyncRouting(docker, config, {
+              ...(payload as unknown as SyncRoutingPayload),
+              runtimeMetadata: toRuntimeMetadata(payload.runtimeMetadata),
+            });
+            break;
+          case "update_agent":
+            result = await handleUpdateAgent(docker, toUpdateAgentPayload(payload));
+            break;
+          default:
+            throw new Error(`Unsupported work kind: ${workItem.kind}`);
+        }
+      } catch (err) {
+        if (
+          err instanceof AppRolloutError ||
+          err instanceof WorkerRolloutError ||
+          err instanceof ExternalBackupImportError
+        ) {
+          failureResult = err.result;
+        }
+        workError = err instanceof Error ? err : new Error("Unknown agent work failure");
+      }
+
+      if (buildLogPublisher) {
+        buildLogPublisher.emit({
+          type: "exit",
+          timestamp: Date.now(),
+          success: workError === null,
+          exitCode: workError === null ? 0 : 1,
+          message: workError
+            ? redactSensitiveText(workError.message, toRecord(payload.envVars), operationalValues)
+            : "Deployment finished",
+        });
+        await buildLogPublisher.close();
+      }
+
+      if (leaseRenewal.leaseLost()) {
+        // The work is finished either way, and the control plane now accepts a terminal report from a
+        // lease nothing else has claimed (#186). Report it and let the control plane decide: if the
+        // lease is genuinely gone the report answers 409 and the branches below drop it, which costs
+        // one request instead of discarding a build that has already run to completion.
+        console.warn(
+          `[nouva-agent] work ${workItem.id} finished locally after a lease renewal failed; ` +
+            "reporting anyway"
         );
       }
-    }
-  };
 
-  let sanitizedResult: Record<string, unknown> | null;
-  try {
-    sanitizedResult = sanitizeAgentWorkResult(result, toRecord(payload.envVars), operationalValues);
-  } catch (error) {
-    if (!(error instanceof AgentWorkResultRedactionConflictError)) {
-      throw error;
-    }
-    await reportUnreportableResult(error.message);
-    return;
-  }
-
-  try {
-    await apiRequest(`/api/agent/work/${workItem.id}/complete`, {
-      method: "POST",
-      token: credentials.agentToken,
-      body: {
-        serverId: SERVER_ID!,
-        leaseId: workItem.leaseId,
-        result: sanitizedResult,
-      },
-    });
-    console.log(`[nouva-agent] work ${workItem.id} (${workItem.kind}) completed`);
-  } catch (reportErr) {
-    if (isAgentWorkResultRejected(reportErr)) {
-      // The lease is still ours; the control plane refused the content of this result and will
-      // refuse it again. Retrying would leave a second container behind and end in the same silent
-      // failure, so tear this attempt down and report why it failed (#122, #187).
-      await reportUnreportableResult(
-        readApiRequestErrorMessage(reportErr, "Agent work result was rejected by the control plane")
-      );
-      return;
-    }
-    if (shouldStopRetryingAgentWorkMutation(reportErr)) {
-      console.warn(
-        `[nouva-agent] completion report for work ${workItem.id} was already superseded:`,
-        reportErr
-      );
-      return;
-    }
-    // Work succeeded locally. Don't call /fail — let lease expire so the item can be retried.
-    console.error(`[nouva-agent] work ${workItem.id} succeeded but /complete failed:`, reportErr);
-  }
+      if (workError) {
+        const report = buildAgentWorkFailureReport({
+          environmentVariables: toRecord(payload.envVars),
+          errorMessage: workError.message,
+          operationalValues,
+          result: failureResult ?? null,
+        });
+        return { kind: "fail", result: report.result, errorMessage: report.errorMessage };
+      }
+      try {
+        return {
+          kind: "complete",
+          result: sanitizeAgentWorkResult(result, toRecord(payload.envVars), operationalValues),
+        };
+      } catch (error) {
+        if (!(error instanceof AgentWorkResultRedactionConflictError)) throw error;
+        return await reportUnreportableResult(error.message);
+      }
+    },
+  });
 }
 
 async function collectMetrics(docker: DockerApiClient): Promise<AgentMetricsEnvelope> {

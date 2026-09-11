@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import net from "node:net";
 import { collectAgentWorkPayloadOperationalValues } from "@repo/runtime/logging";
 import agentPackageJson from "../package.json" with { type: "json" };
+import { executeAndReportAgentWork } from "./agent-work-reporting.js";
 import type { DeployAppImageInput } from "./app-build-runtime.js";
 import { buildAndDeployAppWithDependencies } from "./app-build-runtime.js";
 import { hashProjectNetwork } from "./build.js";
@@ -380,6 +381,7 @@ function createDockerMock() {
     inspectNetwork: mock(async () => null),
     inspectContainer: mock(async () => null),
     listContainersUsingVolume: mock(async () => []),
+    listContainersByLabels: mock(async () => []),
     inspectImage: mock(async () => ({ Id: "img_candidate" })),
     inspectVolume: mock(async () => null),
     removeContainer: mock(async () => {}),
@@ -1730,6 +1732,441 @@ describe("buildAppContainerSpec", () => {
 });
 
 describe("deployAppImageWithDependencies", () => {
+  function retryFixture() {
+    const docker = createDockerMock();
+    const candidate = {
+      Id: "ctr_candidate",
+      Name: "/nouva-app-svc_1-dep_1",
+      Config: {
+        Image: appRuntimePayload.imageUrl,
+        Labels: {
+          "nouva.managed": "true",
+          "nouva.service.id": "svc_1",
+          "nouva.deployment.id": "dep_1",
+        },
+      },
+      Mounts: [
+        {
+          Type: "volume",
+          Name: appRuntimePayload.volume!.volumeName,
+          Destination: appRuntimePayload.volume!.mountPath,
+        },
+      ],
+      State: { Running: true, Health: { Status: "healthy" } },
+    };
+    docker.listContainersByLabels.mockResolvedValue([candidate] as never);
+    docker.listContainersUsingVolume.mockResolvedValue([candidate] as never);
+    docker.inspectContainer.mockImplementation(async (name: string) =>
+      name === "old" ? null : (candidate as never)
+    );
+    const dependencies = {
+      ensureBaseRuntime: async () => {},
+      checkTcpConnect: async () => true,
+      fetchImpl: mock(async () =>
+        Response.json([
+          {
+            name: "svc-svc_1@file",
+            loadBalancer: { servers: [{ url: "http://nouva-app-svc_1-dep_1:8080" }] },
+          },
+        ])
+      ) as typeof fetch,
+      writeLocalTraefikRoute: mock(async () => {}),
+      deleteLocalTraefikRoute: mock(async () => {}),
+      sleep: mock(async () => {}),
+    };
+    const payload = {
+      ...appRuntimePayload,
+      rollout: createRolloutConfig(),
+      runtimeMetadata: { containerName: "old" },
+    };
+    return { docker, candidate, dependencies, payload };
+  }
+
+  test.each([
+    false,
+    true,
+  ])("re-leased deploy adopts image-declared anonymous volumes (platform volume=%s)", async (platformVolume) => {
+    const { docker, candidate, dependencies, payload } = retryFixture();
+    const anonymousVolume = "a".repeat(64);
+    Object.assign(candidate, {
+      Image: "sha256:original-image",
+      HostConfig: platformVolume
+        ? {
+            Mounts: [
+              {
+                Type: "volume",
+                Source: payload.volume!.volumeName,
+                Target: payload.volume!.mountPath,
+              },
+            ],
+          }
+        : {},
+    });
+    candidate.Mounts = [
+      ...(platformVolume ? candidate.Mounts : []),
+      { Type: "volume", Name: anonymousVolume, Destination: "/image-data" },
+    ];
+    docker.inspectImage.mockImplementation(async (image: string) => ({
+      Id: "sha256:original-image",
+      ...(image === "sha256:original-image" ? { Config: { Volumes: { "/image-data": {} } } } : {}),
+    }));
+    docker.inspectVolume.mockResolvedValue({ Name: anonymousVolume, Labels: null } as never);
+    const result = await deployAppImageWithDependencies(
+      dependencies,
+      docker as never,
+      runtimeConfig,
+      { ...payload, volume: platformVolume ? payload.volume : null }
+    );
+    expect(result.runtimeMetadata.containerId).toBe(candidate.Id);
+    expect(result.rollout.reusedCandidate).toBe(true);
+    expect(result.rollout.outcome).toBe("committed");
+    expect(dependencies.writeLocalTraefikRoute).toHaveBeenCalledTimes(1);
+    expect(docker.inspectImage).toHaveBeenCalledWith("sha256:original-image");
+    if (platformVolume)
+      expect(docker.listContainersUsingVolume).toHaveBeenCalledWith(payload.volume!.volumeName);
+    expect(docker.ensureContainer).not.toHaveBeenCalled();
+    expect(docker.createContainer).not.toHaveBeenCalled();
+    expect(docker.removeContainer).not.toHaveBeenCalled();
+    expect(docker.startContainer).not.toHaveBeenCalled();
+    expect(docker.stopContainer).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    "named",
+    "managed-name",
+    "managed-label",
+    "volume-id-label",
+    "undeclared",
+    "explicit",
+    "bind",
+    "volumes-from",
+    "missing-image-id",
+    "missing-image",
+    "missing-declarations",
+    "missing-host-config",
+    "missing-volume",
+    "volume-inspection-mismatch",
+    "non-volume",
+    "platform-path-conflict",
+  ])("retry rejects %s extra mounts without mutating either runtime", async (problem) => {
+    for (const platformVolume of [false, true]) {
+      const { docker, candidate, dependencies, payload } = retryFixture();
+      const anonymousVolume = "a".repeat(64);
+      Object.assign(candidate, { Image: "sha256:original-image", HostConfig: {} });
+      const extraMount = { Type: "volume", Name: anonymousVolume, Destination: "/image-data" };
+      candidate.Mounts = [...(platformVolume ? candidate.Mounts : []), extraMount];
+      docker.inspectImage.mockResolvedValue({
+        Id: "sha256:original-image",
+        Config: { Volumes: { "/image-data": {}, [payload.volume!.mountPath]: {} } },
+      } as never);
+      docker.inspectVolume.mockResolvedValue({ Name: anonymousVolume, Labels: null } as never);
+      if (problem === "named") extraMount.Name = "user-named-volume";
+      if (problem === "managed-name") extraMount.Name = "nouva-vol-unexpected";
+      if (problem === "managed-label" || problem === "volume-id-label")
+        docker.inspectVolume.mockResolvedValue({
+          Name: anonymousVolume,
+          Labels:
+            problem === "managed-label"
+              ? { "nouva.managed": "true" }
+              : { "nouva.volume.id": "other" },
+        } as never);
+      if (problem === "undeclared") extraMount.Destination = "/undeclared";
+      if (problem === "explicit")
+        Object.assign(candidate, {
+          HostConfig: {
+            Mounts: [{ Type: "volume", Source: anonymousVolume, Target: "/image-data" }],
+          },
+        });
+      if (problem === "bind")
+        Object.assign(candidate, { HostConfig: { Binds: [`${anonymousVolume}:/image-data`] } });
+      if (problem === "volumes-from")
+        Object.assign(candidate, { HostConfig: { VolumesFrom: ["other"] } });
+      if (problem === "missing-image-id") Object.assign(candidate, { Image: undefined });
+      if (problem === "missing-image") docker.inspectImage.mockResolvedValue(null as never);
+      if (problem === "missing-declarations")
+        docker.inspectImage.mockResolvedValue({ Id: "sha256:original-image" });
+      if (problem === "missing-host-config") Object.assign(candidate, { HostConfig: undefined });
+      if (problem === "missing-volume") docker.inspectVolume.mockResolvedValue(null);
+      if (problem === "volume-inspection-mismatch")
+        docker.inspectVolume.mockResolvedValue({ Name: "other", Labels: null } as never);
+      if (problem === "non-volume") extraMount.Type = "bind";
+      if (problem === "platform-path-conflict") {
+        extraMount.Destination = payload.volume!.mountPath;
+        // With no platform volume, the same conflict is an explicitly configured mount.
+        if (!platformVolume)
+          Object.assign(candidate, {
+            HostConfig: { Mounts: [{ Target: extraMount.Destination }] },
+          });
+      }
+      await expect(
+        deployAppImageWithDependencies(dependencies, docker as never, runtimeConfig, {
+          ...payload,
+          volume: platformVolume ? payload.volume : null,
+        })
+      ).rejects.toThrow(
+        "Existing app candidate does not match deployment ownership or configuration"
+      );
+      expect(dependencies.writeLocalTraefikRoute).not.toHaveBeenCalled();
+      expect(docker.removeContainer).not.toHaveBeenCalled();
+      expect(docker.startContainer).not.toHaveBeenCalled();
+      expect(docker.stopContainer).not.toHaveBeenCalled();
+      expect(docker.createContainer).not.toHaveBeenCalled();
+      expect(docker.ensureContainer).not.toHaveBeenCalled();
+    }
+  });
+
+  test("snapshot preflight never restarts an old writer alongside an unexpected consumer", async () => {
+    const { docker, dependencies, payload } = retryFixture();
+    docker.listContainersByLabels.mockResolvedValue([]);
+    await expect(
+      deployAppImageWithDependencies(dependencies, docker as never, runtimeConfig, payload)
+    ).rejects.toThrow("another running consumer");
+    expect(docker.startContainer).not.toHaveBeenCalled();
+    expect(docker.createContainer).not.toHaveBeenCalled();
+  });
+
+  test("deploy workflow survives accepted-but-lost completion and a later process re-lease", async () => {
+    const { docker, candidate, dependencies, payload } = retryFixture();
+    let exists = false;
+    docker.listContainersByLabels.mockImplementation(async () =>
+      exists ? ([candidate] as never) : []
+    );
+    docker.listContainersUsingVolume.mockImplementation(async () =>
+      exists ? ([candidate] as never) : []
+    );
+    docker.ensureContainer.mockImplementation(async () => {
+      exists = true;
+      return candidate.Id;
+    });
+    const rejected = mock(async () => ({
+      kind: "fail" as const,
+      result: null,
+      errorMessage: "unexpected rejection",
+    }));
+    let completions = 0;
+    for (const restarted of [false, true]) {
+      await executeAndReportAgentWork({
+        work: { id: "w", kind: "deploy_app" },
+        prepare: async () => ({
+          kind: "complete",
+          result: await deployAppImageWithDependencies(
+            dependencies,
+            docker as never,
+            runtimeConfig,
+            { ...payload, runtimeMetadata: restarted ? payload.runtimeMetadata : null }
+          ),
+        }),
+        send: async () => {
+          if (++completions === 1) throw new TypeError("accepted completion reply lost");
+        },
+        rejectResult: rejected,
+        stopLease: async () => {},
+        redactError: () => "safe",
+        sleep: async () => {},
+        log: () => {},
+      });
+    }
+    expect(completions).toBe(3);
+    expect(docker.ensureContainer).toHaveBeenCalledTimes(1);
+    expect(rejected).not.toHaveBeenCalled();
+    expect(
+      docker.removeContainer.mock.calls.some(
+        ([name]) => name === candidate.Id || name === "nouva-app-svc_1-dep_1"
+      )
+    ).toBe(false);
+  });
+
+  test.each([
+    "sanitizer",
+    "422",
+  ])("adopted runtime survives %s rejection with stale control-plane metadata", async (rejection) => {
+    const { docker, dependencies, payload } = retryFixture();
+    const result = await deployAppImageWithDependencies(
+      dependencies,
+      docker as never,
+      runtimeConfig,
+      payload
+    );
+    const rejectResult = async () => {
+      await rollbackUnreportableWorkResult(docker as never, {
+        kind: "deploy_app",
+        workItemId: "w",
+        payload,
+        result,
+      });
+      return { kind: "fail" as const, result: null, errorMessage: "rejected" };
+    };
+    await executeAndReportAgentWork({
+      work: { id: "w", kind: "deploy_app" },
+      prepare: async () => {
+        if (rejection === "sanitizer") {
+          expect(() => sanitizeAgentWorkResult(result, { SECRET: "ctr_candidate" })).toThrow();
+          return await rejectResult();
+        }
+        return { kind: "complete", result: sanitizeAgentWorkResult(result, {}) };
+      },
+      send: async (report) => {
+        if (report.kind === "complete")
+          throw new ApiRequestError({
+            status: 422,
+            method: "POST",
+            pathName: "/complete",
+            message: "rejected",
+          });
+      },
+      rejectResult,
+      stopLease: async () => {},
+      redactError: () => "safe",
+      log: () => {},
+    });
+    expect(docker.removeContainer).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    "service",
+    "deployment",
+    "managed",
+    "image",
+    "volume",
+    "volume-path",
+    "volume-type",
+    "writer",
+    "readiness",
+    "cutover",
+  ])("retry refuses %s mismatch without deleting the candidate or restarting the old writer", async (problem) => {
+    const { docker, candidate, dependencies, payload } = retryFixture();
+    if (problem === "service") candidate.Config.Labels["nouva.service.id"] = "foreign";
+    if (problem === "deployment") candidate.Config.Labels["nouva.deployment.id"] = "foreign";
+    if (problem === "managed") candidate.Config.Labels["nouva.managed"] = "false";
+    if (problem === "image") candidate.Config.Image = "other:image";
+    if (problem === "volume") candidate.Mounts[0]!.Name = "other-volume";
+    if (problem === "volume-path") candidate.Mounts[0]!.Destination = "/other-path";
+    if (problem === "volume-type") candidate.Mounts[0]!.Type = "bind";
+    if (problem === "writer")
+      docker.listContainersUsingVolume.mockResolvedValue([
+        candidate,
+        { ...candidate, Id: "other", Name: "/other" },
+      ] as never);
+    if (problem === "readiness") candidate.State.Health.Status = "unhealthy";
+    if (problem === "cutover")
+      dependencies.fetchImpl = mock(async () => Response.json([])) as typeof fetch;
+    await expect(
+      deployAppImageWithDependencies(dependencies, docker as never, runtimeConfig, payload)
+    ).rejects.toThrow();
+    expect(docker.removeContainer).not.toHaveBeenCalled();
+    expect(docker.startContainer).not.toHaveBeenCalled();
+    expect(docker.createContainer).not.toHaveBeenCalled();
+    expect(docker.ensureContainer).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    "ctr_candidate",
+    "nouva-app-svc_1-dep_1",
+    "/nouva-app-svc_1-dep_1",
+  ])("retry never retires its own previous-container alias %s", async (alias) => {
+    const { docker, dependencies, payload } = retryFixture();
+    payload.runtimeMetadata.containerName = alias;
+    await deployAppImageWithDependencies(dependencies, docker as never, runtimeConfig, payload);
+    expect(docker.removeContainer).not.toHaveBeenCalled();
+    expect(docker.stopContainer).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    "throws",
+    "still-present",
+  ])("stopped candidate cleanup %s cannot snapshot or restore a writer", async (failure) => {
+    const { docker, candidate, dependencies, payload } = retryFixture();
+    candidate.State.Running = false;
+    if (failure === "throws") docker.removeContainer.mockRejectedValue(new Error("remove failed"));
+    await expect(
+      deployAppImageWithDependencies(dependencies, docker as never, runtimeConfig, payload)
+    ).rejects.toThrow();
+    expect(docker.startContainer).not.toHaveBeenCalled();
+    expect(docker.createContainer).not.toHaveBeenCalled();
+    expect(docker.ensureContainer).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    false,
+    true,
+  ])("retirement retries are bounded and never roll back the healthy candidate (persistent=%s)", async (persistent) => {
+    const { docker, candidate, dependencies, payload } = retryFixture();
+    docker.inspectContainer.mockImplementation(async (name: string) =>
+      name === "old"
+        ? ({ ...candidate, Id: "old-id", Name: "/old", State: { Running: false } } as never)
+        : (candidate as never)
+    );
+    if (persistent) docker.removeContainer.mockRejectedValue(new Error("remove failed"));
+    else docker.removeContainer.mockRejectedValueOnce(new Error("remove failed"));
+    const result = await deployAppImageWithDependencies(
+      dependencies,
+      docker as never,
+      runtimeConfig,
+      payload
+    );
+    expect(result.rollout.previousContainerRetirement).toBe(persistent ? "deferred" : "graceful");
+    expect(docker.removeContainer).toHaveBeenCalledTimes(persistent ? 3 : 2);
+    expect(docker.removeContainer.mock.calls.every(([name]) => name === "old")).toBe(true);
+    expect(result.rollout.outcome).toBe("committed");
+  });
+
+  test("re-leased volume deploy adopts its running candidate after a lost completion and stale metadata", async () => {
+    const docker = createDockerMock();
+    const candidate = {
+      Id: "ctr_candidate",
+      Name: "/nouva-app-svc_1-dep_1",
+      Config: {
+        Image: appRuntimePayload.imageUrl,
+        Labels: {
+          "nouva.managed": "true",
+          "nouva.service.id": "svc_1",
+          "nouva.deployment.id": "dep_1",
+        },
+      },
+      Mounts: [
+        {
+          Type: "volume",
+          Name: appRuntimePayload.volume!.volumeName,
+          Destination: appRuntimePayload.volume!.mountPath,
+        },
+      ],
+      State: { Running: true, Health: { Status: "healthy" } },
+    };
+    docker.listContainersByLabels.mockResolvedValue([candidate] as never);
+    docker.listContainersUsingVolume.mockResolvedValue([candidate] as never);
+    docker.inspectContainer.mockImplementation(async (name: string) =>
+      name === "already-retired" ? null : (candidate as never)
+    );
+    const result = await deployAppImageWithDependencies(
+      {
+        ensureBaseRuntime: async () => {},
+        checkTcpConnect: async () => true,
+        fetchImpl: mock(async () =>
+          Response.json([
+            {
+              name: "svc-svc_1@file",
+              loadBalancer: { servers: [{ url: "http://nouva-app-svc_1-dep_1:8080" }] },
+            },
+          ])
+        ) as typeof fetch,
+        writeLocalTraefikRoute: async () => {},
+        deleteLocalTraefikRoute: async () => {},
+      },
+      docker as never,
+      runtimeConfig,
+      {
+        ...appRuntimePayload,
+        rollout: createRolloutConfig(),
+        runtimeMetadata: { containerName: "already-retired" },
+      }
+    );
+    expect(result.runtimeMetadata.containerId).toBe("ctr_candidate");
+    expect(docker.ensureContainer).not.toHaveBeenCalled();
+    expect(docker.createContainer).not.toHaveBeenCalled();
+    expect(docker.startContainer).not.toHaveBeenCalled();
+    expect(docker.removeContainer).not.toHaveBeenCalled();
+  });
+
   test("uses the backward-compatible thirty-second drain defaults", () => {
     expect(resolveAppRolloutConfig(null).drain).toEqual({
       durationMs: 30_000,
@@ -3447,6 +3884,95 @@ describe("verified project network cleanup", () => {
 });
 
 describe("verified service cleanup", () => {
+  test.each([
+    "listing",
+    "removal",
+    "verification",
+    "leftover",
+  ])("does not prove deletion when %s fails", async (failure) => {
+    const docker = createDockerMock();
+    const container = {
+      Id: "orphan",
+      Config: { Labels: { "nouva.managed": "true", "nouva.service.id": "svc_1" } },
+    };
+    docker.listContainersByLabels.mockResolvedValue([container] as never);
+    if (failure === "listing")
+      docker.listContainersByLabels.mockRejectedValue(new Error("listing failed"));
+    if (failure === "removal")
+      docker.removeContainer.mockRejectedValue(new Error("removal failed"));
+    if (failure === "verification")
+      docker.listContainersByLabels
+        .mockResolvedValueOnce([container] as never)
+        .mockRejectedValueOnce(new Error("verification failed"));
+    await expect(
+      handleDeleteService(docker as never, {
+        projectId: "proj_1",
+        serviceId: "svc_1",
+        serviceName: "app",
+        serviceType: "app",
+        runtimeMetadata: null,
+      })
+    ).rejects.toThrow();
+  });
+
+  test.each([
+    "app",
+    "database",
+  ] as const)("%s cleanup never deletes unmanaged or other-service containers from stale metadata", async (serviceType) => {
+    const docker = createDockerMock();
+    docker.listContainersByLabels.mockResolvedValue([
+      {
+        Id: "foreign",
+        Config: { Labels: { "nouva.managed": "true", "nouva.service.id": "other" } },
+      },
+      { Id: "unmanaged", Config: { Labels: { "nouva.service.id": "svc_1" } } },
+    ] as never);
+    await handleDeleteService(docker as never, {
+      projectId: "proj_1",
+      serviceId: "svc_1",
+      serviceName: "service",
+      serviceType,
+      runtimeMetadata: { containerId: "foreign" },
+    });
+    expect(docker.removeContainer).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    null,
+    { containerName: "already-removed-live" },
+  ])("sweeps running failed and stopped replaced deployments with metadata %j", async (runtimeMetadata) => {
+    const docker = createDockerMock();
+    const containers = new Map(
+      ["failed-running", "replaced-stopped"].map((id) => [
+        id,
+        {
+          Id: id,
+          State: { Running: id === "failed-running" },
+          Config: { Labels: { "nouva.managed": "true", "nouva.service.id": "svc_1" } },
+        },
+      ])
+    );
+    docker.listContainersByLabels.mockImplementation(async () => [...containers.values()] as never);
+    docker.removeContainer.mockImplementation(async (id: string) => {
+      containers.delete(id);
+    });
+    const result = await handleDeleteService(docker as never, {
+      projectId: "proj_1",
+      serviceId: "svc_1",
+      serviceName: "app",
+      serviceType: "app",
+      runtimeMetadata,
+    });
+    expect(containers.size).toBe(0);
+    expect(docker.listContainersByLabels).toHaveBeenCalledWith({
+      "nouva.managed": "true",
+      "nouva.service.id": "svc_1",
+    });
+    expect(result.cleanupProof).toMatchObject({
+      serviceContainers: { serviceId: "svc_1", remainingContainerIds: [] },
+    });
+  });
+
   test("retries partial cleanup and removes distinct tags sharing one image ID", async () => {
     const docker = createDockerMock();
     const previousImageFailure = new Error("Docker daemon became unavailable");
@@ -3489,6 +4015,7 @@ describe("verified service cleanup", () => {
     expect(result.cleanupProof).toEqual({
       version: 1,
       kind: "delete_service",
+      serviceContainers: { serviceId: "svc_1", remainingContainerIds: [] },
       container: { identifier: "nouva-app-svc_1", absent: true },
       retainedImages: [
         { reference: "nouva-app:current", absent: true },

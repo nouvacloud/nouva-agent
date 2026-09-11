@@ -1,11 +1,9 @@
 name: Auto Release
 
 on:
-  workflow_run:
-    workflows:
-      - CI
-    types:
-      - completed
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       sha:
@@ -14,32 +12,28 @@ on:
         type: string
 
 concurrency:
-  group: auto-agent-release-${{ inputs.sha || github.event.workflow_run.head_sha }}
+  group: auto-agent-release-${{ inputs.sha || github.sha }}
   cancel-in-progress: false
 
 jobs:
   prepare:
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      (
-        github.event.workflow_run.conclusion == 'success' &&
-        github.event.workflow_run.event == 'push' &&
-        github.event.workflow_run.head_branch == 'main'
-      )
-    runs-on: ubuntu-latest
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       actions: write
       contents: write
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.sha || github.event.workflow_run.head_sha }}
+          ref: ${{ inputs.sha || github.sha }}
           fetch-depth: 0
 
       - name: Resolve agent release
         id: version
         env:
-          RELEASE_SHA: ${{ inputs.sha || github.event.workflow_run.head_sha }}
+          RELEASE_SHA: ${{ inputs.sha || github.sha }}
         run: |
           node <<'EOF'
           const fs = require("node:fs");

@@ -60,6 +60,7 @@ export type AgentCleanupProof =
   | {
       version: 1;
       kind: "delete_service";
+      serviceContainers: { serviceId: string; remainingContainerIds: [] };
       container: { identifier: string | null; absent: true };
       retainedImages: Array<{ reference: string; absent: true }>;
     }
@@ -83,6 +84,7 @@ export type AgentCleanupProof =
   | {
       version: 1;
       kind: "delete_worker";
+      serviceContainers: { serviceId: string; remainingContainerIds: [] };
       containers: Array<{ identifier: string; absent: true }>;
       retainedImages: Array<{ reference: string; absent: true }>;
     }
@@ -182,6 +184,8 @@ export interface AppRolloutConfig {
 }
 
 export interface AppRolloutResult {
+  /** Locally adopted a running candidate; control-plane commitment may still be unknown. */
+  reusedCandidate?: boolean;
   strategy: AppRolloutStrategy;
   outcome: AppRolloutOutcome;
   currentPhase: AppRolloutPhase;
@@ -295,6 +299,7 @@ export type AgentCapabilities = {
   containerMetrics?: boolean;
   postgresObservability?: boolean;
   cleanupProofV1?: boolean;
+  serviceScopedCleanupV1?: boolean;
   resourceIsolationV1?: boolean;
   projectNetworkIsolationV1?: boolean;
   appVolumeRolloutV1?: boolean;
@@ -893,6 +898,7 @@ export function getDefaultAgentCapabilities(): AgentCapabilities {
     containerMetrics: true,
     postgresObservability: true,
     cleanupProofV1: true,
+    serviceScopedCleanupV1: true,
     resourceIsolationV1: true,
     projectNetworkIsolationV1: true,
     projectNetworkReapV1: true,

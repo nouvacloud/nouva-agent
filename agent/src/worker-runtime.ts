@@ -18,6 +18,7 @@ import type {
   WorkerJobLifecyclePayload,
   WorkerJobPayload,
 } from "./protocol.js";
+import { removeManagedServiceContainers } from "./service-container-cleanup.js";
 
 const WORKER_VOLUME_SNAPSHOT_IMAGE = "alpine:3.21";
 const WORKER_HEALTHCHECK_INTERVAL_NS = 10_000_000_000;
@@ -458,29 +459,6 @@ async function listWorkerServiceContainers(
   });
   const seen = new Set<string>();
   return containers.filter((container) => {
-    const identifier = getContainerIdentifier(container);
-    if (seen.has(identifier)) {
-      return false;
-    }
-    seen.add(identifier);
-    return true;
-  });
-}
-
-async function listWorkerManagedContainers(
-  docker: Pick<DockerApiClient, "listContainersByLabels">,
-  serviceId: string
-): Promise<DockerContainerInspection[]> {
-  const containers = await docker.listContainersByLabels({
-    "nouva.managed": "true",
-    "nouva.service.id": serviceId,
-  });
-  const seen = new Set<string>();
-  return containers.filter((container) => {
-    const kind = container.Config?.Labels?.["nouva.kind"];
-    if (kind !== "worker" && kind !== "worker_job" && kind !== "worker_volume_task") {
-      return false;
-    }
     const identifier = getContainerIdentifier(container);
     if (seen.has(identifier)) {
       return false;
@@ -1503,16 +1481,8 @@ export async function removeWorkerServiceRuntime(
     runtimeMetadata?: RuntimeMetadata | null;
   }
 ): Promise<Record<string, unknown>> {
-  const containers = await listWorkerManagedContainers(docker, input.serviceId);
+  const containers = await removeManagedServiceContainers(docker, input.serviceId);
   const identifiers = containers.map(getContainerIdentifier);
-  for (const identifier of identifiers) {
-    await docker.removeContainer(identifier, true);
-  }
-  for (const identifier of identifiers) {
-    if (await docker.inspectContainer(identifier)) {
-      throw new Error(`Worker container ${identifier} still exists after cleanup`);
-    }
-  }
 
   const retainedImages =
     input.runtimeMetadata?.imageStoreMode === "docker-local"
@@ -1541,6 +1511,7 @@ export async function removeWorkerServiceRuntime(
     cleanupProof: {
       version: 1,
       kind: "delete_worker",
+      serviceContainers: { serviceId: input.serviceId, remainingContainerIds: [] },
       containers: identifiers.map((identifier) => ({ identifier, absent: true })),
       retainedImages: retainedImages.map((reference) => ({ reference, absent: true })),
     },
