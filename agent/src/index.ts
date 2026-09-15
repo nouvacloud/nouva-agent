@@ -132,6 +132,11 @@ import {
 } from "./traefik-runtime.js";
 import { resolveUpdateAgentImageRef, toUpdateAgentPayload } from "./update-agent.js";
 import { createVolumeMetricsCollector } from "./volume-metrics-loop.js";
+import {
+  hasReplacedVolumeForGeneration,
+  readVolumeWipeReceipt,
+  writeVolumeWipeReceipt,
+} from "./volume-wipe-receipt.js";
 import { createBoundedWorkScheduler } from "./work-scheduler.js";
 import {
   cleanupWorkerJob,
@@ -3855,28 +3860,71 @@ export async function handleDeleteProject(docker: DockerApiClient, payload: Dele
   };
 }
 
+function readPayloadRepositoryGeneration(
+  payload: Pick<DeleteVolumePayload, "pgbackrestRepositoryGeneration">
+): number | null {
+  const value = payload.pgbackrestRepositoryGeneration;
+  return typeof value === "number" && Number.isInteger(value) ? value : null;
+}
+
+/**
+ * Wipe a volume's live data, keeping every backup.
+ *
+ * The destructive phase (removing the container and the Docker volume, then creating an empty
+ * replacement) runs at most once per repository generation. When the control plane rotated the
+ * volume onto a new pgBackRest repository, the agent records a durable receipt as soon as the empty
+ * replacement exists, and a later attempt on the same generation resumes from provisioning instead
+ * of erasing the cluster the earlier attempt initialized. Without that, a retry after a lost
+ * completion report would leave the rotated repository bound to a PostgreSQL system identifier that
+ * no longer exists.
+ *
+ * `dataDir` exists so tests can exercise the crash boundaries against a temporary directory.
+ */
 export async function handleWipeVolume(
   docker: DockerApiClient,
   config: Pick<AgentRuntimeConfig, "privateRegistry">,
   payload:
     | DeleteVolumePayload
-    | (DatabaseProvisionPayload & { runtimeMetadata?: RuntimeMetadata | null })
+    | (DatabaseProvisionPayload & { runtimeMetadata?: RuntimeMetadata | null }),
+  context: { workItemId?: string | null; dataDir?: string } = {}
 ) {
   const volumeName = getManagedVolumeName(payload);
   const identifier = isAttachedDatabaseVolumePayload(payload)
     ? (payload.runtimeMetadata?.containerId ?? payload.runtimeMetadata?.containerName ?? null)
     : null;
+  const repositoryGeneration = readPayloadRepositoryGeneration(payload);
+  const dataDir = context.dataDir ?? DATA_DIR;
+  const alreadyReplaced =
+    repositoryGeneration !== null &&
+    hasReplacedVolumeForGeneration(await readVolumeWipeReceipt(dataDir, volumeName), {
+      volumeName,
+      repositoryGeneration,
+    });
+
+  const recordVolumeReplaced = async (): Promise<void> => {
+    if (repositoryGeneration === null) {
+      return;
+    }
+    await writeVolumeWipeReceipt(dataDir, {
+      volumeName,
+      repositoryGeneration,
+      workItemId: context.workItemId ?? null,
+    });
+  };
 
   if (!isAttachedDatabaseVolumePayload(payload)) {
-    await docker.removeVolume(volumeName, true);
-    await verifyVolumeAbsent(docker, volumeName);
-    await docker.createVolume(
-      volumeName,
-      buildManagedVolumeLabels({
-        volumeId: payload.volumeId,
-        projectId: payload.projectId,
-      })
-    );
+    if (!alreadyReplaced) {
+      await docker.removeVolume(volumeName, true);
+      await verifyVolumeAbsent(docker, volumeName);
+      await docker.createVolume(
+        volumeName,
+        buildManagedVolumeLabels({
+          volumeId: payload.volumeId,
+          projectId: payload.projectId,
+        })
+      );
+      await recordVolumeReplaced();
+    }
     if (!(await docker.inspectVolume(volumeName))) {
       throw new Error(`Replacement Docker volume ${volumeName} was not created`);
     }
@@ -3897,15 +3945,29 @@ export async function handleWipeVolume(
   const containerTargets = [identifier, getDatabaseContainerName(payload)]
     .filter((target): target is string => Boolean(target))
     .filter((target, index, targets) => targets.indexOf(target) === index);
-  for (const target of containerTargets) {
-    await docker.removeContainer(target, true);
-  }
-  for (const target of containerTargets) {
-    await verifyContainerAbsent(docker, target);
-  }
 
-  await docker.removeVolume(volumeName, true);
-  await verifyVolumeAbsent(docker, volumeName);
+  if (!alreadyReplaced) {
+    for (const target of containerTargets) {
+      await docker.removeContainer(target, true);
+    }
+    for (const target of containerTargets) {
+      await verifyContainerAbsent(docker, target);
+    }
+
+    await docker.removeVolume(volumeName, true);
+    await verifyVolumeAbsent(docker, volumeName);
+    // Created here rather than left to provisioning so the receipt can be written the moment the
+    // replacement exists: everything after this point is safe to repeat.
+    await docker.createVolume(
+      volumeName,
+      buildManagedVolumeLabels({
+        volumeId: payload.volumeId,
+        projectId: payload.projectId,
+        serviceId: payload.serviceId,
+      })
+    );
+    await recordVolumeReplaced();
+  }
 
   const result = await handleDatabaseProvision(docker, config, payload);
   if (!(await docker.inspectVolume(volumeName))) {
@@ -4734,7 +4796,9 @@ export async function handleRestorePostgresPitr(
       ...Object.entries(spec.envVars).map(([key, value]) => `${key}=${value}`),
       "RESTORE_TYPE=time",
       `RESTORE_TARGET=${payload.restoreTarget}`,
-      "RESTORE_SET=",
+      // Pinning the base set keeps recovery on the timeline the control plane selected instead of
+      // letting pgBackRest pick whichever set it considers closest to the timestamp.
+      `RESTORE_SET=${payload.sourcePgbackrestSet ?? ""}`,
       "NOUVA_STAGED_RESTORE=1",
       `NOUVA_DATA_PATH=${spec.dataPath}`,
     ],
@@ -5603,7 +5667,8 @@ async function processWorkItem(
                     ...(payload as unknown as DatabaseProvisionPayload),
                     runtimeMetadata: toRuntimeMetadata(payload.runtimeMetadata),
                   }
-                : (payload as unknown as DeleteVolumePayload)
+                : (payload as unknown as DeleteVolumePayload),
+              { workItemId: workItem.id }
             );
             break;
           case "create_volume_backup":

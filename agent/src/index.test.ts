@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { collectAgentWorkPayloadOperationalValues } from "@repo/runtime/logging";
 import agentPackageJson from "../package.json" with { type: "json" };
 import { executeAndReportAgentWork } from "./agent-work-reporting.js";
@@ -4156,6 +4158,164 @@ describe("verified volume wipe", () => {
       previousVolume: { name: "nouva-vol-vol_1", absent: true },
       replacementVolume: { name: "nouva-vol-vol_1", present: true },
     });
+  });
+
+  // The dangerous retry is the one after a *successful* attempt whose completion never reached the
+  // control plane: repeating the destructive phase would erase the cluster that already initialized
+  // under the rotated repository, leaving that repository with no matching system identifier.
+  function createWipeDockerMock() {
+    const docker = createDockerMock();
+    let volumePresent = true;
+    docker.removeVolume.mockImplementation(async () => {
+      volumePresent = false;
+    });
+    docker.createVolume.mockImplementation(async () => {
+      volumePresent = true;
+    });
+    docker.inspectVolume.mockImplementation(async () =>
+      volumePresent ? ({ Name: "nouva-vol-vol_1" } as never) : null
+    );
+    docker.inspectContainer.mockResolvedValue(null);
+    docker.ensureContainer.mockResolvedValue("ctr_new");
+    return docker;
+  }
+
+  test("resumes at provisioning instead of erasing the cluster a lost completion left behind", async () => {
+    const dataDir = await mkdtemp(path.join(tmpdir(), "nouva-wipe-receipt-"));
+
+    try {
+      const docker = createWipeDockerMock();
+      const payload = {
+        ...databasePayload,
+        pgbackrestRepositoryGeneration: 1,
+        runtimeMetadata: { containerId: "ctr_old" },
+      };
+
+      await handleWipeVolume(docker as never, runtimeConfig, payload, {
+        workItemId: "work_1",
+        dataDir,
+      });
+      expect(docker.removeVolume.mock.calls).toEqual([["nouva-vol-vol_1", true]]);
+
+      docker.removeVolume.mockClear();
+      docker.removeContainer.mockClear();
+
+      const replay = await handleWipeVolume(docker as never, runtimeConfig, payload, {
+        workItemId: "work_1",
+        dataDir,
+      });
+
+      expect(docker.removeVolume.mock.calls).toEqual([]);
+      expect(docker.removeContainer.mock.calls).toEqual([]);
+      expect(replay.cleanupProof).toEqual({
+        version: 1,
+        kind: "wipe_volume",
+        previousContainer: { identifier: "ctr_old", absent: true },
+        previousVolume: { name: "nouva-vol-vol_1", absent: true },
+        replacementVolume: { name: "nouva-vol-vol_1", present: true },
+      });
+    } finally {
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  test("wipes again when a later wipe rotates the repository to a new generation", async () => {
+    const dataDir = await mkdtemp(path.join(tmpdir(), "nouva-wipe-receipt-"));
+
+    try {
+      const docker = createWipeDockerMock();
+      const payload = {
+        ...databasePayload,
+        runtimeMetadata: { containerId: "ctr_old" },
+      };
+
+      await handleWipeVolume(
+        docker as never,
+        runtimeConfig,
+        { ...payload, pgbackrestRepositoryGeneration: 1 },
+        { workItemId: "work_1", dataDir }
+      );
+      docker.removeVolume.mockClear();
+
+      // Wipe work is deduplicated, so the second wipe reuses the same work item id. Only the
+      // generation distinguishes the two, and a stale receipt must not suppress the new wipe.
+      await handleWipeVolume(
+        docker as never,
+        runtimeConfig,
+        { ...payload, pgbackrestRepositoryGeneration: 2 },
+        { workItemId: "work_1", dataDir }
+      );
+
+      expect(docker.removeVolume.mock.calls).toEqual([["nouva-vol-vol_1", true]]);
+    } finally {
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  // An unreadable receipt is not evidence that nothing happened: the previous attempt may have
+  // already replaced the volume and provisioned the fresh cluster. Destroying again on that
+  // evidence is exactly the data loss the receipt exists to prevent.
+  test("refuses to mutate Docker when the receipt exists but cannot be read", async () => {
+    const dataDir = await mkdtemp(path.join(tmpdir(), "nouva-wipe-receipt-"));
+
+    try {
+      const docker = createWipeDockerMock();
+      const payload = {
+        ...databasePayload,
+        pgbackrestRepositoryGeneration: 1,
+        runtimeMetadata: { containerId: "ctr_old" },
+      };
+
+      await mkdir(path.join(dataDir, "volume-wipes"), { recursive: true });
+      const receiptPath = path.join(dataDir, "volume-wipes", "nouva-vol-vol_1.json");
+      await writeFile(receiptPath, '{"version": 1, "volumeName": "nouva-v');
+
+      await expect(
+        handleWipeVolume(docker as never, runtimeConfig, payload, {
+          workItemId: "work_1",
+          dataDir,
+        })
+      ).rejects.toThrow("is not valid JSON");
+
+      await writeFile(receiptPath, JSON.stringify({ version: 2, volumeName: "nouva-vol-vol_1" }));
+
+      await expect(
+        handleWipeVolume(docker as never, runtimeConfig, payload, {
+          workItemId: "work_1",
+          dataDir,
+        })
+      ).rejects.toThrow("does not have a recognised shape");
+
+      expect(docker.removeContainer.mock.calls).toEqual([]);
+      expect(docker.removeVolume.mock.calls).toEqual([]);
+      expect(docker.createVolume.mock.calls).toEqual([]);
+      expect(docker.ensureContainer.mock.calls).toEqual([]);
+    } finally {
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  test("still repeats the destructive phase for volumes without repository lineage", async () => {
+    const dataDir = await mkdtemp(path.join(tmpdir(), "nouva-wipe-receipt-"));
+
+    try {
+      const docker = createWipeDockerMock();
+      const payload = {
+        projectId: "proj_1",
+        volumeId: "vol_1",
+        volumeName: "nouva-vol-vol_1",
+      };
+
+      await handleWipeVolume(docker as never, {}, payload, { dataDir });
+      await handleWipeVolume(docker as never, {}, payload, { dataDir });
+
+      expect(docker.removeVolume.mock.calls).toEqual([
+        ["nouva-vol-vol_1", true],
+        ["nouva-vol-vol_1", true],
+      ]);
+    } finally {
+      await rm(dataDir, { recursive: true, force: true });
+    }
   });
 });
 

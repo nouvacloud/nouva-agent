@@ -310,6 +310,7 @@ export type AgentCapabilities = {
   workerServicesV1?: boolean;
   workerVolumeRolloutV1?: boolean;
   externalBackupImportV1?: boolean;
+  postgresRepositoryLineageV1?: boolean;
   [key: string]: boolean | undefined;
 };
 
@@ -660,6 +661,14 @@ export interface DatabaseProvisionPayload {
   runtimeMetadata?: RuntimeMetadata | null;
   version?: string;
   credentials?: Record<string, string>;
+  /**
+   * Which pgBackRest repository generation the control plane assigned to this volume.
+   *
+   * The repository path itself already arrives resolved in `envVars`; the agent only needs the
+   * number to key its durable wipe receipt, so a retry can tell "this generation's volume was
+   * already replaced" from "a previous wipe's receipt".
+   */
+  pgbackrestRepositoryGeneration?: number | null;
 }
 
 export interface ReconcileServiceResourcesPayload {
@@ -674,6 +683,7 @@ export interface DeleteVolumePayload {
   projectId: string;
   volumeId: string;
   volumeName: string;
+  pgbackrestRepositoryGeneration?: number | null;
 }
 
 export interface DeleteProjectPayload {
@@ -842,6 +852,8 @@ export interface RestorePostgresPitrPayload extends Omit<DatabaseProvisionPayloa
   sourceMountPath?: string;
   restoreTarget: string;
   destination: PlatformBackupDestination;
+  /** The base backup set the control plane selected, pinning recovery to one repository timeline. */
+  sourcePgbackrestSet?: string | null;
 }
 
 export interface ExpireVolumeBackupRepositoryPayload {
@@ -910,6 +922,10 @@ export function getDefaultAgentCapabilities(): AgentCapabilities {
     workerServicesV1: true,
     workerVolumeRolloutV1: true,
     externalBackupImportV1: true,
+    // Declares that a volume wipe records a durable replacement receipt, so a retry after a lost
+    // completion report resumes instead of erasing the freshly initialized cluster. The control
+    // plane refuses to rotate a PostgreSQL repository without it.
+    postgresRepositoryLineageV1: true,
   };
 }
 
