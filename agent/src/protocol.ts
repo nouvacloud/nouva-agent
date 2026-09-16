@@ -368,6 +368,37 @@ export interface AgentRuntimeConfig {
   };
 }
 
+export type AgentDatabaseRuntimeHealthState = "ready" | "unavailable" | "unknown";
+
+/**
+ * Why a managed database container was reported in its state. The set is closed so a report can
+ * never carry container log text, probe output, or other untrusted material.
+ */
+export type AgentDatabaseRuntimeHealthReason =
+  | "authenticated_probe_succeeded"
+  | "container_missing"
+  | "container_restarting"
+  | "container_exited"
+  | "container_paused"
+  | "incompatible_host_kernel"
+  | "probe_unavailable";
+
+export interface AgentDatabaseRuntimeHealthObservation {
+  serviceId: string;
+  containerId: string | null;
+  containerName: string;
+  engine: string;
+  state: AgentDatabaseRuntimeHealthState;
+  reason: AgentDatabaseRuntimeHealthReason;
+  observedAt: string;
+}
+
+/** The server's complete inventory of managed database containers at `observedAt`. */
+export interface AgentDatabaseRuntimeHealthReport {
+  observedAt: string;
+  containers: AgentDatabaseRuntimeHealthObservation[];
+}
+
 export interface AgentRegistrationSnapshot {
   serverId: string;
   hostname: string;
@@ -382,6 +413,8 @@ export interface AgentRegistrationSnapshot {
   diskTotalBytes: number | null;
   latestValidationReport: ServerValidationReport | null;
   capabilities?: AgentCapabilities | null;
+  /** Omitted until the agent has completed one full observation pass; never partially populated. */
+  databaseRuntimeHealth?: AgentDatabaseRuntimeHealthReport | null;
 }
 
 export interface AgentWorkRecord {

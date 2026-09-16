@@ -104,11 +104,13 @@ function mergeExitCode(previous: number | null, reported: number | null): number
 
 function recordEvidence(
   previous: CandidateRuntimeEvidence,
-  inspection: DockerContainerInspection
+  inspection: DockerContainerInspection,
+  restartBaseline: number
 ): CandidateRuntimeEvidence {
+  const reportedRestarts = readNonNegativeInteger(inspection.RestartCount) ?? 0;
   return {
     outOfMemory: previous.outOfMemory || inspection.State?.OOMKilled === true,
-    restarts: Math.max(previous.restarts, readNonNegativeInteger(inspection.RestartCount) ?? 0),
+    restarts: Math.max(previous.restarts, Math.max(0, reportedRestarts - restartBaseline)),
     exitCode: mergeExitCode(previous.exitCode, readReportedExitCode(inspection.State)),
     memoryLimitBytes:
       readPositiveByteLimit(inspection.HostConfig?.Memory) ?? previous.memoryLimitBytes,
@@ -145,31 +147,43 @@ function describeMemoryLimits(evidence: CandidateRuntimeEvidence): string[] {
   return limits;
 }
 
-function describeOutOfMemory(containerName: string, evidence: CandidateRuntimeEvidence): string {
+function describeOutOfMemory(
+  subject: string,
+  containerName: string,
+  evidence: CandidateRuntimeEvidence
+): string {
   const details = describeMemoryLimits(evidence);
   if (evidence.restarts > 0) {
     details.push(formatRestarts(evidence.restarts));
   }
   const suffix = details.length > 0 ? ` (${details.join(", ")})` : "";
-  return `Candidate container ${containerName} ran out of memory and was killed${suffix}; raise the service memory limit and redeploy`;
+  return `${subject} ${containerName} ran out of memory and was killed${suffix}; raise the service memory limit and redeploy`;
 }
 
-function describeRestartLoop(containerName: string, evidence: CandidateRuntimeEvidence): string {
+function describeRestartLoop(
+  subject: string,
+  containerName: string,
+  evidence: CandidateRuntimeEvidence
+): string {
   const details = [formatRestarts(evidence.restarts)];
   if (evidence.exitCode !== null) {
     details.push(`last exit code ${evidence.exitCode}`);
   }
-  return `Candidate container ${containerName} keeps restarting (${details.join(", ")}); the process is exiting instead of serving traffic`;
+  return `${subject} ${containerName} keeps restarting (${details.join(", ")}); the process is exiting instead of serving traffic`;
 }
 
 function describeTerminalStatus(
+  subject: string,
   containerName: string,
   status: string,
   evidence: CandidateRuntimeEvidence
 ): string {
   const exit = evidence.exitCode === null ? "" : `, exit code ${evidence.exitCode}`;
-  return `Candidate container ${containerName} is not running (${status}${exit})`;
+  return `${subject} ${containerName} is not running (${status}${exit})`;
 }
+
+/** Callers that supervise something other than an app candidate relabel the reported subject. */
+const DEFAULT_READINESS_SUBJECT = "Candidate container";
 
 function resolveContainerIpAddress(inspection: DockerContainerInspection): string | null {
   const networks = inspection.NetworkSettings?.Networks;
@@ -197,9 +211,17 @@ export function assessCandidateReadiness(input: {
   appPort: number;
   inspection: DockerContainerInspection;
   evidence: CandidateRuntimeEvidence;
+  subject?: string;
+  /**
+   * Restarts the container had already accumulated before this supervision window began. Docker
+   * reports `RestartCount` for the container's whole life, so a live container that is restarted in
+   * place — rather than replaced — would otherwise be judged by restarts it recovered from long ago.
+   */
+  restartBaseline?: number;
 }): CandidateReadinessAssessment {
-  const evidence = recordEvidence(input.evidence, input.inspection);
+  const evidence = recordEvidence(input.evidence, input.inspection, input.restartBaseline ?? 0);
   const { containerName } = input;
+  const subject = input.subject ?? DEFAULT_READINESS_SUBJECT;
   const state = input.inspection.State;
   const status = state?.Status?.toLowerCase();
 
@@ -209,7 +231,7 @@ export function assessCandidateReadiness(input: {
       step: {
         kind: "failed",
         cause: "out_of_memory",
-        message: describeOutOfMemory(containerName, evidence),
+        message: describeOutOfMemory(subject, containerName, evidence),
       },
     };
   }
@@ -220,7 +242,7 @@ export function assessCandidateReadiness(input: {
       step: {
         kind: "failed",
         cause: "exited",
-        message: describeTerminalStatus(containerName, status, evidence),
+        message: describeTerminalStatus(subject, containerName, status, evidence),
       },
     };
   }
@@ -231,7 +253,7 @@ export function assessCandidateReadiness(input: {
       step: {
         kind: "failed",
         cause: "restart_loop",
-        message: describeRestartLoop(containerName, evidence),
+        message: describeRestartLoop(subject, containerName, evidence),
       },
     };
   }
@@ -249,7 +271,7 @@ export function assessCandidateReadiness(input: {
         step: {
           kind: "failed",
           cause: "unhealthy",
-          message: `Candidate container ${containerName} became unhealthy`,
+          message: `${subject} ${containerName} became unhealthy`,
         },
       };
     }
@@ -258,7 +280,7 @@ export function assessCandidateReadiness(input: {
       evidence,
       step: {
         kind: "wait",
-        message: `Candidate container ${containerName} health status is ${healthStatus}`,
+        message: `${subject} ${containerName} health status is ${healthStatus}`,
       },
     };
   }
@@ -269,7 +291,7 @@ export function assessCandidateReadiness(input: {
       evidence,
       step: {
         kind: "wait",
-        message: `Candidate container ${containerName} has no routable IP address yet`,
+        message: `${subject} ${containerName} has no routable IP address yet`,
       },
     };
   }
@@ -279,7 +301,7 @@ export function assessCandidateReadiness(input: {
     step: {
       kind: "probe",
       ipAddress,
-      unreachableMessage: `Candidate container ${containerName} is not accepting TCP traffic on ${input.appPort}`,
+      unreachableMessage: `${subject} ${containerName} is not accepting TCP traffic on ${input.appPort}`,
     },
   };
 }

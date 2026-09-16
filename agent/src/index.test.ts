@@ -9,7 +9,7 @@ import { executeAndReportAgentWork } from "./agent-work-reporting.js";
 import type { DeployAppImageInput } from "./app-build-runtime.js";
 import { buildAndDeployAppWithDependencies } from "./app-build-runtime.js";
 import { hashProjectNetwork } from "./build.js";
-import { DockerApiError } from "./docker-api.js";
+import { DockerApiError, type DockerContainerSpec } from "./docker-api.js";
 import {
   ApiRequestError,
   adoptReregisteredCredentials,
@@ -30,6 +30,7 @@ import {
   handleDeleteVolume,
   handleImportExternalBackup,
   handleReconcileServiceResources,
+  handleRestartService,
   handleRestorePostgresPitr,
   handleRestoreVolumeBackup,
   handleWipeVolume,
@@ -188,6 +189,11 @@ const databasePayload: DatabaseProvisionPayload = {
   publicAccessEnabled: false,
   resourceLimits,
   runtimeMetadata: null,
+  credentials: {
+    username: "nouva_user",
+    password: "super-secret",
+    database: "nouva_user",
+  },
 };
 
 const pgBackrestBackupPayload: CreateVolumeBackupPayload = {
@@ -373,15 +379,30 @@ const originalAgentContainerName = process.env.NOUVA_AGENT_CONTAINER_NAME;
 const originalHostname = process.env.HOSTNAME;
 
 function createDockerMock() {
+  // Mirrors the host: a container only exists to be inspected once Docker has been asked to run it.
+  let startedContainerName: string | null = null;
   return {
     ensureNetwork: mock(async () => {}),
     createVolume: mock(async () => {}),
-    ensureContainer: mock(async () => "ctr_1"),
+    ensureContainer: mock(async (spec: DockerContainerSpec) => {
+      startedContainerName = spec.name;
+      return "ctr_1";
+    }),
     connectNetwork: mock(async () => {}),
     disconnectNetwork: mock(async () => {}),
     removeNetwork: mock(async () => {}),
     inspectNetwork: mock(async () => null),
-    inspectContainer: mock(async () => null),
+    inspectContainer: mock(async (nameOrId: string) =>
+      startedContainerName && (nameOrId === startedContainerName || nameOrId === "ctr_1")
+        ? {
+            Id: "ctr_1",
+            Name: `/${startedContainerName}`,
+            RestartCount: 0,
+            State: { Running: true, Status: "running", ExitCode: 0, OOMKilled: false },
+            NetworkSettings: { Networks: { managed: { IPAddress: "172.18.0.9" } } },
+          }
+        : null
+    ),
     listContainersUsingVolume: mock(async () => []),
     listContainersByLabels: mock(async () => []),
     inspectImage: mock(async () => ({ Id: "img_candidate" })),
@@ -390,6 +411,7 @@ function createDockerMock() {
     removeImage: mock(async () => {}),
     removeVolume: mock(async () => {}),
     stopContainer: mock(async () => {}),
+    restartContainer: mock(async () => {}),
     pullImage: mock(async () => {}),
     loadImage: mock(async () => {}),
     createContainer: mock(async () => "task_1"),
@@ -397,6 +419,16 @@ function createDockerMock() {
     waitContainer: mock(async () => 0),
     containerLogs: mock(async () => ""),
   };
+}
+
+/**
+ * Database readiness runs its probe in a sidecar the agent creates and removes itself, so container
+ * lifecycle assertions about a service keep looking at the service's own containers.
+ */
+function serviceContainerRemovals(docker: ReturnType<typeof createDockerMock>): Array<unknown[]> {
+  return docker.removeContainer.mock.calls.filter(
+    ([identifier]) => !String(identifier).startsWith("nouva-db-ready-") && identifier !== "task_1"
+  );
 }
 
 function createRolloutConfig(overrides?: Partial<AppRolloutConfig>): AppRolloutConfig {
@@ -3226,6 +3258,94 @@ describe("database runtime recreate paths", () => {
     );
   });
 
+  test("reports a running database only after an authenticated probe answers", async () => {
+    const docker = createDockerMock();
+
+    const result = await handleDatabaseProvision(docker as never, runtimeConfig, databasePayload);
+
+    const probeSpec = docker.createContainer.mock.calls
+      .map((call) => call[0] as DockerContainerSpec)
+      .find((spec) => spec.name?.startsWith("nouva-db-ready-"));
+    expect(probeSpec).toBeDefined();
+    expect(probeSpec?.image).toBe("postgres:17");
+    // The probe must reach the service-facing address on the managed project network, not the
+    // temporary loopback server the entrypoint runs while initializing the data directory.
+    expect(probeSpec?.hostConfig?.NetworkMode).toBe(
+      `nouva-project-${hashProjectNetwork("proj_1")}`
+    );
+    expect(probeSpec?.env).toContain("PGHOST=nouva-postgres-svc_1");
+    expect(probeSpec?.cmd?.join(" ")).toContain("SELECT 1");
+    // Managed database images ignore the command and run their own startup instead, so the probe
+    // container must replace the entrypoint with the shell that runs the statement.
+    expect(probeSpec?.entrypoint).toEqual(["/bin/sh"]);
+    expect(probeSpec?.cmd?.[0]).toBe("-c");
+    expect(result.runtimeInstance.status).toBe("running");
+  });
+
+  test("authenticates with the runtime definition when the payload carries no credentials", async () => {
+    const docker = createDockerMock();
+    const { credentials: _credentials, ...payloadWithoutCredentials } = databasePayload;
+
+    await handleDatabaseProvision(
+      docker as never,
+      runtimeConfig,
+      payloadWithoutCredentials as typeof databasePayload
+    );
+
+    const probeSpec = docker.createContainer.mock.calls
+      .map((call) => call[0] as DockerContainerSpec)
+      .find((spec) => spec.name?.startsWith("nouva-db-ready-"));
+    expect(probeSpec?.env).toContain("PGUSER=nouva_user");
+    expect(probeSpec?.env).toContain("PGPASSWORD=super-secret");
+  });
+
+  test("fails provisioning instead of reporting a restarting database as running", async () => {
+    const docker = createDockerMock();
+    docker.inspectContainer.mockResolvedValue({
+      Id: "ctr_1",
+      Name: "/nouva-postgres-svc_1",
+      RestartCount: 8,
+      State: { Running: true, Status: "restarting", ExitCode: 1, OOMKilled: false },
+    });
+
+    await expect(
+      handleDatabaseProvision(docker as never, runtimeConfig, databasePayload)
+    ).rejects.toThrow("Database container nouva-postgres-svc_1 keeps restarting");
+  });
+
+  test("reports the known MongoDB host kernel incompatibility without echoing logs", async () => {
+    const docker = createDockerMock();
+    docker.inspectContainer.mockResolvedValue({
+      Id: "ctr_1",
+      Name: "/nouva-mongodb-svc_1",
+      RestartCount: 8,
+      State: { Running: true, Status: "restarting", ExitCode: 1, OOMKilled: false },
+    });
+    docker.containerLogs.mockResolvedValue(
+      [
+        '{"t":{"$date":"2026-09-15T21:48:26.446Z"},"s":"F","id":12257600,"ctx":"main","msg":"MongoDB cannot start: Linux kernel versions 6.19 and newer has a known incompatibility with this version of MongoDB. See https://jira.mongodb.org/browse/SERVER-121912 for more information."}',
+        '{"s":"F","msg":"env MONGO_INITDB_ROOT_PASSWORD=super-secret"}',
+      ].join("\n")
+    );
+
+    const error = await handleDatabaseProvision(docker as never, runtimeConfig, {
+      ...databasePayload,
+      variant: "mongodb",
+      imageUrl: "mongo:8.0",
+      internalPort: 27017,
+      mountPath: "/data/db",
+      dataPath: "/data/db",
+      envVars: {
+        MONGO_INITDB_ROOT_USERNAME: "nouva_user",
+        MONGO_INITDB_ROOT_PASSWORD: "super-secret",
+      },
+    }).catch((caught: unknown) => caught as Error);
+
+    expect(error.message).toContain("SERVER-121912");
+    expect(error.message).not.toContain("super-secret");
+    expect(error.message).not.toContain('{"t":');
+  });
+
   test("applies Docker resource limits when reapplying a database volume", async () => {
     const docker = createDockerMock();
 
@@ -3760,6 +3880,125 @@ describe("database runtime recreate paths", () => {
   });
 });
 
+describe("database restart readiness", () => {
+  const restartPayload = {
+    projectId: "proj_1",
+    serviceId: "svc_1",
+    serviceName: "main-db",
+    variant: "postgres" as const,
+    containerName: "nouva-postgres-svc_1",
+    runtimeMetadata: { containerId: "ctr_1", containerName: "nouva-postgres-svc_1" },
+  };
+
+  function liveDatabaseInspection(overrides?: Record<string, unknown>) {
+    return {
+      Id: "ctr_1",
+      Name: "/nouva-postgres-svc_1",
+      RestartCount: 0,
+      State: { Running: true, Status: "running", ExitCode: 0, OOMKilled: false },
+      NetworkSettings: { Networks: { managed: { IPAddress: "172.18.0.9" } } },
+      Config: {
+        Image: "postgres:17",
+        Env: ["POSTGRES_USER=nouva_user", "POSTGRES_PASSWORD=super-secret"],
+        Labels: { "nouva.project.id": "proj_1", "nouva.service.variant": "postgres" },
+      },
+      ...overrides,
+    };
+  }
+
+  function probeSpecs(docker: ReturnType<typeof createDockerMock>) {
+    return docker.createContainer.mock.calls
+      .map((call) => call[0] as DockerContainerSpec)
+      .filter((spec) => spec.name?.startsWith("nouva-db-ready-"));
+  }
+
+  test("reports a restarted database only once it answers an authenticated probe", async () => {
+    const docker = createDockerMock();
+    docker.inspectContainer.mockResolvedValue(liveDatabaseInspection());
+
+    const result = await handleRestartService(
+      docker as never,
+      runtimeConfig,
+      "restart_database",
+      restartPayload
+    );
+
+    expect(docker.restartContainer).toHaveBeenCalledWith("nouva-postgres-svc_1");
+    expect(probeSpecs(docker)).toHaveLength(1);
+    expect(probeSpecs(docker)[0]?.env).toContain("PGHOST=nouva-postgres-svc_1");
+    // A restart must never replace the container or its data.
+    expect(docker.ensureContainer).not.toHaveBeenCalled();
+    expect(docker.removeVolume).not.toHaveBeenCalled();
+    expect(docker.createVolume).not.toHaveBeenCalled();
+    expect(result.runtimeMetadata.containerName).toBe("nouva-postgres-svc_1");
+  });
+
+  test("fails a restart that leaves the engine unable to start", async () => {
+    const docker = createDockerMock();
+    let restarted = false;
+    docker.restartContainer.mockImplementation(async () => {
+      restarted = true;
+    });
+    docker.inspectContainer.mockImplementation(async () =>
+      restarted
+        ? liveDatabaseInspection({
+            RestartCount: 3,
+            State: { Running: true, Status: "restarting", ExitCode: 1, OOMKilled: false },
+          })
+        : liveDatabaseInspection()
+    );
+
+    await expect(
+      handleRestartService(docker as never, runtimeConfig, "restart_database", restartPayload)
+    ).rejects.toThrow("Database container nouva-postgres-svc_1 keeps restarting");
+  });
+
+  test("waits for a database that only answers after a delay", async () => {
+    const docker = createDockerMock();
+    let inspections = 0;
+    docker.inspectContainer.mockImplementation(async () => {
+      inspections += 1;
+      // The engine is still starting when readiness first looks at it.
+      return inspections === 3
+        ? liveDatabaseInspection({
+            State: { Running: false, Status: "created" },
+            NetworkSettings: { Networks: {} },
+          })
+        : liveDatabaseInspection();
+    });
+
+    await handleRestartService(docker as never, runtimeConfig, "restart_database", restartPayload);
+
+    expect(inspections).toBeGreaterThanOrEqual(4);
+    expect(probeSpecs(docker)).toHaveLength(1);
+  });
+
+  test("does not read a long-lived container's restart history as this restart failing", async () => {
+    const docker = createDockerMock();
+    // The restart policy recovered this database nine times over its lifetime; the operator restart
+    // that just happened added none of them.
+    docker.inspectContainer.mockResolvedValue(liveDatabaseInspection({ RestartCount: 9 }));
+
+    await handleRestartService(docker as never, runtimeConfig, "restart_database", restartPayload);
+
+    expect(probeSpecs(docker)).toHaveLength(1);
+  });
+
+  test("leaves app restarts exactly as they were", async () => {
+    const docker = createDockerMock();
+    docker.inspectContainer.mockResolvedValue(liveDatabaseInspection());
+
+    await handleRestartService(docker as never, runtimeConfig, "restart_app", {
+      ...restartPayload,
+      containerName: "nouva-app-svc_1-dep_1",
+      runtimeMetadata: { containerId: "ctr_app", containerName: "nouva-app-svc_1-dep_1" },
+    });
+
+    expect(docker.restartContainer).toHaveBeenCalledWith("nouva-app-svc_1-dep_1");
+    expect(probeSpecs(docker)).toHaveLength(0);
+  });
+});
+
 describe("resolveServiceContainerIdentifier", () => {
   test("prefers explicit container names over runtime metadata", () => {
     expect(
@@ -4108,7 +4347,13 @@ describe("verified volume wipe", () => {
     });
     docker.inspectContainer.mockImplementation(async (identifier: string) =>
       identifier === deterministicContainerName && replacementContainerPresent
-        ? ({ Id: "ctr_replacement" } as never)
+        ? ({
+            Id: "ctr_replacement",
+            Name: `/${deterministicContainerName}`,
+            RestartCount: 0,
+            State: { Running: true, Status: "running", ExitCode: 0, OOMKilled: false },
+            NetworkSettings: { Networks: { managed: { IPAddress: "172.18.0.9" } } },
+          } as never)
         : null
     );
     docker.removeVolume.mockImplementation(async () => {
@@ -4145,7 +4390,7 @@ describe("verified volume wipe", () => {
 
     const result = await handleWipeVolume(docker as never, runtimeConfig, payload);
 
-    expect(docker.removeContainer.mock.calls).toEqual([
+    expect(serviceContainerRemovals(docker)).toEqual([
       ["ctr_old", true],
       [deterministicContainerName, true],
       ["ctr_old", true],
@@ -4175,8 +4420,28 @@ describe("verified volume wipe", () => {
     docker.inspectVolume.mockImplementation(async () =>
       volumePresent ? ({ Name: "nouva-vol-vol_1" } as never) : null
     );
-    docker.inspectContainer.mockResolvedValue(null);
-    docker.ensureContainer.mockResolvedValue("ctr_new");
+    const containerName = "nouva-postgres-svc_1";
+    let containerPresent = false;
+    docker.removeContainer.mockImplementation(async (identifier: string) => {
+      if (identifier === containerName) {
+        containerPresent = false;
+      }
+    });
+    docker.inspectContainer.mockImplementation(async (identifier: string) =>
+      identifier === containerName && containerPresent
+        ? ({
+            Id: "ctr_new",
+            Name: `/${containerName}`,
+            RestartCount: 0,
+            State: { Running: true, Status: "running", ExitCode: 0, OOMKilled: false },
+            NetworkSettings: { Networks: { managed: { IPAddress: "172.18.0.9" } } },
+          } as never)
+        : null
+    );
+    docker.ensureContainer.mockImplementation(async () => {
+      containerPresent = true;
+      return "ctr_new";
+    });
     return docker;
   }
 
@@ -4206,7 +4471,7 @@ describe("verified volume wipe", () => {
       });
 
       expect(docker.removeVolume.mock.calls).toEqual([]);
-      expect(docker.removeContainer.mock.calls).toEqual([]);
+      expect(serviceContainerRemovals(docker)).toEqual([]);
       expect(replay.cleanupProof).toEqual({
         version: 1,
         kind: "wipe_volume",

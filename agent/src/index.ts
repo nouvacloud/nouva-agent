@@ -47,6 +47,15 @@ import {
 import { detectHostClockSync, evaluateClockSync } from "./clock-sync.js";
 import { collectManagedContainerLogConfigValidationCheck } from "./container-log-reconciliation.js";
 import {
+  buildDatabaseReadinessProbe,
+  collectDatabaseRuntimeHealthReport,
+  type DatabaseReadinessProbeCommand,
+  readDatabaseProbeCredentials,
+  readDatabaseProbeCredentialsFromRuntime,
+  resolveDatabaseInternalPort,
+  waitForDatabaseReadiness,
+} from "./database-readiness.js";
+import {
   DockerApiClient,
   type DockerContainerInspection,
   type DockerContainerSpec,
@@ -64,6 +73,7 @@ import {
   type AgentBuildLogsResponse,
   type AgentCapabilities,
   type AgentCleanupProof,
+  type AgentDatabaseRuntimeHealthReport,
   type AgentImageStoreMode,
   type AgentLeaseRenewRequest,
   type AgentLeaseRenewResponse,
@@ -304,6 +314,7 @@ export function adoptReregisteredCredentials(
 }
 
 interface ValidationSnapshot {
+  databaseRuntimeHealth?: AgentDatabaseRuntimeHealthReport;
   hostname: string;
   operatingSystem: string | null;
   architecture: string | null;
@@ -1416,6 +1427,8 @@ async function collectValidationSnapshot(
       checks,
     },
     capabilities: resolveAgentCapabilities(config),
+    // Collected by its own bounded loop so an in-flight probe never delays a heartbeat.
+    ...(latestDatabaseRuntimeHealth ? { databaseRuntimeHealth: latestDatabaseRuntimeHealth } : {}),
   };
 }
 
@@ -2685,9 +2698,13 @@ async function runTaskContainer(
     mounts?: Array<{ source: string; target: string; readOnly?: boolean }>;
     networkMode?: string;
     timeoutMs?: number;
+    /** Skipped for images the caller just pulled, so repeated probes stay off the registry. */
+    pull?: boolean;
   }
 ): Promise<{ logs: string }> {
-  await docker.pullImage(options.image, resolveRegistryAuthForImage(config, options.image));
+  if (options.pull !== false) {
+    await docker.pullImage(options.image, resolveRegistryAuthForImage(config, options.image));
+  }
   await docker.removeContainer(options.name, true);
 
   const id = await docker.createContainer({
@@ -3762,6 +3779,108 @@ async function deployDatabaseContainer(
   };
 }
 
+/** Bounds one authenticated probe attempt; the surrounding readiness wait owns the overall budget. */
+const DATABASE_READINESS_PROBE_TIMEOUT_MS = 20_000;
+
+/**
+ * Resolves the account readiness authenticates with.
+ *
+ * The runtime definition the container is created with is authoritative: it is what the engine will
+ * actually accept. The request's own credential fields are a fallback for a runtime whose account
+ * does not appear in its environment or arguments.
+ */
+function getDatabaseProbeCredentials(
+  payload: DatabaseProvisionPayload,
+  runtime: { envVars: Record<string, string>; containerArgs: string[] }
+): {
+  username: string;
+  password: string;
+  database?: string | null;
+} {
+  const fromRuntime = readDatabaseProbeCredentialsFromRuntime(payload.variant, runtime);
+  if (fromRuntime) {
+    return fromRuntime;
+  }
+
+  const username = payload.credentials?.username?.trim();
+  const password = payload.credentials?.password;
+  if (!username || !password) {
+    throw new Error(
+      `Database readiness for ${payload.serviceName} cannot be verified: the provisioning request did not include service credentials`
+    );
+  }
+
+  return { username, password, database: payload.credentials?.database ?? null };
+}
+
+async function runDatabaseReadinessProbe(
+  docker: DockerApiClient,
+  config: Pick<AgentRuntimeConfig, "privateRegistry">,
+  input: {
+    serviceId: string;
+    image: string;
+    projectNetwork: string;
+    probe: DatabaseReadinessProbeCommand;
+    /** Keeps provisioning and continuing-health sidecars from evicting each other by name. */
+    namePrefix: string;
+  }
+): Promise<void> {
+  await runTaskContainer(docker, config, {
+    name: `${input.namePrefix}${input.serviceId.slice(0, 12)}`,
+    image: input.image,
+    env: input.probe.env,
+    // The managed database images run their own startup and ignore the command, so the probe
+    // container replaces the entrypoint with the shell that runs the authenticated statement.
+    entrypoint: input.probe.entrypoint,
+    cmd: input.probe.cmd,
+    // Joining the project network reaches the database through its service address, so the
+    // loopback bootstrap server an initializing image runs cannot answer for it.
+    networkMode: input.projectNetwork,
+    timeoutMs: DATABASE_READINESS_PROBE_TIMEOUT_MS,
+    pull: false,
+  });
+}
+
+/**
+ * How often managed databases are re-observed for continuing health. Slower than the heartbeat: a
+ * pass runs authenticated probes, and the heartbeat only reports the latest completed inventory.
+ */
+export const DATABASE_RUNTIME_HEALTH_INTERVAL_MS = 60_000;
+
+let latestDatabaseRuntimeHealth: AgentDatabaseRuntimeHealthReport | null = null;
+
+async function refreshDatabaseRuntimeHealth(
+  docker: DockerApiClient,
+  config: Pick<AgentRuntimeConfig, "privateRegistry">
+): Promise<void> {
+  latestDatabaseRuntimeHealth = await collectDatabaseRuntimeHealthReport({
+    docker,
+    // Heartbeats publish the newest snapshot instead of waiting for the slowest probe, so a pass
+    // over many databases cannot starve the ones it observed first. Snapshots are immutable and
+    // always complete, so a heartbeat mid-pass still carries the whole inventory.
+    onReport: (report) => {
+      latestDatabaseRuntimeHealth = report;
+    },
+    runProbe: async ({ container, inspection, probe }) => {
+      const image = inspection.Config?.Image;
+      const projectId = inspection.Config?.Labels?.["nouva.project.id"];
+      if (!image || !projectId) {
+        throw new Error(
+          `Managed database container ${container.containerName} does not carry the image and project labels a health probe needs`
+        );
+      }
+
+      await runDatabaseReadinessProbe(docker, config, {
+        serviceId: container.serviceId,
+        image,
+        projectNetwork: buildProjectNetwork(projectId),
+        namePrefix: "nouva-db-health-",
+        probe,
+      });
+    },
+  });
+}
+
 export async function handleDatabaseProvision(
   docker: DockerApiClient,
   config: Pick<AgentRuntimeConfig, "privateRegistry">,
@@ -3769,6 +3888,31 @@ export async function handleDatabaseProvision(
 ) {
   const { projectNetwork, resolved, volumeName, containerName, containerId } =
     await deployDatabaseContainer(docker, config, payload);
+  const credentials = getDatabaseProbeCredentials(payload, {
+    envVars: resolved.envVars,
+    containerArgs: resolved.containerArgs,
+  });
+
+  // A started container is not a running database: readiness is only reported once the engine
+  // answers an authenticated statement, and a failing start is reported as such.
+  await waitForDatabaseReadiness({
+    docker,
+    containerName,
+    engine: payload.variant,
+    probe: () =>
+      runDatabaseReadinessProbe(docker, config, {
+        serviceId: payload.serviceId,
+        image: resolved.image,
+        projectNetwork,
+        namePrefix: "nouva-db-ready-",
+        probe: buildDatabaseReadinessProbe({
+          engine: payload.variant,
+          host: containerName,
+          port: resolved.internalPort,
+          credentials,
+        }),
+      }),
+  });
 
   return {
     internalHost: containerName,
@@ -5190,6 +5334,103 @@ async function handleRestart(docker: DockerApiClient, payload: RestartServicePay
   };
 }
 
+function readRestartCount(inspection: DockerContainerInspection | null): number {
+  const restarts = inspection?.RestartCount;
+  return typeof restarts === "number" && Number.isFinite(restarts) && restarts > 0 ? restarts : 0;
+}
+
+/**
+ * Waits for a restarted database to answer an authenticated probe.
+ *
+ * The container is restarted in place, so it keeps its data, its image and every restart it ever
+ * recovered from: `restartBaseline` scopes the restart-loop judgement to this attempt. Credentials
+ * and the probe image come from the running container's own definition, which is the account the
+ * engine will accept.
+ */
+async function waitForRestartedDatabaseReadiness(
+  docker: DockerApiClient,
+  config: Pick<AgentRuntimeConfig, "privateRegistry">,
+  input: {
+    payload: RestartServicePayload;
+    identifier: string;
+    restartBaseline: number;
+  }
+): Promise<void> {
+  const inspection = await docker.inspectContainer(input.identifier);
+  if (!inspection) {
+    throw new Error(
+      `Database container ${input.identifier} is missing on the server after the restart`
+    );
+  }
+
+  const containerName =
+    input.payload.containerName ??
+    input.payload.runtimeMetadata?.containerName ??
+    inspection.Name?.replace(/^\//, "") ??
+    input.identifier;
+  const image = inspection.Config?.Image;
+  const projectId = input.payload.projectId ?? inspection.Config?.Labels?.["nouva.project.id"];
+  const credentials = readDatabaseProbeCredentials(input.payload.variant, inspection);
+
+  if (!image || !projectId || !credentials) {
+    throw new Error(
+      `Restarted database ${containerName} cannot be verified: its container does not carry the image, project and credential definition an authenticated readiness check needs`
+    );
+  }
+
+  await waitForDatabaseReadiness({
+    docker,
+    containerName,
+    engine: input.payload.variant,
+    restartBaseline: input.restartBaseline,
+    probe: () =>
+      runDatabaseReadinessProbe(docker, config, {
+        serviceId: input.payload.serviceId,
+        image,
+        projectNetwork: buildProjectNetwork(projectId),
+        namePrefix: "nouva-db-ready-",
+        probe: buildDatabaseReadinessProbe({
+          engine: input.payload.variant,
+          host: containerName,
+          port: resolveDatabaseInternalPort(input.payload.variant, inspection),
+          credentials,
+        }),
+      }),
+  });
+}
+
+/**
+ * Restarts a service container, and for a database waits until it actually serves again.
+ *
+ * `restart_database` reporting completion while the engine cannot start is the original #297
+ * symptom, so the database path is gated on an authenticated probe. The app path is unchanged: it
+ * keeps its own rollout readiness and is not probed here.
+ */
+export async function handleRestartService(
+  docker: DockerApiClient,
+  config: Pick<AgentRuntimeConfig, "privateRegistry">,
+  kind: "restart_app" | "restart_database",
+  payload: RestartServicePayload
+) {
+  if (kind !== "restart_database") {
+    return await handleRestart(docker, payload);
+  }
+
+  const identifier = resolveServiceContainerIdentifier(payload);
+  if (!identifier) {
+    throw new Error("Missing container identifier for restart");
+  }
+
+  const restartBaseline = readRestartCount(await docker.inspectContainer(identifier));
+  const result = await handleRestart(docker, payload);
+  await waitForRestartedDatabaseReadiness(docker, config, {
+    payload,
+    identifier,
+    restartBaseline,
+  });
+  return result;
+}
+
 export function resolveServiceContainerIdentifier(input: {
   containerName?: string | null;
   runtimeMetadata?: RuntimeMetadata | null;
@@ -5583,7 +5824,7 @@ async function processWorkItem(
             break;
           case "restart_app":
           case "restart_database":
-            result = await handleRestart(docker, {
+            result = await handleRestartService(docker, config, workItem.kind, {
               ...(payload as unknown as RestartServicePayload),
               runtimeMetadata: toRuntimeMetadata(payload.runtimeMetadata),
             });
@@ -5990,6 +6231,24 @@ async function main() {
         console.error("[nouva-agent] metrics failed", error);
       });
   }, config.metricsIntervalSeconds * 1000);
+
+  // Continuing database health is reported through the heartbeat rather than metrics: it must keep
+  // working when Alloy owns telemetry, and a dead container produces no metrics at all.
+  let databaseRuntimeHealthPassActive = false;
+  setInterval(() => {
+    if (databaseRuntimeHealthPassActive || isShuttingDown) {
+      return;
+    }
+
+    databaseRuntimeHealthPassActive = true;
+    refreshDatabaseRuntimeHealth(docker, config)
+      .catch((error) => {
+        console.error("[nouva-agent] database runtime health failed", error);
+      })
+      .finally(() => {
+        databaseRuntimeHealthPassActive = false;
+      });
+  }, DATABASE_RUNTIME_HEALTH_INTERVAL_MS);
 
   // Volume usage backs reservation admission, so it is reported even when Alloy owns the rest
   // of the telemetry pipeline.
