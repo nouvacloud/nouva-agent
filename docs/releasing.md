@@ -45,11 +45,12 @@ rerun the check. Never move a published tag or bump only the mirror. An existing
 its version; retry its exact original release workflow rather than syncing different content under
 that tag. Availability must be rechecked before publication because neither gate reserves a version.
 
-Local preparation for the combined fixes uses `0.4.35`, which makes database provisioning wait for an
-authenticated readiness answer and reports continuing database health through the heartbeat. Version
-availability for `v0.4.35` has not been checked during this preparation; run the readiness check and
-the sync gate before publishing. Neither a local bump nor a green check is evidence of a published
-image or an upgraded server.
+Local preparation for the kernel-release report uses `0.4.36`, which adds the host kernel release
+(`uname -r`) to the registration and heartbeat snapshot so the control plane can refuse database
+images the kernel is known to reject before queueing them. Version availability for `v0.4.36` has
+not been checked during this preparation; run the readiness check and the sync gate before
+publishing. Neither a local bump nor a green check is evidence of a published image or an upgraded
+server.
 
 ## Manual validation and runners
 

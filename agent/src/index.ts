@@ -318,6 +318,7 @@ interface ValidationSnapshot {
   hostname: string;
   operatingSystem: string | null;
   architecture: string | null;
+  kernelRelease: string | null;
   dockerVersion: string | null;
   publicIp: string | null;
   cpuCores: number | null;
@@ -933,6 +934,16 @@ async function readSystemdResolvedUpstreams(): Promise<string[]> {
   }
 }
 
+/** `uname -r` of the host the agent container shares its kernel with; null if unavailable. */
+function readKernelRelease(): string | null {
+  try {
+    const release = os.release().trim();
+    return release.length > 0 ? release : null;
+  } catch {
+    return null;
+  }
+}
+
 async function collectValidationSnapshot(
   docker: DockerApiClient,
   config: AgentRuntimeConfig,
@@ -1415,6 +1426,10 @@ async function collectValidationSnapshot(
     hostname: os.hostname(),
     operatingSystem: `${hostOsId} ${hostOsVersion}`,
     architecture: hostArch,
+    // The release string exactly as `uname -r` reports it. The control plane decides which database
+    // images can start on it (MongoDB 8.0 refuses a range of kernels by this string), so it is sent
+    // verbatim rather than interpreted here.
+    kernelRelease: readKernelRelease(),
     dockerVersion,
     publicIp,
     cpuCores: os.cpus().length,

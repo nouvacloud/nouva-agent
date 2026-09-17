@@ -404,6 +404,8 @@ export interface AgentRegistrationSnapshot {
   hostname: string;
   operatingSystem: string | null;
   architecture: string | null;
+  /** The host kernel release exactly as `uname -r` reports it; see `collectValidationSnapshot`. */
+  kernelRelease?: string | null;
   dockerVersion: string | null;
   agentVersion: string;
   publicIp: string | null;
